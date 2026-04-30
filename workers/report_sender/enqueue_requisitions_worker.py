@@ -112,13 +112,18 @@ class EnqueueWorker:
         timeout = int(self.cfg.get("enqueue", {}).get("request_timeout_seconds", 20))
 
         if method == "GET":
-            r = self.http.get(endpoint, params=payload, timeout=timeout)
+            dated_endpoint = endpoint
+            if "{" in endpoint and "}" in endpoint:
+                dated_endpoint = endpoint.replace("{date}", self._today_ist())
+            elif not endpoint.rstrip("/").endswith(self._today_ist()):
+                dated_endpoint = endpoint.rstrip("/") + "/" + self._today_ist()
+            r = self.http.get(dated_endpoint, timeout=timeout)
         else:
             r = self.http.post(endpoint, json=payload, timeout=timeout)
 
         r.raise_for_status()
         data = r.json()
-        rows = data.get("rows") if isinstance(data, dict) else data
+        rows = (data.get("rows") or data.get("requisitions")) if isinstance(data, dict) else data
         if not isinstance(rows, list):
             raise ValueError("Unexpected requisitions response")
         return rows
