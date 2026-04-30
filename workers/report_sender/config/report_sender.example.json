@@ -1,0 +1,49 @@
+{
+  "supabase": {
+    "url": "https://YOUR-PROJECT.supabase.co",
+    "service_role_key": "YOUR_SUPABASE_SERVICE_ROLE_KEY"
+  },
+  "tables": {
+    "jobs": "report_auto_dispatch_jobs",
+    "events": "report_auto_dispatch_events"
+  },
+  "labbit_py": {
+    "base_url": "https://api.sdrc.in/py",
+    "status_mode": "reqno"
+  },
+  "shivam": {
+    "requisitions_url": "https://YOUR_SHIVAM_ENDPOINT_FOR_TODAY_REQUISITIONS",
+    "method": "POST"
+  },
+  "whatsapp": {
+    "internal_send_url": "https://lab.sdrc.in/api/internal/whatsapp/send",
+    "internal_send_token": "YOUR_WHATSAPP_INTERNAL_SEND_TOKEN",
+    "lab_id": "b539c161-1e2b-480b-9526-d4b37bd37b1e",
+    "template_name": "report_pdf",
+    "language_code": "en",
+    "source_service": "report_sender_worker"
+  },
+  "worker": {
+    "poll_seconds": 20,
+    "poll_start_hhmm": 730,
+    "poll_end_hhmm": 2130,
+    "batch_size": 25,
+    "cooloff_minutes_default": 30,
+    "max_attempts": 5,
+    "retry_backoff_seconds": [60, 180, 600, 1800, 3600],
+    "request_timeout_seconds": 20,
+    "dry_run": false,
+    "log_level": "INFO"
+  },
+  "enqueue": {
+    "start_date": "2026-05-01",
+    "poll_start_hhmm": 730,
+    "poll_end_hhmm": 2130,
+    "poll_seconds_pre_10am": 3600,
+    "poll_seconds_post_10am": 300,
+    "enqueue_paused_default": true,
+    "fetch_limit": 1000,
+    "request_timeout_seconds": 20,
+    "log_level": "INFO"
+  }
+}

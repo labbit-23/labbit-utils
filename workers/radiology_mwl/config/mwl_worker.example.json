@@ -1,0 +1,48 @@
+{
+  "source": {
+    "poll_url": "https://api.sdrc.in/py/shivam/radiology-worklist",
+    "poll_method": "GET",
+    "poll_headers": {
+      "Authorization": "Bearer <internal-token>"
+    },
+    "poll_timeout_seconds": 20,
+    "items_path": "items",
+    "performed_field": "performed",
+    "pending_value": 0,
+    "id_field": "id"
+  },
+  "destination": {
+    "aet": "SDRC_RAD_AE",
+    "host": "127.0.0.1",
+    "port": 4242
+  },
+  "mwl": {
+    "create_url": "http://127.0.0.1:8042/tools/create-mwl",
+    "create_method": "POST",
+    "create_headers": {},
+    "timeout_seconds": 20,
+    "transport": "legacy_json",
+    "outbox_dir": "./outbox",
+    "include_local_file_path": true,
+    "include_dicom_base64": false,
+    "payload_fields": {
+      "accession_number": "reqno",
+      "patient_id": "mrno",
+      "patient_name": "patient_name",
+      "modality": "modality",
+      "scheduled_datetime": "scheduled_datetime"
+    },
+    "defaults": {
+      "modality": "US",
+      "institution_name": "SDRC",
+      "requested_procedure_description": "RADIOLOGY",
+      "scheduled_step_description": "RADIOLOGY"
+    }
+  },
+  "worker": {
+    "poll_seconds": 15,
+    "batch_size": 50,
+    "log_level": "INFO",
+    "state_db_path": "./state/radiology_mwl_state.sqlite3"
+  }
+}
