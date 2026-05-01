@@ -104,13 +104,16 @@ class SupabaseRest:
         self.timeout = timeout_seconds
         self.session = requests.Session()
 
-    def select_jobs(self, table: str, limit: int) -> List[Dict[str, Any]]:
+    def select_jobs(self, table: str, limit: int, now_iso: str) -> List[Dict[str, Any]]:
         statuses = "(queued,cooling_off,eligible,retrying)"
         url = f"{self.base}/{table}"
         params = {
             "select": "*",
             "status": f"in.{statuses}",
-            "order": "updated_at.asc",
+            # Only pull due-now rows to avoid starvation from a fixed LIMIT window.
+            "or": f"(force_send_now.eq.true,next_attempt_at.is.null,next_attempt_at.lte.{now_iso})",
+            # Priority: manual push first, then older due attempts.
+            "order": "force_send_now.desc,next_attempt_at.asc.nullsfirst,updated_at.asc",
             "limit": str(limit)
         }
         r = self.session.get(url, headers=self.headers, params=params, timeout=self.timeout)
@@ -317,17 +320,25 @@ class ReportSenderWorker:
             self.log.info("Outside sender polling window; skipping cycle")
             return
 
-        rows = self.sb.select_jobs(self.cfg["tables"]["jobs"], limit=int(self.cfg.get("worker", {}).get("batch_size", 25)))
+        rows = self.sb.select_jobs(
+            self.cfg["tables"]["jobs"],
+            limit=int(self.cfg.get("worker", {}).get("batch_size", 25)),
+            now_iso=utc_iso(utc_now()),
+        )
         self.log.info("Fetched %s jobs", len(rows))
         now = utc_now()
+        skipped_future = 0
         for row in rows:
             next_attempt = parse_iso(row.get("next_attempt_at"))
             if next_attempt and next_attempt > now:
+                skipped_future += 1
                 continue
             try:
                 self.process_job(row)
             except Exception as exc:
                 self.log.exception("Job processing error id=%s: %s", row.get("id"), exc)
+        if skipped_future:
+            self.log.info("Skipped %s future-scheduled jobs in fetched batch", skipped_future)
 
     def run_forever(self) -> None:
         poll_seconds = int(self.cfg.get("worker", {}).get("poll_seconds", 20))
