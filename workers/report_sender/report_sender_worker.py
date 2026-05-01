@@ -61,11 +61,11 @@ def build_template_report_label(status: Dict[str, Any]) -> str:
     elif overall in {"LAB_PENDING", "NO_REPORT"}:
         lab_piece = "pending lab"
     elif overall == "NO_LAB_TESTS":
-        lab_piece = "no lab"
+        lab_piece = ""
     else:
         lab_piece = "lab"
 
-    parts = [lab_piece]
+    parts = [lab_piece] if lab_piece else []
     if rad_total > 0:
         if rad_ready >= rad_total:
             parts.append("complete radiology")
