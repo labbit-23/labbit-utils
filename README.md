@@ -36,3 +36,19 @@ This allows independent deploy/runtime per worker.
 - Mirth-facing workers
 - report sender workers
 - additional automation pollers
+
+## VPS deploy helper
+
+For report sender worker updates on VPS:
+
+```bash
+cd /opt/py_utils
+./scripts/deploy-vps-report-sender.sh
+```
+
+With PM2 restart:
+
+```bash
+cd /opt/py_utils
+./scripts/deploy-vps-report-sender.sh --restart-pm2
+```
