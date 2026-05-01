@@ -215,22 +215,15 @@ class ReportSenderWorker:
 
     def _send_template(self, job: Dict[str, Any], status: Dict[str, Any], report_label: str) -> Dict[str, Any]:
         wa = self.cfg["whatsapp"]
-        document_url = self._build_report_document_url(job, status)
         reqno = norm_text(job.get("reqno") or status.get("reqno"))
         reqid = norm_text(job.get("reqid") or status.get("reqid"))
-        filename_core = reqno or reqid or "report"
+        patient_name = norm_text(status.get("patient_name") or job.get("patient_name") or "Patient") or "Patient"
         payload = {
             "lab_id": wa["lab_id"],
             "phone": norm_text(job.get("phone") or status.get("patient_phone")),
-            "message_type": "template",
-            "template_name": norm_text(wa.get("template_name") or "reports_pdf"),
-            "language_code": norm_text(wa.get("language_code") or "en"),
-            "template_params": [
-                norm_text(status.get("patient_name") or job.get("patient_name") or "Patient") or "Patient",
-                report_label,
-            ],
-            "header_document_url": document_url,
-            "header_document_filename": f"{filename_core}.pdf",
+            "patient_name": patient_name,
+            "report_label": report_label,
+            "report_source": "requisition_report",
             "reqno": reqno or None,
             "source_service": norm_text(wa.get("source_service") or "report_sender_worker")
         }
