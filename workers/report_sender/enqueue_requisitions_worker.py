@@ -145,7 +145,7 @@ class EnqueueWorker:
         for row in rows:
             reqno = norm(row.get("REQNO") or row.get("reqno"))
             reqid = norm(row.get("REQID") or row.get("reqid"))
-            phone = norm(row.get("PHONENO") or row.get("MOBILENO") or row.get("phone"))
+            phone = norm(row.get("PHONENO") or row.get("phoneno") or row.get("MOBILENO") or row.get("mobileno") or row.get("phone"))
             name = norm(row.get("PATIENTNM") or row.get("patient_name"))
             mrno = norm(row.get("MRNO") or row.get("mrno"))
             if not reqno or not phone:

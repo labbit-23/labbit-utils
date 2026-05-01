@@ -242,7 +242,6 @@ class ReportSenderWorker:
             return
 
         if bool(job.get("is_paused", False)):
-            self._event(job, "paused_skip", "Job is paused")
             return
 
         status = self._fetch_status(job)
