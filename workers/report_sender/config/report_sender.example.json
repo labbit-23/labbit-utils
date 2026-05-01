@@ -29,6 +29,8 @@
     "poll_end_hhmm": 2130,
     "batch_size": 25,
     "cooloff_minutes_default": 30,
+    "partial_send_cutoff_from_hhmm": 1700,
+    "partial_send_cutoff_to_hhmm": 1730,
     "max_attempts": 5,
     "retry_backoff_seconds": [60, 180, 600, 1800, 3600],
     "request_timeout_seconds": 20,

@@ -9,6 +9,7 @@ Auto-dispatch worker for patient report WhatsApp sends.
 - Active window: `07:30` to `21:30` local time
 - Applies same-day readiness gating using `SAMEDAYREPORT`
 - Applies cooloff (`latest_approved_at + cooloff_minutes`, default 30m)
+- Supports evening partial-send window with randomized per-job cutoff (`partial_send_cutoff_from_hhmm` to `partial_send_cutoff_to_hhmm`)
 - Sends via existing `report_pdf` template through `/api/internal/whatsapp/send`
 - Supports `is_paused` and `force_send_now`
 

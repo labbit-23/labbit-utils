@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import logging
+import random
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -92,6 +94,49 @@ def evaluate_same_day_readiness(status: Dict[str, Any]) -> bool:
     return True
 
 
+def has_any_ready_same_day(status: Dict[str, Any]) -> bool:
+    tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+    required = [t for t in tests if isinstance(t, dict) and is_same_day_required(t)]
+    if not required:
+        return False
+    return any(is_ready_test(row) for row in required)
+
+
+def derive_group_ready_timestamps(status: Dict[str, Any]) -> Tuple[Optional[datetime], Optional[datetime]]:
+    tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+    required = [t for t in tests if isinstance(t, dict) and is_same_day_required(t)]
+
+    lab_latest = None
+    rad_latest = None
+
+    for row in required:
+        if not is_ready_test(row):
+            continue
+
+        group = norm_text(row.get("GROUPNM") or row.get("groupnm")).upper()
+        if not group:
+            gid = norm_text(row.get("GROUPID") or row.get("groupid"))
+            if gid == "GDEP0001":
+                group = "LAB"
+            elif gid == "GDEP0002":
+                group = "RADIOLOGY"
+
+        approved = parse_iso(row.get("approved_at") or row.get("APPROVED_AT"))
+        if approved is None:
+            approved = parse_iso(status.get("latest_approved_at"))
+        if approved is None:
+            continue
+
+        if group == "LAB":
+            if lab_latest is None or approved > lab_latest:
+                lab_latest = approved
+        elif group == "RADIOLOGY":
+            if rad_latest is None or approved > rad_latest:
+                rad_latest = approved
+
+    return lab_latest, rad_latest
+
+
 class SupabaseRest:
     def __init__(self, url: str, service_role_key: str, timeout_seconds: int = 20) -> None:
         self.base = url.rstrip("/") + "/rest/v1"
@@ -154,6 +199,32 @@ class ReportSenderWorker:
             timeout_seconds=timeout_seconds,
         )
         self.http = requests.Session()
+
+    def _job_ctx(self, job: Dict[str, Any], status: Optional[Dict[str, Any]] = None) -> str:
+        reqno = norm_text((status or {}).get("reqno") or job.get("reqno"))
+        reqid = norm_text((status or {}).get("reqid") or job.get("reqid"))
+        phone = norm_text(job.get("phone") or (status or {}).get("patient_phone"))
+        return f"job_id={job.get('id')} reqno={reqno or '-'} reqid={reqid or '-'} phone={phone or '-'}"
+
+    def _partial_cutoff_due(self, job: Dict[str, Any]) -> Tuple[bool, Optional[datetime]]:
+        worker_cfg = self.cfg.get("worker", {})
+        start_hhmm = int(worker_cfg.get("partial_send_cutoff_from_hhmm", 1700))
+        end_hhmm = int(worker_cfg.get("partial_send_cutoff_to_hhmm", 1730))
+        if end_hhmm < start_hhmm:
+            end_hhmm = start_hhmm
+
+        start_minutes = (start_hhmm // 100) * 60 + (start_hhmm % 100)
+        end_minutes = (end_hhmm // 100) * 60 + (end_hhmm % 100)
+
+        now_local = datetime.now().astimezone()
+        today_local = now_local.date()
+
+        seed_key = f"{norm_text(job.get('lab_id'))}:{norm_text(job.get('reqno'))}:{norm_text(job.get('reqid'))}:{today_local.isoformat()}"
+        seed = int(hashlib.sha256(seed_key.encode("utf-8")).hexdigest()[:12], 16)
+        rng = random.Random(seed)
+        target_minutes = rng.randint(start_minutes, end_minutes)
+        target_local = now_local.replace(hour=target_minutes // 60, minute=target_minutes % 60, second=0, microsecond=0)
+        return now_local >= target_local, target_local.astimezone(timezone.utc)
 
     def _event(self, job: Dict[str, Any], event_type: str, message: str, payload: Optional[Dict[str, Any]] = None) -> None:
         table_events = self.cfg["tables"]["events"]
@@ -248,10 +319,31 @@ class ReportSenderWorker:
         existing = parse_iso(job.get("scheduled_at"))
         if existing:
             return existing
-        cooloff_default = int(self.cfg.get("worker", {}).get("cooloff_minutes_default", 30))
-        cooloff_minutes = int(job.get("cooloff_minutes") or cooloff_default)
+
+        worker_cfg = self.cfg.get("worker", {})
+        cooloff_default = int(worker_cfg.get("cooloff_minutes_default", 30))
+        cooloff_lab = int(worker_cfg.get("cooloff_lab_minutes", cooloff_default))
+        cooloff_rad = int(worker_cfg.get("cooloff_radiology_minutes", 10))
+
+        # Backward compatibility: if split cooloffs are absent, allow per-job cooloff override.
+        job_cooloff = job.get("cooloff_minutes")
+        if job_cooloff not in (None, "", 0, "0") and "cooloff_lab_minutes" not in worker_cfg and "cooloff_radiology_minutes" not in worker_cfg:
+            j = int(job_cooloff)
+            cooloff_lab = j
+            cooloff_rad = j
+
+        lab_ready_at, rad_ready_at = derive_group_ready_timestamps(status)
+        candidates = []
+        if lab_ready_at is not None:
+            candidates.append(lab_ready_at + timedelta(minutes=cooloff_lab))
+        if rad_ready_at is not None:
+            candidates.append(rad_ready_at + timedelta(minutes=cooloff_rad))
+
+        if candidates:
+            return max(candidates)
+
         approved_at = parse_iso(status.get("latest_approved_at")) or utc_now()
-        return approved_at + timedelta(minutes=cooloff_minutes)
+        return approved_at + timedelta(minutes=cooloff_default)
 
     def process_job(self, job: Dict[str, Any]) -> None:
         if not job.get("id"):
@@ -263,16 +355,38 @@ class ReportSenderWorker:
 
         status = self._fetch_status(job)
         report_label = build_template_report_label(status)
+        self.log.info("status-check %s overall=%s label=%s", self._job_ctx(job, status), norm_text(status.get("overall_status") or "-"), report_label)
 
-        if not evaluate_same_day_readiness(status):
-            self._patch_job(job, {
-                "status": "queued",
-                "report_label": report_label,
-                "last_status_snapshot": status,
-                "next_attempt_at": utc_iso(utc_now() + timedelta(minutes=10)),
+        all_ready = evaluate_same_day_readiness(status)
+        if not all_ready:
+            cutoff_due, cutoff_at_utc = self._partial_cutoff_due(job)
+            allow_partial = cutoff_due and has_any_ready_same_day(status)
+            if not allow_partial:
+                now = utc_now()
+                next_check = now + timedelta(minutes=10)
+                if cutoff_at_utc and cutoff_at_utc > now:
+                    next_check = min(next_check, cutoff_at_utc)
+                cutoff_text = utc_iso(cutoff_at_utc) if cutoff_at_utc else None
+                event_payload: Dict[str, Any] = {"label": report_label}
+                if cutoff_text:
+                    event_payload["partial_cutoff_at"] = cutoff_text
+                    event_payload["ready_any"] = False
+                    event_message = "Waiting for all same-day reports (partial send allowed after cutoff if at least one report is ready)"
+                else:
+                    event_message = "Waiting for all same-day reports"
+                self._patch_job(job, {
+                    "status": "queued",
+                    "report_label": report_label,
+                    "last_status_snapshot": status,
+                    "next_attempt_at": utc_iso(next_check),
+                })
+                self._event(job, "queued_wait", event_message, event_payload)
+                return
+
+            self._event(job, "queued_partial_cutoff", "Proceeding with partial send after evening cutoff", {
+                "label": report_label,
+                "partial_cutoff_at": utc_iso(cutoff_at_utc) if cutoff_at_utc else None,
             })
-            self._event(job, "queued_wait", "Waiting for all same-day reports", {"label": report_label})
-            return
 
         scheduled_at = self._resolve_schedule(job, status)
         force_now = bool(job.get("force_send_now", False))
@@ -286,6 +400,7 @@ class ReportSenderWorker:
                 "last_status_snapshot": status,
                 "next_attempt_at": utc_iso(min(scheduled_at, now + timedelta(minutes=10))),
             })
+            self.log.info("cooling-off %s scheduled_at=%s label=%s", self._job_ctx(job, status), utc_iso(scheduled_at), report_label)
             self._event(job, "cooling_off", "Waiting for cooloff window", {"label": report_label, "scheduled_at": utc_iso(scheduled_at)})
             return
 
@@ -300,6 +415,8 @@ class ReportSenderWorker:
         })
 
         try:
+            report_url = self._build_report_document_url(job, status)
+            self.log.info("sending %s label=%s report_url=%s", self._job_ctx(job, status), report_label, report_url)
             response = self._send_template(job, status, report_label)
             self._patch_job(job, {
                 "status": "sent",
@@ -307,6 +424,8 @@ class ReportSenderWorker:
                 "last_error": None,
                 "provider_response": response,
             })
+            provider_id = norm_text((response or {}).get("provider_message_id") or (response or {}).get("id") or ((response or {}).get("messages") or [{}])[0].get("id") if isinstance((response or {}).get("messages"), list) and (response or {}).get("messages") else "")
+            self.log.info("sent %s label=%s provider_message_id=%s", self._job_ctx(job, status), report_label, provider_id or "-")
             self._event(job, "sent", "Template sent successfully", {"response": response, "label": report_label})
         except Exception as exc:
             attempts = attempts + 1
@@ -320,6 +439,7 @@ class ReportSenderWorker:
                 "last_error": str(exc),
                 "next_attempt_at": None if terminal else utc_iso(utc_now() + timedelta(seconds=delay)),
             })
+            self.log.error("send-failed %s attempt=%s terminal=%s error=%s", self._job_ctx(job, status), attempts, terminal, str(exc))
             self._event(job, "send_failed", str(exc), {"attempt": attempts, "terminal": terminal})
 
     def _within_window(self) -> bool:
