@@ -222,10 +222,15 @@ class ReportSenderWorker:
         payload = {
             "lab_id": wa["lab_id"],
             "phone": norm_text(job.get("phone") or status.get("patient_phone")),
-            "message_type": "document",
-            "document_url": document_url,
-            "filename": f"{filename_core}.pdf",
-            "caption": "Please find your report attached.",
+            "message_type": "template",
+            "template_name": norm_text(wa.get("template_name") or "reports_pdf"),
+            "language_code": norm_text(wa.get("language_code") or "en"),
+            "template_params": [
+                norm_text(status.get("patient_name") or job.get("patient_name") or "Patient") or "Patient",
+                report_label,
+            ],
+            "header_document_url": document_url,
+            "header_document_filename": f"{filename_core}.pdf",
             "reqno": reqno or None,
             "source_service": norm_text(wa.get("source_service") or "report_sender_worker")
         }
