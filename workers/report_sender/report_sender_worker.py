@@ -104,7 +104,7 @@ class SupabaseRest:
         self.timeout = timeout_seconds
         self.session = requests.Session()
 
-    def select_jobs(self, table: str, limit: int, now_iso: str) -> List[Dict[str, Any]]:
+    def select_jobs(self, table: str, limit: int, now_iso: str, offset: int = 0) -> List[Dict[str, Any]]:
         statuses = "(queued,cooling_off,eligible,retrying)"
         url = f"{self.base}/{table}"
         params = {
@@ -114,7 +114,8 @@ class SupabaseRest:
             "or": f"(force_send_now.eq.true,next_attempt_at.is.null,next_attempt_at.lte.{now_iso})",
             # Priority: manual push first, then older due attempts.
             "order": "force_send_now.desc,next_attempt_at.asc.nullsfirst,updated_at.asc",
-            "limit": str(limit)
+            "limit": str(limit),
+            "offset": str(max(0, int(offset or 0))),
         }
         r = self.session.get(url, headers=self.headers, params=params, timeout=self.timeout)
         r.raise_for_status()
@@ -323,12 +324,30 @@ class ReportSenderWorker:
             self.log.info("Outside sender polling window; skipping cycle")
             return
 
-        rows = self.sb.select_jobs(
-            self.cfg["tables"]["jobs"],
-            limit=int(self.cfg.get("worker", {}).get("batch_size", 25)),
-            now_iso=utc_iso(utc_now()),
-        )
-        self.log.info("Fetched %s jobs", len(rows))
+        batch_size = int(self.cfg.get("worker", {}).get("batch_size", 25))
+        max_scan_rows = int(self.cfg.get("worker", {}).get("max_scan_rows", max(100, batch_size * 8)))
+        now_iso = utc_iso(utc_now())
+
+        rows: List[Dict[str, Any]] = []
+        offset = 0
+        while len(rows) < max_scan_rows:
+            page = self.sb.select_jobs(
+                self.cfg["tables"]["jobs"],
+                limit=batch_size,
+                now_iso=now_iso,
+                offset=offset,
+            )
+            if not page:
+                break
+            rows.extend(page)
+            if len(page) < batch_size:
+                break
+            offset += batch_size
+
+        if len(rows) > max_scan_rows:
+            rows = rows[:max_scan_rows]
+
+        self.log.info("Fetched %s jobs (batch_size=%s max_scan_rows=%s)", len(rows), batch_size, max_scan_rows)
         now = utc_now()
         skipped_future = 0
         for row in rows:
