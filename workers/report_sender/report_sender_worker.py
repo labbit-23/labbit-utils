@@ -234,6 +234,9 @@ class ReportSenderWorker:
         return r.json() if r.text else {"ok": True}
 
     def _resolve_schedule(self, job: Dict[str, Any], status: Dict[str, Any]) -> datetime:
+        existing = parse_iso(job.get("scheduled_at"))
+        if existing:
+            return existing
         cooloff_default = int(self.cfg.get("worker", {}).get("cooloff_minutes_default", 30))
         cooloff_minutes = int(job.get("cooloff_minutes") or cooloff_default)
         approved_at = parse_iso(status.get("latest_approved_at")) or utc_now()
