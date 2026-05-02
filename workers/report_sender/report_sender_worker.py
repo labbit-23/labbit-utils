@@ -380,7 +380,10 @@ class ReportSenderWorker:
                     "last_status_snapshot": status,
                     "next_attempt_at": utc_iso(next_check),
                 })
-                self._event(job, "queued_wait", event_message, event_payload)
+                prev_status = norm_text(job.get("status")).lower()
+                prev_label = norm_text(job.get("report_label"))
+                if prev_status != "queued" or prev_label != report_label:
+                    self._event(job, "queued_wait", event_message, event_payload)
                 return
 
             self._event(job, "queued_partial_cutoff", "Proceeding with partial send after evening cutoff", {
@@ -393,6 +396,7 @@ class ReportSenderWorker:
         now = utc_now()
 
         if not force_now and now < scheduled_at:
+            prev_scheduled_at = parse_iso(job.get("scheduled_at"))
             self._patch_job(job, {
                 "status": "cooling_off",
                 "report_label": report_label,
@@ -401,7 +405,11 @@ class ReportSenderWorker:
                 "next_attempt_at": utc_iso(min(scheduled_at, now + timedelta(minutes=10))),
             })
             self.log.info("cooling-off %s scheduled_at=%s label=%s", self._job_ctx(job, status), utc_iso(scheduled_at), report_label)
-            self._event(job, "cooling_off", "Waiting for cooloff window", {"label": report_label, "scheduled_at": utc_iso(scheduled_at)})
+            prev_status = norm_text(job.get("status")).lower()
+            prev_label = norm_text(job.get("report_label"))
+            schedule_changed = prev_scheduled_at is None or abs((scheduled_at - prev_scheduled_at).total_seconds()) >= 60
+            if prev_status != "cooling_off" or prev_label != report_label or schedule_changed:
+                self._event(job, "cooling_off", "Waiting for cooloff window", {"label": report_label, "scheduled_at": utc_iso(scheduled_at)})
             return
 
         attempts = int(job.get("attempt_count") or 0)

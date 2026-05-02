@@ -44,6 +44,8 @@
     "poll_seconds_pre_10am": 3600,
     "poll_seconds_post_10am": 300,
     "enqueue_paused_default": true,
+    "lookback_hours": 0,
+    "lookback_max_rows": 2000,
     "fetch_limit": 1000,
     "request_timeout_seconds": 20,
     "log_level": "INFO"

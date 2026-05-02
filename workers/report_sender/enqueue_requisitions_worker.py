@@ -2,7 +2,7 @@
 import argparse
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 import requests
@@ -51,6 +51,46 @@ class SupabaseRest:
         rows = r.json()
         return bool(isinstance(rows, list) and rows)
 
+    def has_active_job(self, table: str, reqno: str) -> bool:
+        u = f"{self.base}/{table}"
+        p = {
+            "select": "id,status",
+            "reqno": f"eq.{reqno}",
+            "status": "in.(queued,cooling_off,eligible,retrying,sending)",
+            "limit": "1"
+        }
+        r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return bool(isinstance(rows, list) and rows)
+
+    def has_sent_full(self, table: str, reqno: str) -> bool:
+        u = f"{self.base}/{table}"
+        p = {
+            "select": "id,report_label",
+            "reqno": f"eq.{reqno}",
+            "status": "eq.sent",
+            "report_label": "ilike.*complete*",
+            "limit": "1"
+        }
+        r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return bool(isinstance(rows, list) and rows)
+
+    def list_recent_jobs(self, table: str, since_iso: str, limit: int = 2000) -> List[Dict[str, Any]]:
+        u = f"{self.base}/{table}"
+        p = {
+            "select": "id,lab_id,reqno,reqid,mrno,phone,patient_name,status,report_label,is_paused,created_at,updated_at",
+            "or": f"(created_at.gte.{since_iso},updated_at.gte.{since_iso})",
+            "order": "updated_at.desc",
+            "limit": str(limit)
+        }
+        r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return rows if isinstance(rows, list) else []
+
     def dispatched_exists(self, reqno: str, phone: str) -> bool:
         # report_dispatch_logs lives in labbit-main schema and indicates already sent dispatches.
         u = f"{self.base}/report_dispatch_logs"
@@ -83,6 +123,135 @@ class EnqueueWorker:
         timeout = int(cfg.get("enqueue", {}).get("request_timeout_seconds", 20))
         self.sb = SupabaseRest(cfg["supabase"]["url"], cfg["supabase"]["service_role_key"], timeout=timeout)
         self.http = requests.Session()
+
+    def _fetch_status(self, reqno: str, reqid: str) -> Dict[str, Any]:
+        base = norm(self.cfg.get("labbit_py", {}).get("base_url")).rstrip("/")
+        mode = norm(self.cfg.get("labbit_py", {}).get("status_mode") or "reqno").lower()
+        timeout = int(self.cfg.get("enqueue", {}).get("request_timeout_seconds", 20))
+        if mode == "reqid" and reqid:
+            url = f"{base}/report-status-reqid/{reqid}"
+        elif reqno:
+            url = f"{base}/report-status/{reqno}"
+        elif reqid:
+            url = f"{base}/report-status-reqid/{reqid}"
+        else:
+            raise ValueError("Missing reqno/reqid for status fetch")
+        r = self.http.get(url, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, dict):
+            raise ValueError("Unexpected status response")
+        return data
+
+    def _is_same_day_required(self, row: Dict[str, Any]) -> bool:
+        return norm(row.get("SAMEDAYREPORT") or row.get("samedayreport")) == "1"
+
+    def _is_ready_test(self, row: Dict[str, Any]) -> bool:
+        status = norm(row.get("REPORT_STATUS") or row.get("report_status")).upper()
+        approved = norm(row.get("APPROVEDFLG") or row.get("approvedflg")) == "1"
+        return approved or status in {"LAB_READY", "RADIOLOGY_READY"}
+
+    def _same_day_full_ready(self, status: Dict[str, Any]) -> bool:
+        tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+        required = [t for t in tests if isinstance(t, dict) and self._is_same_day_required(t)]
+        if not required:
+            return False
+        return all(self._is_ready_test(row) for row in required)
+
+    def _is_partial_label(self, label: Any) -> bool:
+        t = norm(label).lower()
+        return "partial" in t
+
+    def _is_full_label(self, label: Any) -> bool:
+        t = norm(label).lower()
+        return "complete" in t and "partial" not in t
+
+    def _reconcile_recent(self, jobs_table: str) -> int:
+        lookback_hours = int(self.cfg.get("enqueue", {}).get("lookback_hours", 0) or 0)
+        if lookback_hours <= 0:
+            return 0
+
+        since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+        recent = self.sb.list_recent_jobs(jobs_table, since.isoformat(), limit=int(self.cfg.get("enqueue", {}).get("lookback_max_rows", 2000)))
+        if not recent:
+            return 0
+
+        # Only hit status API for unsent or partial-sent rows.
+        candidates: List[Dict[str, Any]] = []
+        for row in recent:
+            status = norm(row.get("status")).lower()
+            if status in {"queued", "cooling_off", "eligible", "retrying", "failed", "sending"}:
+                candidates.append(row)
+                continue
+            if status == "sent" and self._is_partial_label(row.get("report_label")):
+                candidates.append(row)
+
+        added = 0
+        lab_id = norm(self.cfg.get("whatsapp", {}).get("lab_id"))
+        paused_default = bool(self.cfg.get("enqueue", {}).get("enqueue_paused_default", True))
+        cooloff = int(self.cfg.get("worker", {}).get("cooloff_minutes_default", 30))
+        max_attempts = int(self.cfg.get("worker", {}).get("max_attempts", 5))
+
+        seen_reqnos = set()
+        for row in candidates:
+            reqno = norm(row.get("reqno"))
+            reqid = norm(row.get("reqid"))
+            phone = norm(row.get("phone"))
+            if not reqno or not phone or reqno in seen_reqnos:
+                continue
+            seen_reqnos.add(reqno)
+
+            # If already has active queue job, let sender handle current flow.
+            if self.sb.has_active_job(jobs_table, reqno):
+                continue
+            if self.sb.has_sent_full(jobs_table, reqno):
+                continue
+
+            # Skip reconciled follow-up when already fully sent before.
+            if norm(row.get("status")).lower() == "sent" and self._is_full_label(row.get("report_label")):
+                continue
+
+            try:
+                live = self._fetch_status(reqno=reqno, reqid=reqid)
+            except Exception as e:
+                self.log.warning("Reconcile status fetch failed reqno=%s err=%s", reqno, e)
+                continue
+
+            if not self._same_day_full_ready(live):
+                continue
+
+            # If partial was sent and now fully ready, enqueue a follow-up send job.
+            new_job = {
+                "lab_id": lab_id,
+                "reqno": reqno,
+                "reqid": reqid or None,
+                "mrno": norm(row.get("mrno")) or None,
+                "phone": phone,
+                "patient_name": norm(row.get("patient_name")) or None,
+                "status": "queued",
+                "is_paused": paused_default,
+                "force_send_now": False,
+                "cooloff_minutes": cooloff,
+                "attempt_count": 0,
+                "max_attempts": max_attempts,
+                "next_attempt_at": utc_iso(),
+                "metadata": {
+                    "reconcile": True,
+                    "lookback_hours": lookback_hours,
+                    "reason": "partial_or_unsent_now_full_ready"
+                },
+                "created_at": utc_iso(),
+                "updated_at": utc_iso(),
+            }
+            if self.dry_run:
+                self.log.info("[dry-run] reconcile enqueue reqno=%s", reqno)
+            else:
+                self.sb.insert_job(jobs_table, new_job)
+            added += 1
+
+        if added:
+            self.log.info("Reconcile complete. new_followup_jobs=%s", added)
+        return added
 
     def _today_ist(self) -> str:
         return now_ist().strftime("%Y-%m-%d")
@@ -181,6 +350,7 @@ class EnqueueWorker:
             enqueued += 1
 
         self.log.info("Enqueue complete. new_jobs=%s", enqueued)
+        self._reconcile_recent(jobs_table)
 
 
 def main() -> int:
