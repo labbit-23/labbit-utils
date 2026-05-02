@@ -158,6 +158,10 @@ class EnqueueWorker:
             return False
         return all(self._is_ready_test(row) for row in required)
 
+    def _is_overall_full_ready(self, status: Dict[str, Any]) -> bool:
+        overall = norm(status.get("overall_status")).upper()
+        return overall == "FULL_REPORT"
+
     def _is_partial_label(self, label: Any) -> bool:
         t = norm(label).lower()
         return "partial" in t
@@ -217,7 +221,9 @@ class EnqueueWorker:
                 self.log.warning("Reconcile status fetch failed reqno=%s err=%s", reqno, e)
                 continue
 
-            if not self._same_day_full_ready(live):
+            # Reconcile follow-up should happen only when report set is fully ready,
+            # not merely when same-day subset is ready.
+            if not self._is_overall_full_ready(live):
                 continue
 
             # If partial was sent and now fully ready, enqueue a follow-up send job.
