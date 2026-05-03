@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import random
 import time
 from datetime import datetime, timedelta, timezone
@@ -102,6 +103,26 @@ def has_any_ready_same_day(status: Dict[str, Any]) -> bool:
     return any(is_ready_test(row) for row in required)
 
 
+def has_same_day_required_tests(status: Dict[str, Any]) -> bool:
+    tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+    required = [t for t in tests if isinstance(t, dict) and is_same_day_required(t)]
+    return bool(required)
+
+
+def same_day_counts_and_pending(status: Dict[str, Any]) -> Tuple[int, int, List[str]]:
+    tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+    required = [t for t in tests if isinstance(t, dict) and is_same_day_required(t)]
+    total = len(required)
+    ready = 0
+    pending: List[str] = []
+    for row in required:
+        if is_ready_test(row):
+            ready += 1
+        else:
+            pending.append(norm_text(row.get("TESTNM") or row.get("testnm") or row.get("test_name")) or "Unnamed test")
+    return total, ready, pending
+
+
 def derive_group_ready_timestamps(status: Dict[str, Any]) -> Tuple[Optional[datetime], Optional[datetime]]:
     tests = status.get("tests") if isinstance(status.get("tests"), list) else []
     required = [t for t in tests if isinstance(t, dict) and is_same_day_required(t)]
@@ -182,6 +203,66 @@ class SupabaseRest:
         r = self.session.post(url, headers=self.headers, data=json.dumps(row), timeout=self.timeout)
         r.raise_for_status()
 
+    def get_latest_event(self, table: str, job_id: Any) -> Optional[Dict[str, Any]]:
+        url = f"{self.base}/{table}"
+        params = {"select": "*", "job_id": f"eq.{job_id}", "order": "created_at.desc", "limit": "1"}
+        r = self.session.get(url, headers=self.headers, params=params, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        return None
+
+    def claim_job(self, table: str, row_id: Any, worker_token: str) -> Optional[Dict[str, Any]]:
+        url = f"{self.base}/{table}"
+        params = {
+            "id": f"eq.{row_id}",
+            "status": "in.(queued,cooling_off,eligible,retrying)",
+            "limit": "1",
+        }
+        patch = {
+            "status": "processing",
+            "processing_owner": worker_token,
+            "processing_started_at": utc_iso(),
+            "updated_at": utc_iso(),
+        }
+        r = self.session.patch(url, headers=self.headers, params=params, data=json.dumps(patch), timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        return None
+
+    def list_watchdog_candidates(self, table: str, limit: int = 500) -> List[Dict[str, Any]]:
+        url = f"{self.base}/{table}"
+        params = {
+            "select": "*",
+            "status": "in.(queued,cooling_off,eligible,retrying)",
+            "sent_at": "is.null",
+            "order": "updated_at.asc",
+            "limit": str(limit),
+        }
+        r = self.session.get(url, headers=self.headers, params=params, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return rows if isinstance(rows, list) else []
+
+    def get_latest_sent_job_for_reqno(self, table: str, reqno: str) -> Optional[Dict[str, Any]]:
+        url = f"{self.base}/{table}"
+        params = {
+            "select": "id,status,report_label,last_status_snapshot,sent_at,updated_at",
+            "reqno": f"eq.{reqno}",
+            "status": "eq.sent",
+            "order": "sent_at.desc.nullslast,updated_at.desc",
+            "limit": "1",
+        }
+        r = self.session.get(url, headers=self.headers, params=params, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        return None
+
 
 class ReportSenderWorker:
     def __init__(self, cfg: Dict[str, Any], dry_run: bool = False) -> None:
@@ -199,6 +280,13 @@ class ReportSenderWorker:
             timeout_seconds=timeout_seconds,
         )
         self.http = requests.Session()
+        self.worker_token = f"sender-{int(time.time())}-{random.randint(1000,9999)}"
+        self.metrics = {
+            "stuck_detected": 0,
+            "auto_requeued": 0,
+            "failed_timeout": 0,
+            "status_reconciled": 0,
+        }
 
     def _job_ctx(self, job: Dict[str, Any], status: Optional[Dict[str, Any]] = None) -> str:
         reqno = norm_text((status or {}).get("reqno") or job.get("reqno"))
@@ -250,6 +338,81 @@ class ReportSenderWorker:
             self.log.info("[dry-run] patch job id=%s %s", job.get("id"), patch)
             return {**job, **patch}
         return self.sb.patch_job(self.cfg["tables"]["jobs"], job.get("id"), patch)
+
+    def _status_from_event(self, event_type: str) -> Optional[str]:
+        m = {
+            "queued_wait": "queued",
+            "cooling_off": "cooling_off",
+            "sent": "sent",
+            "auto_requeue_stuck": "queued",
+            "failed_timeout": "failed",
+        }
+        return m.get(norm_text(event_type).lower())
+
+    def _reconcile_job_state(self, job: Dict[str, Any]) -> None:
+        latest = self.sb.get_latest_event(self.cfg["tables"]["events"], job.get("id"))
+        if not latest:
+            return
+        event_type = norm_text(latest.get("event_type")).lower()
+        current = norm_text(job.get("status")).lower()
+        expected = self._status_from_event(event_type)
+        if event_type == "sent" and current != "sent":
+            self._patch_job(job, {"status": "sent"})
+            self.metrics["status_reconciled"] += 1
+            self.log.info("status_reconciled %s prev=%s new=sent reason=latest_event_sent", self._job_ctx(job), current)
+            return
+        if expected and current != expected and current != "sent":
+            self._patch_job(job, {"status": expected})
+            self.metrics["status_reconciled"] += 1
+            self.log.info("status_reconciled %s prev=%s new=%s reason=event_%s", self._job_ctx(job), current, expected, event_type)
+
+    def _watchdog_stuck_jobs(self) -> None:
+        worker_cfg = self.cfg.get("worker", {})
+        queued_wait_hours = int(os.getenv("REPORT_SENDER_STUCK_QUEUED_WAIT_HOURS", worker_cfg.get("stuck_queued_wait_hours", 6)))
+        cooling_hours = int(os.getenv("REPORT_SENDER_STUCK_COOLING_OFF_HOURS", worker_cfg.get("stuck_cooling_off_hours", 2)))
+        max_requeues = int(os.getenv("REPORT_SENDER_STUCK_MAX_AUTO_REQUEUES", worker_cfg.get("stuck_max_auto_requeues", 3)))
+        scan_limit = int(os.getenv("REPORT_SENDER_STUCK_SCAN_LIMIT", worker_cfg.get("stuck_scan_limit", 500)))
+        now = utc_now()
+        rows = self.sb.list_watchdog_candidates(self.cfg["tables"]["jobs"], limit=scan_limit)
+        for job in rows:
+            latest = self.sb.get_latest_event(self.cfg["tables"]["events"], job.get("id"))
+            if not latest:
+                continue
+            e_type = norm_text(latest.get("event_type")).lower()
+            if e_type not in {"queued_wait", "cooling_off"}:
+                continue
+            e_time = parse_iso(latest.get("created_at"))
+            if e_time is None:
+                continue
+            age_hours = (now - e_time).total_seconds() / 3600.0
+            threshold = queued_wait_hours if e_type == "queued_wait" else cooling_hours
+            if age_hours < threshold:
+                continue
+            self.metrics["stuck_detected"] += 1
+            meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+            stuck_count = int((meta or {}).get("stuck_requeue_count") or 0)
+            if stuck_count >= max_requeues:
+                self._patch_job(job, {"status": "failed", "last_error": "failed_timeout_stuck"})
+                self._event(job, "failed_timeout", "Watchdog marked terminal failure after stuck wait", {
+                    "previous_status": norm_text(job.get("status")),
+                    "event_type": e_type,
+                    "age_hours": round(age_hours, 2),
+                    "retry_count": stuck_count,
+                })
+                self.metrics["failed_timeout"] += 1
+                self.log.warning("failed_timeout job_id=%s reqno=%s prev=%s reason=%s", job.get("id"), norm_text(job.get("reqno")), norm_text(job.get("status")), e_type)
+                continue
+            new_meta = dict(meta or {})
+            new_meta["stuck_requeue_count"] = stuck_count + 1
+            self._patch_job(job, {"status": "queued", "next_attempt_at": utc_iso(now), "metadata": new_meta, "last_error": None})
+            self._event(job, "auto_requeue_stuck", "Watchdog auto-requeued stuck wait-state job", {
+                "previous_status": norm_text(job.get("status")),
+                "event_type": e_type,
+                "age_hours": round(age_hours, 2),
+                "retry_count": stuck_count + 1,
+            })
+            self.metrics["auto_requeued"] += 1
+            self.log.warning("auto_requeued job_id=%s reqno=%s prev=%s reason=%s", job.get("id"), norm_text(job.get("reqno")), norm_text(job.get("status")), e_type)
 
     def _fetch_status(self, job: Dict[str, Any]) -> Dict[str, Any]:
         base = self.cfg["labbit_py"]["base_url"].rstrip("/")
@@ -356,8 +519,14 @@ class ReportSenderWorker:
         status = self._fetch_status(job)
         report_label = build_template_report_label(status)
         self.log.info("status-check %s overall=%s label=%s", self._job_ctx(job, status), norm_text(status.get("overall_status") or "-"), report_label)
+        sameday_total, sameday_ready, not_ready_tests = same_day_counts_and_pending(status)
 
+        has_required = has_same_day_required_tests(status)
         all_ready = evaluate_same_day_readiness(status)
+        if not has_required:
+            overall = norm_text(status.get("overall_status")).upper()
+            rad_ready = int(status.get("radiology_ready") or 0)
+            all_ready = overall == "FULL_REPORT" or rad_ready > 0
         if not all_ready:
             cutoff_due, cutoff_at_utc = self._partial_cutoff_due(job)
             allow_partial = cutoff_due and has_any_ready_same_day(status)
@@ -368,6 +537,9 @@ class ReportSenderWorker:
                     next_check = min(next_check, cutoff_at_utc)
                 cutoff_text = utc_iso(cutoff_at_utc) if cutoff_at_utc else None
                 event_payload: Dict[str, Any] = {"label": report_label}
+                event_payload["sameday_total"] = sameday_total
+                event_payload["sameday_ready"] = sameday_ready
+                event_payload["not_ready_tests"] = not_ready_tests[:30]
                 if cutoff_text:
                     event_payload["partial_cutoff_at"] = cutoff_text
                     event_payload["ready_any"] = False
@@ -413,6 +585,29 @@ class ReportSenderWorker:
             return
 
         attempts = int(job.get("attempt_count") or 0)
+
+        # Duplicate-send guard: do not resend when same-day ready count has not increased.
+        latest_sent = self.sb.get_latest_sent_job_for_reqno(self.cfg["tables"]["jobs"], norm_text(job.get("reqno")))
+        if latest_sent:
+            prev_snap = latest_sent.get("last_status_snapshot") if isinstance(latest_sent.get("last_status_snapshot"), dict) else {}
+            prev_total, prev_ready, _ = same_day_counts_and_pending(prev_snap if isinstance(prev_snap, dict) else {})
+            if sameday_total > 0 and sameday_ready <= prev_ready and sameday_total == prev_total:
+                self._patch_job(job, {
+                    "status": "queued",
+                    "report_label": report_label,
+                    "last_status_snapshot": status,
+                    "next_attempt_at": utc_iso(utc_now() + timedelta(minutes=20)),
+                    "last_error": None,
+                })
+                self._event(job, "queued_wait", "Skipped duplicate send: same-day ready count unchanged", {
+                    "label": report_label,
+                    "sameday_total": sameday_total,
+                    "sameday_ready": sameday_ready,
+                    "prev_sameday_ready": prev_ready,
+                    "not_ready_tests": not_ready_tests[:30],
+                })
+                return
+
         self._patch_job(job, {
             "status": "sending",
             "report_label": report_label,
@@ -462,6 +657,8 @@ class ReportSenderWorker:
             self.log.info("Outside sender polling window; skipping cycle")
             return
 
+        self._watchdog_stuck_jobs()
+
         batch_size = int(self.cfg.get("worker", {}).get("batch_size", 25))
         max_scan_rows = int(self.cfg.get("worker", {}).get("max_scan_rows", max(100, batch_size * 8)))
         now_iso = utc_iso(utc_now())
@@ -494,11 +691,22 @@ class ReportSenderWorker:
                 skipped_future += 1
                 continue
             try:
-                self.process_job(row)
+                self._reconcile_job_state(row)
+                claimed = self.sb.claim_job(self.cfg["tables"]["jobs"], row.get("id"), self.worker_token)
+                if not claimed:
+                    continue
+                self.process_job(claimed)
             except Exception as exc:
                 self.log.exception("Job processing error id=%s: %s", row.get("id"), exc)
         if skipped_future:
             self.log.info("Skipped %s future-scheduled jobs in fetched batch", skipped_future)
+        self.log.info(
+            "metrics stuck_detected=%s auto_requeued=%s failed_timeout=%s status_reconciled=%s",
+            self.metrics["stuck_detected"],
+            self.metrics["auto_requeued"],
+            self.metrics["failed_timeout"],
+            self.metrics["status_reconciled"],
+        )
 
     def run_forever(self) -> None:
         poll_seconds = int(self.cfg.get("worker", {}).get("poll_seconds", 20))

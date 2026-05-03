@@ -12,6 +12,11 @@ Auto-dispatch worker for patient report WhatsApp sends.
 - Supports evening partial-send window with randomized per-job cutoff (`partial_send_cutoff_from_hhmm` to `partial_send_cutoff_to_hhmm`)
 - Sends via existing `report_pdf` template through `/api/internal/whatsapp/send`
 - Supports `is_paused` and `force_send_now`
+- Includes stuck-job watchdog + state reconciliation:
+- auto-requeue stale `queued_wait` / `cooling_off`
+- terminal `failed_timeout` after retry cap
+- claim-based processing to reduce multi-worker race risk
+- duplicate-send guard: skips resend when same-day ready count has not increased
 
 2. `enqueue_requisitions_worker.py`
 - Fetches today's requisitions from existing Shivam endpoint
@@ -58,6 +63,17 @@ Sender:
 ./deploy.sh run-sender-once
 ./deploy.sh run-sender
 ```
+
+Watchdog overrides (optional env vars):
+```bash
+REPORT_SENDER_STUCK_QUEUED_WAIT_HOURS=6
+REPORT_SENDER_STUCK_COOLING_OFF_HOURS=2
+REPORT_SENDER_STUCK_MAX_AUTO_REQUEUES=3
+REPORT_SENDER_STUCK_SCAN_LIMIT=500
+```
+
+Admin recovery SQL:
+`workers/report_sender/sql/recover_stuck_jobs.sql`
 
 ## Required Supabase Tables
 
