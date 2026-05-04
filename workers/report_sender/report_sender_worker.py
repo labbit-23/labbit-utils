@@ -218,7 +218,7 @@ class SupabaseRest:
         url = f"{self.base}/{table}"
         params = {
             "id": f"eq.{row_id}",
-            "status": "in.(queued,cooling_off,eligible,retrying)",
+            "or": "(status.eq.queued,status.eq.cooling_off,status.eq.eligible,status.eq.retrying)",
             "limit": "1",
         }
         patch = {
