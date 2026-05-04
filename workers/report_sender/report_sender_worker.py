@@ -176,8 +176,9 @@ class SupabaseRest:
         params = {
             "select": "*",
             "status": f"in.{statuses}",
-            # Only pull due-now rows to avoid starvation from a fixed LIMIT window.
-            "or": f"(force_send_now.eq.true,next_attempt_at.is.null,next_attempt_at.lte.{now_iso})",
+            # Only pull due-now rows.
+            # Also include overdue cooling_off by scheduled_at<=now to recover from next_attempt drift.
+            "or": f"(force_send_now.eq.true,next_attempt_at.is.null,next_attempt_at.lte.{now_iso},and(status.eq.cooling_off,scheduled_at.lte.{now_iso}))",
             # Priority: manual push first, then older due attempts.
             "order": "force_send_now.desc,next_attempt_at.asc.nullsfirst,updated_at.asc",
             "limit": str(limit),
@@ -688,8 +689,15 @@ class ReportSenderWorker:
         for row in rows:
             next_attempt = parse_iso(row.get("next_attempt_at"))
             if next_attempt and next_attempt > now:
-                skipped_future += 1
-                continue
+                scheduled_at = parse_iso(row.get("scheduled_at"))
+                due_overdue_cooling = (
+                    norm_text(row.get("status")).lower() == "cooling_off"
+                    and scheduled_at is not None
+                    and scheduled_at <= now
+                )
+                if not due_overdue_cooling:
+                    skipped_future += 1
+                    continue
             try:
                 self._reconcile_job_state(row)
                 claimed = self.sb.claim_job(self.cfg["tables"]["jobs"], row.get("id"), self.worker_token)

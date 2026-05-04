@@ -78,6 +78,30 @@ class SupabaseRest:
         rows = r.json()
         return bool(isinstance(rows, list) and rows)
 
+    def latest_sent_snapshot(self, table: str, reqno: str) -> Dict[str, Any]:
+        u = f"{self.base}/{table}"
+        p = {
+            "select": "id,last_status_snapshot,sent_at,report_label,updated_at",
+            "reqno": f"eq.{reqno}",
+            "status": "eq.sent",
+            "order": "sent_at.desc.nullslast,updated_at.desc",
+            "limit": "1"
+        }
+        r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        if isinstance(rows, list) and rows:
+            row = rows[0]
+            snap = row.get("last_status_snapshot")
+            if isinstance(snap, str):
+                try:
+                    snap = json.loads(snap)
+                except Exception:
+                    snap = {}
+            row["last_status_snapshot"] = snap if isinstance(snap, dict) else {}
+            return row
+        return {}
+
     def list_recent_jobs(self, table: str, since_iso: str, limit: int = 2000) -> List[Dict[str, Any]]:
         u = f"{self.base}/{table}"
         p = {
@@ -158,6 +182,13 @@ class EnqueueWorker:
             return False
         return all(self._is_ready_test(row) for row in required)
 
+    def _same_day_ready_counts(self, status: Dict[str, Any]) -> tuple[int, int]:
+        tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+        required = [t for t in tests if isinstance(t, dict) and self._is_same_day_required(t)]
+        total = len(required)
+        ready = sum(1 for row in required if self._is_ready_test(row))
+        return total, ready
+
     def _is_overall_full_ready(self, status: Dict[str, Any]) -> bool:
         overall = norm(status.get("overall_status")).upper()
         return overall == "FULL_REPORT"
@@ -225,6 +256,16 @@ class EnqueueWorker:
             # not merely when same-day subset is ready.
             if not self._is_overall_full_ready(live):
                 continue
+
+            # Duplicate guard: only enqueue follow-up if ready-count increased from latest sent snapshot.
+            latest_sent = self.sb.latest_sent_snapshot(jobs_table, reqno)
+            if latest_sent:
+                prev_snap = latest_sent.get("last_status_snapshot") if isinstance(latest_sent.get("last_status_snapshot"), dict) else {}
+                prev_total, prev_ready = self._same_day_ready_counts(prev_snap if isinstance(prev_snap, dict) else {})
+                cur_total, cur_ready = self._same_day_ready_counts(live)
+                if cur_total > 0 and cur_total == prev_total and cur_ready <= prev_ready:
+                    self.log.info("Reconcile skip reqno=%s ready-count unchanged prev=%s/%s cur=%s/%s", reqno, prev_ready, prev_total, cur_ready, cur_total)
+                    continue
 
             # If partial was sent and now fully ready, enqueue a follow-up send job.
             new_job = {
