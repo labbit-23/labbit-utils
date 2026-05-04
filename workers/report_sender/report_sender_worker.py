@@ -223,8 +223,6 @@ class SupabaseRest:
         }
         patch = {
             "status": "processing",
-            "processing_owner": worker_token,
-            "processing_started_at": utc_iso(),
             "updated_at": utc_iso(),
         }
         r = self.session.patch(url, headers=self.headers, params=params, data=json.dumps(patch), timeout=self.timeout)
