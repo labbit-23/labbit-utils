@@ -287,7 +287,7 @@ def derive_group_ready_timestamps(status: Dict[str, Any]) -> Tuple[Optional[date
 
 
 class SupabaseRest:
-    def __init__(self, url: str, service_role_key: str, timeout_seconds: int = 20) -> None:
+    def __init__(self, url: str, service_role_key: str, timeout_seconds: int = 40) -> None:
         self.base = url.rstrip("/") + "/rest/v1"
         self.headers = {
             "apikey": service_role_key,
@@ -414,7 +414,7 @@ class ReportSenderWorker:
         logging.basicConfig(level=getattr(logging, log_level, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
         self.log = logging.getLogger("report_sender_worker")
 
-        timeout_seconds = int(worker_cfg.get("request_timeout_seconds", 20))
+        timeout_seconds = int(worker_cfg.get("request_timeout_seconds", 40))
         self.sb = SupabaseRest(
             url=cfg["supabase"]["url"],
             service_role_key=cfg["supabase"]["service_role_key"],
@@ -596,7 +596,7 @@ class ReportSenderWorker:
         else:
             raise ValueError("Job missing reqno/reqid")
 
-        timeout = int(self.cfg.get("worker", {}).get("request_timeout_seconds", 20))
+        timeout = int(self.cfg.get("worker", {}).get("request_timeout_seconds", 40))
         r = self.http.get(url, timeout=timeout)
         r.raise_for_status()
         data = r.json()
@@ -641,7 +641,7 @@ class ReportSenderWorker:
             "x-internal-token": token,
         }
 
-        timeout = int(self.cfg.get("worker", {}).get("request_timeout_seconds", 20))
+        timeout = int(self.cfg.get("worker", {}).get("request_timeout_seconds", 40))
         r = self.http.post(wa["internal_send_url"], headers=headers, data=json.dumps(payload), timeout=timeout)
         if not r.ok:
             raise RuntimeError(f"Send failed: {r.status_code} {r.text[:300]}")
