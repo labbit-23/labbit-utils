@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+INVALID_PHONE_SENTINEL = "INVALID_PHONE"
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -27,7 +29,12 @@ def parse_iso(value: Any) -> Optional[datetime]:
     try:
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
-        return datetime.fromisoformat(text)
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
     except Exception:
         return None
 
@@ -41,7 +48,41 @@ def norm_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def digits_only(value: Any) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def is_valid_india_phone(value: Any) -> bool:
+    d = digits_only(value)
+    return len(d) == 10 or (len(d) == 12 and d.startswith("91"))
+
+
+def parse_neo_datetime(value: Any) -> Optional[datetime]:
+    text = norm_text(value)
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+    return parse_iso(text)
+
+
+def is_not_collected_test(row: Dict[str, Any]) -> bool:
+    joined = " ".join([
+        norm_text(row.get("REPORT_STATUS") or row.get("report_status")),
+        norm_text(row.get("APPROVEDFLG") or row.get("approvedflg")),
+        norm_text(row.get("SAMPLESTATUS") or row.get("samplestatus")),
+        norm_text(row.get("RESULTSTATUS") or row.get("resultstatus")),
+    ]).upper()
+    markers = ("NOT_COLLECTED", "SAMPLE_NOT", "COLLECTION_PENDING", "PENDING_COLLECTION", "NO_SAMPLE")
+    return any(m in joined for m in markers)
+
+
 def is_ready_test(row: Dict[str, Any]) -> bool:
+    if is_not_collected_test(row):
+        return False
     status = norm_text(row.get("REPORT_STATUS") or row.get("report_status")).upper()
     approved = norm_text(row.get("APPROVEDFLG") or row.get("approvedflg")) == "1"
     return approved or status in {"LAB_READY", "RADIOLOGY_READY"}
@@ -107,6 +148,45 @@ def has_same_day_required_tests(status: Dict[str, Any]) -> bool:
     tests = status.get("tests") if isinstance(status.get("tests"), list) else []
     required = [t for t in tests if isinstance(t, dict) and is_same_day_required(t)]
     return bool(required)
+
+
+def is_no_reportable_case(status: Dict[str, Any]) -> bool:
+    lab_total = int(status.get("lab_total") or 0)
+    rad_total = int(status.get("radiology_total") or 0)
+    if lab_total == 0 and rad_total == 0:
+        return True
+
+    tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+    if not tests:
+        return False
+
+    reportable = [t for t in tests if isinstance(t, dict) and is_same_day_required(t)]
+    if reportable:
+        return False
+
+    overall = norm_text(status.get("overall_status")).upper()
+    if overall not in {"NO_REPORT", "NO_LAB_TESTS", "LAB_PENDING"}:
+        return False
+    return not any(is_ready_test(t) for t in tests if isinstance(t, dict))
+
+
+def requisition_after_cutoff(status: Dict[str, Any], cutoff_hhmm: int) -> bool:
+    if cutoff_hhmm <= 0:
+        return False
+    dt = parse_neo_datetime(status.get("test_date"))
+    if dt is None:
+        tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+        for row in tests:
+            if not isinstance(row, dict):
+                continue
+            dt = parse_neo_datetime(row.get("REQDT") or row.get("reqdt"))
+            if dt is not None:
+                break
+    if dt is None:
+        return False
+    local = dt.astimezone()
+    hhmm = local.hour * 100 + local.minute
+    return hhmm > cutoff_hhmm
 
 
 def same_day_counts_and_pending(status: Dict[str, Any]) -> Tuple[int, int, List[str]]:
@@ -239,6 +319,20 @@ class SupabaseRest:
             "status": "in.(queued,cooling_off,eligible,retrying)",
             "sent_at": "is.null",
             "order": "updated_at.asc",
+            "limit": str(limit),
+        }
+        r = self.session.get(url, headers=self.headers, params=params, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return rows if isinstance(rows, list) else []
+
+    def list_failed_invalid_phone(self, table: str, limit: int = 100) -> List[Dict[str, Any]]:
+        url = f"{self.base}/{table}"
+        params = {
+            "select": "*",
+            "status": "eq.failed",
+            "last_error": f"eq.{INVALID_PHONE_SENTINEL}",
+            "order": "updated_at.desc",
             "limit": str(limit),
         }
         r = self.session.get(url, headers=self.headers, params=params, timeout=self.timeout)
@@ -413,6 +507,21 @@ class ReportSenderWorker:
             self.metrics["auto_requeued"] += 1
             self.log.warning("auto_requeued job_id=%s reqno=%s prev=%s reason=%s", job.get("id"), norm_text(job.get("reqno")), norm_text(job.get("status")), e_type)
 
+    def _recover_invalid_phone_jobs(self) -> None:
+        rows = self.sb.list_failed_invalid_phone(self.cfg["tables"]["jobs"], limit=100)
+        for job in rows:
+            phone = norm_text(job.get("phone"))
+            if not is_valid_india_phone(phone):
+                continue
+            self._patch_job(job, {
+                "status": "queued",
+                "attempt_count": 0,
+                "last_error": None,
+                "next_attempt_at": utc_iso(),
+            })
+            self._event(job, "admin_phone_updated_requeue", "Requeued after valid phone update", {"phone": phone})
+            self.log.info("phone-requeue %s", self._job_ctx(job))
+
     def _fetch_status(self, job: Dict[str, Any]) -> Dict[str, Any]:
         base = self.cfg["labbit_py"]["base_url"].rstrip("/")
         mode = norm_text(self.cfg["labbit_py"].get("status_mode") or "reqno").lower()
@@ -463,6 +572,8 @@ class ReportSenderWorker:
 
         if not payload["phone"]:
             raise ValueError("Missing phone for send")
+        if not is_valid_india_phone(payload["phone"]):
+            raise ValueError(INVALID_PHONE_SENTINEL)
 
         token = wa["internal_send_token"]
         headers = {
@@ -522,13 +633,26 @@ class ReportSenderWorker:
 
         has_required = has_same_day_required_tests(status)
         all_ready = evaluate_same_day_readiness(status)
+        if is_no_reportable_case(status):
+            self._patch_job(job, {
+                "status": "skipped",
+                "report_label": report_label,
+                "last_status_snapshot": status,
+                "last_error": None,
+                "next_attempt_at": None,
+            })
+            self._event(job, "skipped_no_reportable_tests", "No reportable lab/radiology tests found", {})
+            self.log.info("skip-no-reportable %s", self._job_ctx(job, status))
+            return
         if not has_required:
             overall = norm_text(status.get("overall_status")).upper()
             rad_ready = int(status.get("radiology_ready") or 0)
             all_ready = overall == "FULL_REPORT" or rad_ready > 0
         if not all_ready:
             cutoff_due, cutoff_at_utc = self._partial_cutoff_due(job)
-            allow_partial = cutoff_due and has_any_ready_same_day(status)
+            reg_cutoff = int(self.cfg.get("worker", {}).get("partial_same_day_registration_cutoff_hhmm", 0))
+            after_reg_cutoff = requisition_after_cutoff(status, reg_cutoff)
+            allow_partial = cutoff_due and has_any_ready_same_day(status) and not after_reg_cutoff
             if not allow_partial:
                 now = utc_now()
                 next_check = now + timedelta(minutes=10)
@@ -539,6 +663,9 @@ class ReportSenderWorker:
                 event_payload["sameday_total"] = sameday_total
                 event_payload["sameday_ready"] = sameday_ready
                 event_payload["not_ready_tests"] = not_ready_tests[:30]
+                if reg_cutoff > 0:
+                    event_payload["registration_cutoff_hhmm"] = reg_cutoff
+                    event_payload["after_registration_cutoff"] = after_reg_cutoff
                 if cutoff_text:
                     event_payload["partial_cutoff_at"] = cutoff_text
                     event_payload["ready_any"] = False
@@ -635,14 +762,16 @@ class ReportSenderWorker:
             backoffs = self.cfg.get("worker", {}).get("retry_backoff_seconds", [60, 180, 600, 1800, 3600])
             idx = min(max(0, attempts - 1), len(backoffs) - 1)
             delay = int(backoffs[idx])
-            terminal = attempts >= max_attempts
+            err_text = str(exc)
+            invalid_phone = INVALID_PHONE_SENTINEL in err_text or "Phone must be 10 digits" in err_text
+            terminal = invalid_phone or attempts >= max_attempts
             self._patch_job(job, {
                 "status": "failed" if terminal else "retrying",
-                "last_error": str(exc),
+                "last_error": INVALID_PHONE_SENTINEL if invalid_phone else err_text,
                 "next_attempt_at": None if terminal else utc_iso(utc_now() + timedelta(seconds=delay)),
             })
             self.log.error("send-failed %s attempt=%s terminal=%s error=%s", self._job_ctx(job, status), attempts, terminal, str(exc))
-            self._event(job, "send_failed", str(exc), {"attempt": attempts, "terminal": terminal})
+            self._event(job, "failed_invalid_phone" if invalid_phone else "send_failed", str(exc), {"attempt": attempts, "terminal": terminal})
 
     def _within_window(self) -> bool:
         start_hhmm = int(self.cfg.get("worker", {}).get("poll_start_hhmm", 730))
@@ -657,6 +786,7 @@ class ReportSenderWorker:
             return
 
         self._watchdog_stuck_jobs()
+        self._recover_invalid_phone_jobs()
 
         batch_size = int(self.cfg.get("worker", {}).get("batch_size", 25))
         max_scan_rows = int(self.cfg.get("worker", {}).get("max_scan_rows", max(100, batch_size * 8)))
