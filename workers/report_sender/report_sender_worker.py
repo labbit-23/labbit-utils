@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 INVALID_PHONE_SENTINEL = "INVALID_PHONE"
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def utc_now() -> datetime:
@@ -39,6 +40,36 @@ def parse_iso(value: Any) -> Optional[datetime]:
         return None
 
 
+def parse_status_dt_ist_to_utc(value: Any) -> Optional[datetime]:
+    """
+    Parse report-status timestamps.
+    If timezone is missing, treat it as IST and convert to UTC.
+    If timezone exists, normalize to UTC.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith(".0"):
+        text = text[:-2]
+    try:
+        if text.endswith("Z"):
+            dt = datetime.fromisoformat(text[:-1] + "+00:00")
+            return dt.astimezone(timezone.utc)
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=IST).astimezone(timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(text, fmt)
+            return dt.replace(tzinfo=IST).astimezone(timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
 def load_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -63,10 +94,10 @@ def parse_neo_datetime(value: Any) -> Optional[datetime]:
         return None
     for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
         try:
-            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+            return datetime.strptime(text, fmt).replace(tzinfo=IST).astimezone(timezone.utc)
         except Exception:
             continue
-    return parse_iso(text)
+    return parse_status_dt_ist_to_utc(text)
 
 
 def is_not_collected_test(row: Dict[str, Any]) -> bool:
@@ -236,9 +267,9 @@ def derive_group_ready_timestamps(status: Dict[str, Any]) -> Tuple[Optional[date
             elif gid == "GDEP0002":
                 group = "RADIOLOGY"
 
-        approved = parse_iso(row.get("approved_at") or row.get("APPROVED_AT"))
+        approved = parse_status_dt_ist_to_utc(row.get("approved_at") or row.get("APPROVED_AT"))
         if approved is None:
-            approved = parse_iso(status.get("latest_approved_at"))
+            approved = parse_status_dt_ist_to_utc(status.get("latest_approved_at"))
         if approved is None:
             continue
 
@@ -640,7 +671,7 @@ class ReportSenderWorker:
         if candidates:
             return max(candidates)
 
-        approved_at = parse_iso(status.get("latest_approved_at")) or utc_now()
+        approved_at = parse_status_dt_ist_to_utc(status.get("latest_approved_at")) or utc_now()
         return approved_at + timedelta(minutes=cooloff_default)
 
     def process_job(self, job: Dict[str, Any]) -> None:
