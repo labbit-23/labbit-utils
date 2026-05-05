@@ -31,6 +31,10 @@ def norm(v: Any) -> str:
     return str(v or "").strip()
 
 
+def digits_only(v: Any) -> str:
+    return "".join(ch for ch in str(v or "") if ch.isdigit())
+
+
 class SupabaseRest:
     def __init__(self, url: str, service_role_key: str, timeout: int = 20) -> None:
         self.base = url.rstrip("/") + "/rest/v1"
@@ -50,6 +54,21 @@ class SupabaseRest:
         r.raise_for_status()
         rows = r.json()
         return bool(isinstance(rows, list) and rows)
+
+    def latest_job(self, table: str, reqno: str) -> Dict[str, Any]:
+        u = f"{self.base}/{table}"
+        p = {
+            "select": "id,reqno,phone,status,last_error,updated_at,created_at",
+            "reqno": f"eq.{reqno}",
+            "order": "updated_at.desc,created_at.desc,id.desc",
+            "limit": "1",
+        }
+        r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        return {}
 
     def has_active_job(self, table: str, reqno: str) -> bool:
         u = f"{self.base}/{table}"
@@ -200,6 +219,19 @@ class EnqueueWorker:
     def _is_full_label(self, label: Any) -> bool:
         t = norm(label).lower()
         return "complete" in t and "partial" not in t
+
+    def _should_skip_invalid_phone_reenqueue(self, jobs_table: str, reqno: str, incoming_phone: str) -> bool:
+        latest = self.sb.latest_job(jobs_table, reqno)
+        if not latest:
+            return False
+        status = norm(latest.get("status")).lower()
+        last_error = norm(latest.get("last_error")).upper()
+        if status != "failed" or last_error != "INVALID_PHONE":
+            return False
+        prev_phone = digits_only(latest.get("phone"))
+        cur_phone = digits_only(incoming_phone)
+        # Allow new enqueue only if phone changed from previously failed invalid phone.
+        return prev_phone == cur_phone
 
     def _reconcile_recent(self, jobs_table: str) -> int:
         lookback_hours = int(self.cfg.get("enqueue", {}).get("lookback_hours", 0) or 0)
@@ -365,6 +397,14 @@ class EnqueueWorker:
             name = norm(row.get("PATIENTNM") or row.get("patient_name"))
             mrno = norm(row.get("MRNO") or row.get("mrno"))
             if not reqno or not phone:
+                continue
+
+            if self._should_skip_invalid_phone_reenqueue(jobs_table, reqno, phone):
+                self.log.info(
+                    "Skip enqueue reqno=%s reason=failed_invalid_phone_unchanged phone=%s",
+                    reqno,
+                    phone,
+                )
                 continue
 
             if self.sb.job_exists(jobs_table, reqno):
