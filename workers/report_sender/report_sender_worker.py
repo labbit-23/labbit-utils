@@ -346,6 +346,7 @@ class SupabaseRest:
         url = f"{self.base}/{table}"
         params = {
             "id": f"eq.{row_id}",
+            "is_paused": "eq.false",
             "or": "(status.eq.queued,status.eq.cooling_off,status.eq.eligible,status.eq.retrying)",
             "limit": "1",
         }
@@ -359,6 +360,21 @@ class SupabaseRest:
         if isinstance(rows, list) and rows:
             return rows[0]
         return None
+
+    def list_paused_jobs(self, table: str, limit: int = 25) -> List[Dict[str, Any]]:
+        url = f"{self.base}/{table}"
+        params = {
+            "select": "*",
+            "is_paused": "eq.true",
+            "sent_at": "is.null",
+            "status": "in.(queued,cooling_off,eligible,retrying,processing,sending)",
+            "order": "updated_at.asc",
+            "limit": str(limit),
+        }
+        r = self.session.get(url, headers=self.headers, params=params, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return rows if isinstance(rows, list) else []
 
     def list_watchdog_candidates(self, table: str, limit: int = 500) -> List[Dict[str, Any]]:
         url = f"{self.base}/{table}"
@@ -604,6 +620,25 @@ class ReportSenderWorker:
             raise ValueError(f"Unexpected status response: {data}")
         return data
 
+    def _refresh_paused_jobs(self) -> None:
+        limit = int(self.cfg.get("worker", {}).get("paused_refresh_limit", 25))
+        rows = self.sb.list_paused_jobs(self.cfg["tables"]["jobs"], limit=limit)
+        for job in rows:
+            try:
+                status = self._fetch_status(job)
+                report_label = build_template_report_label(status)
+                patch = {
+                    "status": "queued",
+                    "report_label": report_label,
+                    "last_status_snapshot": status,
+                    "scheduled_at": None,
+                    "force_send_now": False,
+                }
+                self._patch_job(job, patch)
+                self.log.info("paused-refresh %s overall=%s label=%s", self._job_ctx(job, status), norm_text(status.get("overall_status") or "-"), report_label)
+            except Exception as exc:
+                self.log.warning("paused-refresh-failed id=%s reqno=%s err=%s", job.get("id"), norm_text(job.get("reqno")), exc)
+
     def _build_report_document_url(self, job: Dict[str, Any], status: Dict[str, Any]) -> str:
         base = norm_text(self.cfg["labbit_py"].get("base_url")).rstrip("/")
         reqid = norm_text(job.get("reqid") or status.get("reqid"))
@@ -754,6 +789,24 @@ class ReportSenderWorker:
 
         if not force_now and now < scheduled_at:
             prev_scheduled_at = parse_iso(job.get("scheduled_at"))
+            after_cutoff_now = self._is_after_cutoff_now()
+            if after_cutoff_now:
+                # After cutoff, do not move fresh jobs into cooling_off; keep queued for next polling cycle.
+                self._patch_job(job, {
+                    "status": "queued",
+                    "report_label": report_label,
+                    "scheduled_at": utc_iso(scheduled_at),
+                    "last_status_snapshot": status,
+                    "next_attempt_at": utc_iso(now + timedelta(minutes=10)),
+                })
+                prev_status = norm_text(job.get("status")).lower()
+                prev_label = norm_text(job.get("report_label"))
+                schedule_changed = prev_scheduled_at is None or abs((scheduled_at - prev_scheduled_at).total_seconds()) >= 60
+                if prev_status != "queued" or prev_label != report_label or schedule_changed:
+                    self._event(job, "queued_wait", "After cutoff: holding queued until next send window", {"label": report_label, "scheduled_at": utc_iso(scheduled_at)})
+                self.log.info("queued-after-cutoff %s scheduled_at=%s label=%s", self._job_ctx(job, status), utc_iso(scheduled_at), report_label)
+                return
+
             self._patch_job(job, {
                 "status": "cooling_off",
                 "report_label": report_label,
@@ -832,6 +885,13 @@ class ReportSenderWorker:
             self.log.error("send-failed %s attempt=%s terminal=%s error=%s", self._job_ctx(job, status), attempts, terminal, str(exc))
             self._event(job, "failed_invalid_phone" if invalid_phone else "send_failed", str(exc), {"attempt": attempts, "terminal": terminal})
 
+
+    def _is_after_cutoff_now(self) -> bool:
+        end_hhmm = int(self.cfg.get("worker", {}).get("poll_end_hhmm", 2130))
+        now_local = utc_now().astimezone(IST)
+        now_hhmm = now_local.hour * 100 + now_local.minute
+        return now_hhmm > end_hhmm
+
     def _within_window(self) -> bool:
         start_hhmm = int(self.cfg.get("worker", {}).get("poll_start_hhmm", 730))
         end_hhmm = int(self.cfg.get("worker", {}).get("poll_end_hhmm", 2130))
@@ -840,12 +900,13 @@ class ReportSenderWorker:
         return start_hhmm <= now_hhmm <= end_hhmm
 
     def process_once(self) -> None:
-        if not self._within_window():
-            self.log.info("Outside sender polling window; skipping cycle")
-            return
+        within_window = self._within_window()
+        if not within_window:
+            self.log.info("Outside sender polling window; maintenance-only cycle")
 
         self._watchdog_stuck_jobs()
         self._recover_invalid_phone_jobs()
+        self._refresh_paused_jobs()
 
         batch_size = int(self.cfg.get("worker", {}).get("batch_size", 25))
         max_scan_rows = int(self.cfg.get("worker", {}).get("max_scan_rows", max(100, batch_size * 8)))
@@ -871,6 +932,17 @@ class ReportSenderWorker:
             rows = rows[:max_scan_rows]
 
         self.log.info("Fetched %s jobs (batch_size=%s max_scan_rows=%s)", len(rows), batch_size, max_scan_rows)
+        if not within_window:
+            self.log.info("Skipping claim/send outside polling window")
+            self.log.info(
+                "metrics stuck_detected=%s auto_requeued=%s failed_timeout=%s status_reconciled=%s",
+                self.metrics["stuck_detected"],
+                self.metrics["auto_requeued"],
+                self.metrics["failed_timeout"],
+                self.metrics["status_reconciled"],
+            )
+            return
+
         now = utc_now()
         skipped_future = 0
         for row in rows:
