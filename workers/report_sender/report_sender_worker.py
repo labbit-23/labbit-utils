@@ -189,6 +189,20 @@ def requisition_after_cutoff(status: Dict[str, Any], cutoff_hhmm: int) -> bool:
     return hhmm > cutoff_hhmm
 
 
+def extract_phone_from_status(status: Dict[str, Any]) -> str:
+    top = norm_text(status.get("phoneno") or status.get("patient_phone") or status.get("MOBILENO"))
+    if top:
+        return top
+    tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+    for row in tests:
+        if not isinstance(row, dict):
+            continue
+        p = norm_text(row.get("PHONENO") or row.get("MOBILENO") or row.get("phoneno") or row.get("mobileno"))
+        if p:
+            return p
+    return ""
+
+
 def same_day_counts_and_pending(status: Dict[str, Any]) -> Tuple[int, int, List[str]]:
     tests = status.get("tests") if isinstance(status.get("tests"), list) else []
     required = [t for t in tests if isinstance(t, dict) and is_same_day_required(t)]
@@ -511,6 +525,17 @@ class ReportSenderWorker:
         rows = self.sb.list_failed_invalid_phone(self.cfg["tables"]["jobs"], limit=100)
         for job in rows:
             phone = norm_text(job.get("phone"))
+            # Targeted refresh for this reqno/reqid only, to pick corrected source phone.
+            try:
+                live = self._fetch_status(job)
+                src_phone = extract_phone_from_status(live)
+                if src_phone and digits_only(src_phone) != digits_only(phone):
+                    self._patch_job(job, {"phone": src_phone})
+                    phone = src_phone
+                    self._event(job, "phone_refreshed_from_source", "Updated phone from report-status source", {"old_phone": norm_text(job.get("phone")), "new_phone": src_phone})
+                    self.log.info("phone-refresh %s old=%s new=%s", self._job_ctx(job), norm_text(job.get("phone")), src_phone)
+            except Exception as e:
+                self.log.warning("phone-refresh-skip %s err=%s", self._job_ctx(job), e)
             if not is_valid_india_phone(phone):
                 continue
             self._patch_job(job, {
