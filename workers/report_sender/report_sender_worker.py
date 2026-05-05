@@ -260,6 +260,9 @@ def derive_group_ready_timestamps(status: Dict[str, Any]) -> Tuple[Optional[date
             continue
 
         group = norm_text(row.get("GROUPNM") or row.get("groupnm")).upper()
+        # Some payloads use SCAN/SCANS/XRAY/CT/MRI labels instead of RADIOLOGY.
+        if group in {"SCAN", "SCANS", "XRAY", "X-RAY", "CT", "MRI", "USG", "ULTRASOUND"}:
+            group = "RADIOLOGY"
         if not group:
             gid = norm_text(row.get("GROUPID") or row.get("groupid"))
             if gid == "GDEP0001":
