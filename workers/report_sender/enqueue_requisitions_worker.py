@@ -254,11 +254,11 @@ class EnqueueWorker:
         if not recent:
             return 0
 
-        # Only hit status API for unsent or partial-sent rows.
+        # Hit status API for unsent/partial rows, including skipped rows so they can be re-evaluated.
         candidates: List[Dict[str, Any]] = []
         for row in recent:
             status = norm(row.get("status")).lower()
-            if status in {"queued", "cooling_off", "eligible", "retrying", "failed", "sending"}:
+            if status in {"queued", "cooling_off", "eligible", "retrying", "failed", "sending", "skipped"}:
                 candidates.append(row)
                 continue
             if status == "sent" and self._is_partial_label(row.get("report_label")):
@@ -295,8 +295,45 @@ class EnqueueWorker:
                 self.log.warning("Reconcile status fetch failed reqno=%s err=%s", reqno, e)
                 continue
 
-            # Reconcile follow-up should happen only when report set is fully ready,
-            # not merely when same-day subset is ready.
+            latest_status = norm(row.get("status")).lower()
+            has_reportable = self._has_any_reportable_tests(live)
+
+            # For previously skipped rows: if reportable tests exist, reactivate into queued.
+            # If still no reportable tests, keep skipped.
+            if latest_status == "skipped":
+                if not has_reportable:
+                    self.log.info("Reconcile keep-skipped reqno=%s reason=no_reportable_tests", reqno)
+                    continue
+                new_job = {
+                    "lab_id": lab_id,
+                    "reqno": reqno,
+                    "reqid": reqid or None,
+                    "mrno": norm(row.get("mrno")) or None,
+                    "phone": phone,
+                    "patient_name": norm(row.get("patient_name")) or None,
+                    "status": "queued",
+                    "is_paused": paused_default,
+                    "force_send_now": False,
+                    "cooloff_minutes": cooloff,
+                    "attempt_count": 0,
+                    "max_attempts": max_attempts,
+                    "next_attempt_at": utc_iso(),
+                    "metadata": {
+                        "reconcile": True,
+                        "lookback_hours": lookback_hours,
+                        "reason": "reactivate_from_skipped_reportable"
+                    },
+                    "created_at": utc_iso(),
+                    "updated_at": utc_iso(),
+                }
+                if self.dry_run:
+                    self.log.info("[dry-run] reconcile re-activate reqno=%s from=skipped", reqno)
+                else:
+                    self.sb.insert_job(jobs_table, new_job)
+                added += 1
+                continue
+
+            # For non-skipped rows, follow-up only when fully ready.
             if not self._is_overall_full_ready(live):
                 continue
 
