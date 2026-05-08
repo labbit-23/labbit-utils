@@ -155,6 +155,14 @@ def build_template_report_label(status: Dict[str, Any]) -> str:
     return text
 
 
+def resolve_job_report_label(job: Dict[str, Any], status: Dict[str, Any]) -> str:
+    meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+    report_source = norm_text(meta.get("report_source")).lower()
+    if report_source == "outsourced_report":
+        return "outsourced report"
+    return build_template_report_label(status)
+
+
 def evaluate_same_day_readiness(status: Dict[str, Any]) -> bool:
     tests = status.get("tests") if isinstance(status.get("tests"), list) else []
     required = [t for t in tests if isinstance(t, dict) and is_same_day_required(t)]
@@ -674,7 +682,7 @@ class ReportSenderWorker:
         for job in rows:
             try:
                 status = self._fetch_status(job)
-                report_label = build_template_report_label(status)
+                report_label = resolve_job_report_label(job, status)
                 patch = {
                     "status": "queued",
                     "report_label": report_label,
@@ -781,7 +789,7 @@ class ReportSenderWorker:
             return
 
         status = self._fetch_status(job)
-        report_label = build_template_report_label(status)
+        report_label = resolve_job_report_label(job, status)
         self.log.info("status-check %s overall=%s label=%s", self._job_ctx(job, status), norm_text(status.get("overall_status") or "-"), report_label)
         sameday_total, sameday_ready, not_ready_tests = same_day_counts_and_pending(status)
 
