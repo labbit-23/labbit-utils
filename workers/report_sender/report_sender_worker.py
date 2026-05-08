@@ -691,8 +691,15 @@ class ReportSenderWorker:
         base = norm_text(self.cfg["labbit_py"].get("base_url")).rstrip("/")
         reqid = norm_text(job.get("reqid") or status.get("reqid"))
         reqno = norm_text(job.get("reqno") or status.get("reqno"))
+        meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+        report_source = norm_text(meta.get("report_source")).lower()
+        outsourced_testid = norm_text(meta.get("outsourced_testid"))
         if not base or not reqid:
             raise ValueError("Missing base_url or reqid for report document URL")
+        if report_source == "outsourced_report":
+            if not outsourced_testid:
+                raise ValueError("Missing outsourced_testid for outsourced report URL")
+            return f"{base}/outsourced-report?reqid={reqid}&testid={outsourced_testid}"
         if reqno:
             return f"{base}/report/{reqid}?reqno={reqno}"
         return f"{base}/report/{reqid}"
@@ -701,14 +708,19 @@ class ReportSenderWorker:
         wa = self.cfg["whatsapp"]
         reqno = norm_text(job.get("reqno") or status.get("reqno"))
         reqid = norm_text(job.get("reqid") or status.get("reqid"))
+        meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+        report_source = norm_text(meta.get("report_source") or "requisition_report").lower() or "requisition_report"
+        outsourced_testid = norm_text(meta.get("outsourced_testid"))
         patient_name = norm_text(status.get("patient_name") or job.get("patient_name") or "Patient") or "Patient"
         payload = {
             "lab_id": wa["lab_id"],
             "phone": norm_text(job.get("phone") or status.get("patient_phone")),
             "patient_name": patient_name,
             "report_label": report_label,
-            "report_source": "requisition_report",
+            "report_source": report_source,
             "reqno": reqno or None,
+            "reqid": reqid or None,
+            "testid": outsourced_testid or None,
             "source_service": norm_text(wa.get("source_service") or "report_sender_worker")
         }
 
@@ -880,28 +892,31 @@ class ReportSenderWorker:
             return
 
         attempts = int(job.get("attempt_count") or 0)
+        meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+        report_source = norm_text(meta.get("report_source") or "requisition_report").lower() or "requisition_report"
 
         # Duplicate-send guard: do not resend when same-day ready count has not increased.
-        latest_sent = self.sb.get_latest_sent_job_for_reqno(self.cfg["tables"]["jobs"], norm_text(job.get("reqno")))
-        if latest_sent:
-            prev_snap = latest_sent.get("last_status_snapshot") if isinstance(latest_sent.get("last_status_snapshot"), dict) else {}
-            prev_total, prev_ready, _ = same_day_counts_and_pending(prev_snap if isinstance(prev_snap, dict) else {})
-            if sameday_total > 0 and sameday_ready <= prev_ready and sameday_total == prev_total:
-                self._patch_job(job, {
-                    "status": "queued",
-                    "report_label": report_label,
-                    "last_status_snapshot": status,
-                    "next_attempt_at": utc_iso(utc_now() + timedelta(minutes=20)),
-                    "last_error": None,
-                })
-                self._event(job, "queued_wait", "Skipped duplicate send: same-day ready count unchanged", {
-                    "label": report_label,
-                    "sameday_total": sameday_total,
-                    "sameday_ready": sameday_ready,
-                    "prev_sameday_ready": prev_ready,
-                    "not_ready_tests": not_ready_tests[:30],
-                })
-                return
+        if report_source != "outsourced_report":
+            latest_sent = self.sb.get_latest_sent_job_for_reqno(self.cfg["tables"]["jobs"], norm_text(job.get("reqno")))
+            if latest_sent:
+                prev_snap = latest_sent.get("last_status_snapshot") if isinstance(latest_sent.get("last_status_snapshot"), dict) else {}
+                prev_total, prev_ready, _ = same_day_counts_and_pending(prev_snap if isinstance(prev_snap, dict) else {})
+                if sameday_total > 0 and sameday_ready <= prev_ready and sameday_total == prev_total:
+                    self._patch_job(job, {
+                        "status": "queued",
+                        "report_label": report_label,
+                        "last_status_snapshot": status,
+                        "next_attempt_at": utc_iso(utc_now() + timedelta(minutes=20)),
+                        "last_error": None,
+                    })
+                    self._event(job, "queued_wait", "Skipped duplicate send: same-day ready count unchanged", {
+                        "label": report_label,
+                        "sameday_total": sameday_total,
+                        "sameday_ready": sameday_ready,
+                        "prev_sameday_ready": prev_ready,
+                        "not_ready_tests": not_ready_tests[:30],
+                    })
+                    return
 
         self._patch_job(job, {
             "status": "sending",
