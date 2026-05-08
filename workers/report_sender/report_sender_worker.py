@@ -181,6 +181,19 @@ def has_same_day_required_tests(status: Dict[str, Any]) -> bool:
     return bool(required)
 
 
+def is_lab_or_radiology_test(row: Dict[str, Any]) -> bool:
+    group = norm_text(row.get("GROUPNM") or row.get("groupnm")).upper()
+    if group in {"LAB", "RADIOLOGY", "SCAN", "SCANS", "XRAY", "X-RAY", "CT", "MRI", "USG", "ULTRASOUND"}:
+        return True
+    gid = norm_text(row.get("GROUPID") or row.get("groupid"))
+    return gid in {"GDEP0001", "GDEP0002"}
+
+
+def has_any_reportable_test(status: Dict[str, Any]) -> bool:
+    tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+    return any(isinstance(t, dict) and is_lab_or_radiology_test(t) for t in tests)
+
+
 def is_no_reportable_case(status: Dict[str, Any]) -> bool:
     lab_total = int(status.get("lab_total") or 0)
     rad_total = int(status.get("radiology_total") or 0)
@@ -191,7 +204,7 @@ def is_no_reportable_case(status: Dict[str, Any]) -> bool:
     if not tests:
         return False
 
-    reportable = [t for t in tests if isinstance(t, dict) and is_same_day_required(t)]
+    reportable = [t for t in tests if isinstance(t, dict) and is_lab_or_radiology_test(t)]
     if reportable:
         return False
 
@@ -390,6 +403,21 @@ class SupabaseRest:
         rows = r.json()
         return rows if isinstance(rows, list) else []
 
+    def list_stale_inflight(self, table: str, before_iso: str, limit: int = 200) -> List[Dict[str, Any]]:
+        url = f"{self.base}/{table}"
+        params = {
+            "select": "*",
+            "status": "in.(processing,sending)",
+            "sent_at": "is.null",
+            "updated_at": f"lt.{before_iso}",
+            "order": "updated_at.asc",
+            "limit": str(limit),
+        }
+        r = self.session.get(url, headers=self.headers, params=params, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return rows if isinstance(rows, list) else []
+
     def list_failed_invalid_phone(self, table: str, limit: int = 100) -> List[Dict[str, Any]]:
         url = f"{self.base}/{table}"
         params = {
@@ -530,6 +558,26 @@ class ReportSenderWorker:
         max_requeues = int(os.getenv("REPORT_SENDER_STUCK_MAX_AUTO_REQUEUES", worker_cfg.get("stuck_max_auto_requeues", 3)))
         scan_limit = int(os.getenv("REPORT_SENDER_STUCK_SCAN_LIMIT", worker_cfg.get("stuck_scan_limit", 500)))
         now = utc_now()
+        inflight_minutes = int(os.getenv("REPORT_SENDER_STUCK_INFLIGHT_MINUTES", worker_cfg.get("stuck_inflight_minutes", 15)))
+        inflight_limit = int(os.getenv("REPORT_SENDER_STUCK_INFLIGHT_LIMIT", worker_cfg.get("stuck_inflight_limit", 200)))
+        before_iso = utc_iso(now - timedelta(minutes=max(1, inflight_minutes)))
+        stale_rows = self.sb.list_stale_inflight(self.cfg["tables"]["jobs"], before_iso=before_iso, limit=inflight_limit)
+        for job in stale_rows:
+            prev = norm_text(job.get("status")).lower()
+            self._patch_job(job, {
+                "status": "queued",
+                "next_attempt_at": utc_iso(now),
+                "last_error": None,
+            })
+            self._event(job, "auto_requeue_stuck_inflight", "Watchdog auto-requeued stale inflight job", {
+                "previous_status": prev,
+                "updated_at": norm_text(job.get("updated_at")),
+                "threshold_minutes": inflight_minutes,
+                "reason": "stale_processing_or_sending",
+            })
+            self.metrics["auto_requeued"] += 1
+            self.log.warning("auto_requeued_inflight job_id=%s reqno=%s prev=%s threshold_min=%s", job.get("id"), norm_text(job.get("reqno")), prev, inflight_minutes)
+
         rows = self.sb.list_watchdog_candidates(self.cfg["tables"]["jobs"], limit=scan_limit)
         for job in rows:
             latest = self.sb.get_latest_event(self.cfg["tables"]["events"], job.get("id"))
@@ -728,15 +776,24 @@ class ReportSenderWorker:
         has_required = has_same_day_required_tests(status)
         all_ready = evaluate_same_day_readiness(status)
         if is_no_reportable_case(status):
+            reason = "no_lab_or_radiology_tests"
+            if has_any_reportable_test(status):
+                reason = "non_reportable_by_policy"
             self._patch_job(job, {
                 "status": "skipped",
                 "report_label": report_label,
                 "last_status_snapshot": status,
                 "last_error": None,
                 "next_attempt_at": None,
+                "metadata": {
+                    "skip_reason": reason,
+                    "overall_status": norm_text(status.get("overall_status")).upper(),
+                    "lab_total": int(status.get("lab_total") or 0),
+                    "radiology_total": int(status.get("radiology_total") or 0),
+                },
             })
-            self._event(job, "skipped_no_reportable_tests", "No reportable lab/radiology tests found", {})
-            self.log.info("skip-no-reportable %s", self._job_ctx(job, status))
+            self._event(job, "skipped_no_reportable_tests", "No reportable lab/radiology tests found", {"reason": reason})
+            self.log.info("skip-no-reportable %s reason=%s", self._job_ctx(job, status), reason)
             return
         if not has_required:
             overall = norm_text(status.get("overall_status")).upper()

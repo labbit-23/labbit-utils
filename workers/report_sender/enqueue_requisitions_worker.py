@@ -189,10 +189,21 @@ class EnqueueWorker:
     def _is_same_day_required(self, row: Dict[str, Any]) -> bool:
         return norm(row.get("SAMEDAYREPORT") or row.get("samedayreport")) == "1"
 
+    def _is_lab_or_radiology_test(self, row: Dict[str, Any]) -> bool:
+        group = norm(row.get("GROUPNM") or row.get("groupnm")).upper()
+        if group in {"LAB", "RADIOLOGY", "SCAN", "SCANS", "XRAY", "X-RAY", "CT", "MRI", "USG", "ULTRASOUND"}:
+            return True
+        gid = norm(row.get("GROUPID") or row.get("groupid"))
+        return gid in {"GDEP0001", "GDEP0002"}
+
     def _is_ready_test(self, row: Dict[str, Any]) -> bool:
         status = norm(row.get("REPORT_STATUS") or row.get("report_status")).upper()
         approved = norm(row.get("APPROVEDFLG") or row.get("approvedflg")) == "1"
         return approved or status in {"LAB_READY", "RADIOLOGY_READY"}
+
+    def _has_any_reportable_tests(self, status: Dict[str, Any]) -> bool:
+        tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+        return any(isinstance(t, dict) and self._is_lab_or_radiology_test(t) for t in tests)
 
     def _same_day_full_ready(self, status: Dict[str, Any]) -> bool:
         tests = status.get("tests") if isinstance(status.get("tests"), list) else []
@@ -407,8 +418,21 @@ class EnqueueWorker:
                 )
                 continue
 
-            if self.sb.job_exists(jobs_table, reqno):
-                continue
+            latest = self.sb.latest_job(jobs_table, reqno)
+            if latest:
+                latest_status = norm(latest.get("status")).lower()
+                if latest_status in {"queued", "cooling_off", "eligible", "retrying", "sending", "processing", "sent"}:
+                    continue
+                # If latest is skipped/failed, re-evaluate live status and allow re-activation
+                # when reportable tests are present (e.g., non-same-day culture/TMT pending).
+                if latest_status in {"skipped", "failed"}:
+                    try:
+                        live = self._fetch_status(reqno=reqno, reqid=reqid)
+                    except Exception as e:
+                        self.log.warning("Skip reactivation reqno=%s status-fetch-failed err=%s", reqno, e)
+                        continue
+                    if not self._has_any_reportable_tests(live):
+                        continue
 
             if self.sb.dispatched_exists(reqno, phone):
                 continue
