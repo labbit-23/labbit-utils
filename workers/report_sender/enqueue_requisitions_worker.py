@@ -70,6 +70,19 @@ class SupabaseRest:
             return rows[0]
         return {}
 
+    def list_jobs_by_reqno(self, table: str, reqno: str, limit: int = 200) -> List[Dict[str, Any]]:
+        u = f"{self.base}/{table}"
+        p = {
+            "select": "id,reqno,status,metadata,updated_at,created_at",
+            "reqno": f"eq.{reqno}",
+            "order": "updated_at.desc,created_at.desc,id.desc",
+            "limit": str(limit),
+        }
+        r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return rows if isinstance(rows, list) else []
+
     def has_active_job(self, table: str, reqno: str) -> bool:
         u = f"{self.base}/{table}"
         p = {
@@ -239,6 +252,20 @@ class EnqueueWorker:
             if report_status != "OUTSOURCED":
                 return False
         return True
+
+    def _has_outsourced_job(self, jobs_table: str, reqno: str, testid: str, statuses: set[str]) -> bool:
+        rows = self.sb.list_jobs_by_reqno(jobs_table, reqno=reqno, limit=300)
+        wanted = norm(testid).upper()
+        for row in rows:
+            st = norm(row.get("status")).lower()
+            if st not in statuses:
+                continue
+            meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            src = norm(meta.get("report_source")).lower()
+            tid = norm(meta.get("outsourced_testid")).upper()
+            if src == "outsourced_report" and tid == wanted:
+                return True
+        return False
 
     def _fetch_outsourced_meta(self, reqid: str, testid: str) -> Dict[str, Any]:
         base = norm(self.cfg.get("labbit_py", {}).get("base_url")).rstrip("/")
@@ -527,57 +554,68 @@ class EnqueueWorker:
             if self.sb.dispatched_exists(reqno, phone):
                 continue
 
-            # For outsourced-only requisitions, create separate outsourced dispatch jobs
-            # so they are tracked/sent via outsourced route instead of combined /report path.
+            # Live status is used for outsourced split-job detection and reactivation decisions.
             try:
                 live = self._fetch_status(reqno=reqno, reqid=reqid)
             except Exception as e:
                 self.log.warning("Skip enqueue reqno=%s reason=status-fetch-failed err=%s", reqno, e)
                 continue
 
-            if self._is_outsourced_only_reportable(live):
-                outsourced_testids = self._extract_outsourced_ready_testids(live)
-                attached_modes = {"attached_base", "attached_qr"}
-                outsourced_enqueued = 0
-                for testid in outsourced_testids:
-                    meta = self._fetch_outsourced_meta(reqid=reqid, testid=testid)
-                    mode = norm(meta.get("outsourced_mode") or meta.get("mode")).lower()
-                    # Only enqueue separate outsourced jobs for attached-PDF routes.
-                    # Transcribed rows should remain on regular requisition flow.
-                    if mode and mode not in attached_modes:
-                        continue
-                    job = {
-                        "lab_id": lab_id,
-                        "reqno": reqno,
-                        "reqid": reqid or None,
-                        "mrno": mrno or None,
-                        "phone": phone,
-                        "patient_name": name or None,
-                        "status": "queued",
-                        "is_paused": paused_default,
-                        "force_send_now": False,
-                        "cooloff_minutes": cooloff,
-                        "attempt_count": 0,
-                        "max_attempts": int(self.cfg.get("worker", {}).get("max_attempts", 5)),
-                        "next_attempt_at": utc_iso(),
-                        "metadata": {
-                            "report_source": "outsourced_report",
-                            "outsourced_testid": testid,
-                            "outsourced_mode": mode or None,
-                            "reason": "outsourced_only_separate_job",
-                        },
-                        "created_at": utc_iso(),
-                        "updated_at": utc_iso(),
-                    }
-                    if self.dry_run:
-                        self.log.info("[dry-run] enqueue-outsourced reqno=%s testid=%s", reqno, testid)
-                    else:
-                        self.sb.insert_job(jobs_table, job)
-                    enqueued += 1
-                    outsourced_enqueued += 1
-                # If we queued attached outsourced jobs, skip combined job for this requisition.
-                if outsourced_enqueued > 0:
+            # Split outsourced attached-PDF tests into separate jobs (works for mixed and outsourced-only requisitions).
+            outsourced_testids = self._extract_outsourced_ready_testids(live)
+            attached_modes = {"attached_base", "attached_qr"}
+            outsourced_enqueued = 0
+            for testid in outsourced_testids:
+                # Dedupe by reqno+testid for active/sent outsourced jobs.
+                if self._has_outsourced_job(
+                    jobs_table,
+                    reqno=reqno,
+                    testid=testid,
+                    statuses={"queued", "cooling_off", "eligible", "retrying", "sending", "processing", "sent"},
+                ):
                     continue
+                meta = self._fetch_outsourced_meta(reqid=reqid, testid=testid)
+                mode = norm(meta.get("outsourced_mode") or meta.get("mode")).lower()
+                # Only enqueue separate outsourced jobs for attached-PDF routes.
+                # Transcribed rows remain on regular requisition flow.
+                if mode and mode not in attached_modes:
+                    continue
+                if not mode:
+                    continue
+                job = {
+                    "lab_id": lab_id,
+                    "reqno": reqno,
+                    "reqid": reqid or None,
+                    "mrno": mrno or None,
+                    "phone": phone,
+                    "patient_name": name or None,
+                    "status": "queued",
+                    "is_paused": paused_default,
+                    "force_send_now": False,
+                    "cooloff_minutes": cooloff,
+                    "attempt_count": 0,
+                    "max_attempts": int(self.cfg.get("worker", {}).get("max_attempts", 5)),
+                    "next_attempt_at": utc_iso(),
+                    "metadata": {
+                        "report_source": "outsourced_report",
+                        "outsourced_testid": testid,
+                        "outsourced_mode": mode,
+                        "reason": "outsourced_separate_job",
+                    },
+                    "created_at": utc_iso(),
+                    "updated_at": utc_iso(),
+                }
+                if self.dry_run:
+                    self.log.info("[dry-run] enqueue-outsourced reqno=%s testid=%s mode=%s", reqno, testid, mode)
+                else:
+                    self.sb.insert_job(jobs_table, job)
+                enqueued += 1
+                outsourced_enqueued += 1
+
+            # For outsourced-only requisitions, avoid creating a regular combined job when
+            # at least one attached outsourced job was created.
+            if self._is_outsourced_only_reportable(live) and outsourced_enqueued > 0:
+                continue
 
             job = {
                 "lab_id": lab_id,
