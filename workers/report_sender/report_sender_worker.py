@@ -83,6 +83,10 @@ def digits_only(value: Any) -> str:
     return "".join(ch for ch in str(value or "") if ch.isdigit())
 
 
+def _digits_changed(prev: Any, cur: Any) -> bool:
+    return digits_only(prev) != digits_only(cur)
+
+
 def is_valid_india_phone(value: Any) -> bool:
     d = digits_only(value)
     return len(d) == 10 or (len(d) == 12 and d.startswith("91"))
@@ -631,18 +635,25 @@ class ReportSenderWorker:
         rows = self.sb.list_failed_invalid_phone(self.cfg["tables"]["jobs"], limit=100)
         for job in rows:
             phone = norm_text(job.get("phone"))
+            meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+            failed_phone = norm_text(meta.get("invalid_phone_at_failure") or phone)
+            changed = _digits_changed(failed_phone, phone)
             # Targeted refresh for this reqno/reqid only, to pick corrected source phone.
             try:
                 live = self._fetch_status(job)
                 src_phone = extract_phone_from_status(live)
-                if src_phone and digits_only(src_phone) != digits_only(phone):
+                if src_phone and _digits_changed(phone, src_phone):
                     self._patch_job(job, {"phone": src_phone})
+                    changed = _digits_changed(failed_phone, src_phone)
                     phone = src_phone
                     self._event(job, "phone_refreshed_from_source", "Updated phone from report-status source", {"old_phone": norm_text(job.get("phone")), "new_phone": src_phone})
                     self.log.info("phone-refresh %s old=%s new=%s", self._job_ctx(job), norm_text(job.get("phone")), src_phone)
             except Exception as e:
                 self.log.warning("phone-refresh-skip %s err=%s", self._job_ctx(job), e)
             if not is_valid_india_phone(phone):
+                continue
+            if not changed:
+                # Keep INVALID_PHONE terminal unless source phone actually changed.
                 continue
             self._patch_job(job, {
                 "status": "queued",
@@ -775,10 +786,20 @@ class ReportSenderWorker:
             candidates.append(rad_ready_at + timedelta(minutes=cooloff_rad))
 
         if candidates:
-            return max(candidates)
+            base_schedule = max(candidates)
+        else:
+            approved_at = parse_status_dt_ist_to_utc(status.get("latest_approved_at")) or utc_now()
+            base_schedule = approved_at + timedelta(minutes=cooloff_default)
 
-        approved_at = parse_status_dt_ist_to_utc(status.get("latest_approved_at")) or utc_now()
-        return approved_at + timedelta(minutes=cooloff_default)
+        # One-sided jitter only (+0..N min): preserves minimum cooloff while smoothing bursts.
+        jitter_max = int(worker_cfg.get("cooloff_jitter_max_minutes", 0) or 0)
+        if jitter_max <= 0:
+            return base_schedule
+        # Stable per-job jitter seed to avoid schedule flapping across cycles.
+        seed_input = f"{norm_text(job.get('reqno'))}|{norm_text(job.get('reqid'))}|{norm_text(job.get('id'))}"
+        digest = hashlib.sha256(seed_input.encode("utf-8")).hexdigest()
+        jitter_minutes = int(digest[:8], 16) % (jitter_max + 1)
+        return base_schedule + timedelta(minutes=jitter_minutes)
 
     def process_job(self, job: Dict[str, Any]) -> None:
         if not job.get("id"):
@@ -957,10 +978,14 @@ class ReportSenderWorker:
             err_text = str(exc)
             invalid_phone = INVALID_PHONE_SENTINEL in err_text or "Phone must be 10 digits" in err_text
             terminal = invalid_phone or attempts >= max_attempts
+            patch_meta = dict(meta or {})
+            if invalid_phone:
+                patch_meta["invalid_phone_at_failure"] = norm_text(job.get("phone"))
             self._patch_job(job, {
                 "status": "failed" if terminal else "retrying",
                 "last_error": INVALID_PHONE_SENTINEL if invalid_phone else err_text,
                 "next_attempt_at": None if terminal else utc_iso(utc_now() + timedelta(seconds=delay)),
+                "metadata": patch_meta,
             })
             self.log.error("send-failed %s attempt=%s terminal=%s error=%s", self._job_ctx(job, status), attempts, terminal, str(exc))
             self._event(job, "failed_invalid_phone" if invalid_phone else "send_failed", str(exc), {"attempt": attempts, "terminal": terminal})
@@ -984,9 +1009,19 @@ class ReportSenderWorker:
         if not within_window:
             self.log.info("Outside sender polling window; maintenance-only cycle")
 
-        self._watchdog_stuck_jobs()
-        self._recover_invalid_phone_jobs()
-        self._refresh_paused_jobs()
+        # Maintenance failures must never block valid sends.
+        try:
+            self._watchdog_stuck_jobs()
+        except Exception as exc:
+            self.log.exception("watchdog-failed: %s", exc)
+        try:
+            self._recover_invalid_phone_jobs()
+        except Exception as exc:
+            self.log.exception("invalid-phone-recover-failed: %s", exc)
+        try:
+            self._refresh_paused_jobs()
+        except Exception as exc:
+            self.log.exception("paused-refresh-cycle-failed: %s", exc)
 
         batch_size = int(self.cfg.get("worker", {}).get("batch_size", 25))
         max_scan_rows = int(self.cfg.get("worker", {}).get("max_scan_rows", max(100, batch_size * 8)))
