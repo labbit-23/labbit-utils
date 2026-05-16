@@ -387,6 +387,13 @@ class EnqueueWorker:
                 if not has_reportable:
                     self.log.info("Reconcile keep-skipped reqno=%s reason=no_reportable_tests", reqno)
                     continue
+                if self._should_skip_invalid_phone_reenqueue(jobs_table, reqno, phone):
+                    self.log.info(
+                        "Reconcile skip reqno=%s reason=failed_invalid_phone_unchanged phone=%s",
+                        reqno,
+                        phone,
+                    )
+                    continue
                 new_job = {
                     "lab_id": lab_id,
                     "reqno": reqno,
@@ -431,6 +438,13 @@ class EnqueueWorker:
                     continue
 
             # If partial was sent and now fully ready, enqueue a follow-up send job.
+            if self._should_skip_invalid_phone_reenqueue(jobs_table, reqno, phone):
+                self.log.info(
+                    "Reconcile skip reqno=%s reason=failed_invalid_phone_unchanged phone=%s",
+                    reqno,
+                    phone,
+                )
+                continue
             new_job = {
                 "lab_id": lab_id,
                 "reqno": reqno,
