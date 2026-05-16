@@ -312,17 +312,20 @@ class EnqueueWorker:
         return "complete" in t and "partial" not in t
 
     def _should_skip_invalid_phone_reenqueue(self, jobs_table: str, reqno: str, incoming_phone: str) -> bool:
-        latest = self.sb.latest_job(jobs_table, reqno)
-        if not latest:
-            return False
-        status = norm(latest.get("status")).lower()
-        last_error = norm(latest.get("last_error")).upper()
-        if status != "failed" or last_error != "INVALID_PHONE":
-            return False
-        prev_phone = digits_only(latest.get("phone"))
+        # Guard against churn: if ANY recent failed INVALID_PHONE exists for this reqno
+        # with the same phone, do not create yet another job.
+        rows = self.sb.list_jobs_by_reqno(jobs_table, reqno=reqno, limit=200)
         cur_phone = digits_only(incoming_phone)
-        # Allow new enqueue only if phone changed from previously failed invalid phone.
-        return prev_phone == cur_phone
+        if not cur_phone:
+            return False
+        for row in rows:
+            status = norm(row.get("status")).lower()
+            last_error = norm(row.get("last_error")).upper()
+            if status == "failed" and last_error == "INVALID_PHONE":
+                prev_phone = digits_only(row.get("phone"))
+                if prev_phone == cur_phone:
+                    return True
+        return False
 
     def _reconcile_recent(self, jobs_table: str) -> int:
         lookback_hours = int(self.cfg.get("enqueue", {}).get("lookback_hours", 0) or 0)
