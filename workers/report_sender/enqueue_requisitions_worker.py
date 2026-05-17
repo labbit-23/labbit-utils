@@ -593,12 +593,13 @@ class EnqueueWorker:
                     continue
                 meta = self._fetch_outsourced_meta(reqid=reqid, testid=testid)
                 mode = norm(meta.get("outsourced_mode") or meta.get("mode")).lower()
-                # Only enqueue separate outsourced jobs for attached-PDF routes.
+                # Enqueue separate outsourced jobs for attached-PDF routes.
+                # If mode resolver is unavailable, fail-open to split-job enqueue so
+                # outsourced ready tests are not silently dropped.
                 # Transcribed rows remain on regular requisition flow.
                 if mode and mode not in attached_modes:
                     continue
-                if not mode:
-                    continue
+                normalized_mode = mode or "unavailable"
                 job = {
                     "lab_id": lab_id,
                     "reqno": reqno,
@@ -616,7 +617,7 @@ class EnqueueWorker:
                     "metadata": {
                         "report_source": "outsourced_report",
                         "outsourced_testid": testid,
-                        "outsourced_mode": mode,
+                        "outsourced_mode": normalized_mode,
                         "reason": "outsourced_separate_job",
                     },
                     "created_at": utc_iso(),
