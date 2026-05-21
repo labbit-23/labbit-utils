@@ -163,6 +163,20 @@ class SupabaseRest:
         rows = r.json()
         return rows if isinstance(rows, list) else []
 
+    def list_recent_failed_regular_jobs(self, table: str, since_iso: str, limit: int = 200) -> List[Dict[str, Any]]:
+        u = f"{self.base}/{table}"
+        p = {
+            "select": "id,reqno,reqid,mrno,phone,patient_name,metadata",
+            "status": "eq.failed",
+            "updated_at": f"gte.{since_iso}",
+            "order": "updated_at.desc",
+            "limit": str(limit),
+        }
+        r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return rows if isinstance(rows, list) else []
+
     def dispatched_exists(self, reqno: str, phone: str) -> bool:
         # report_dispatch_logs lives in labbit-main schema and indicates already sent dispatches.
         u = f"{self.base}/report_dispatch_logs"
@@ -608,6 +622,86 @@ class EnqueueWorker:
                 else:
                     self.sb.insert_job(jobs_table, job)
                 self.log.info("reconcile-outsourced enqueued reqno=%s testid=%s mode=%s", reqno, testid, mode)
+                added += 1
+
+        # Also scan failed regular jobs — PDF may have arrived after they exhausted retries.
+        # No snapshot pre-filter here: failed jobs may have been created before the test was outsourced.
+        failed_rows = self.sb.list_recent_failed_regular_jobs(
+            jobs_table,
+            since.isoformat(),
+            limit=int(self.cfg.get("enqueue", {}).get("outsourced_lookback_max_rows", 200)),
+        )
+        for row in failed_rows:
+            row_meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            if norm(row_meta.get("report_source")).lower() == "outsourced_report":
+                continue
+
+            reqno = norm(row.get("reqno"))
+            reqid = norm(row.get("reqid"))
+            phone = norm(row.get("phone"))
+            if not reqno or not phone or reqno in seen_reqnos:
+                continue
+            seen_reqnos.add(reqno)
+
+            try:
+                live = self._fetch_status(reqno=reqno, reqid=reqid)
+            except Exception as e:
+                self.log.warning("reconcile-outsourced-failed status-fetch-failed reqno=%s err=%s", reqno, e)
+                continue
+
+            outsourced_testids = self._extract_outsourced_ready_testids(live)
+            if not outsourced_testids:
+                continue
+
+            mrno = norm(row.get("mrno"))
+            name = norm(row.get("patient_name"))
+
+            for testid in outsourced_testids:
+                if self._has_outsourced_job(
+                    jobs_table,
+                    reqno=reqno,
+                    testid=testid,
+                    statuses={"queued", "cooling_off", "eligible", "retrying", "sending", "processing", "sent"},
+                ):
+                    continue
+
+                meta_resp = self._fetch_outsourced_meta(reqid=reqid, testid=testid)
+                mode = norm(meta_resp.get("outsourced_mode") or meta_resp.get("mode")).lower()
+                if not mode or mode not in attached_modes:
+                    self.log.info(
+                        "reconcile-outsourced-failed skip reqno=%s testid=%s mode=%s reason=pdf_not_available",
+                        reqno, testid, mode or "unknown",
+                    )
+                    continue
+
+                job = {
+                    "lab_id": lab_id,
+                    "reqno": reqno,
+                    "reqid": reqid or None,
+                    "mrno": mrno or None,
+                    "phone": phone,
+                    "patient_name": name or None,
+                    "status": "queued",
+                    "is_paused": paused_default,
+                    "force_send_now": False,
+                    "cooloff_minutes": cooloff,
+                    "attempt_count": 0,
+                    "max_attempts": max_attempts,
+                    "next_attempt_at": utc_iso(),
+                    "metadata": {
+                        "report_source": "outsourced_report",
+                        "outsourced_testid": testid,
+                        "outsourced_mode": mode,
+                        "reason": "outsourced_reconcile_from_failed",
+                    },
+                    "created_at": utc_iso(),
+                    "updated_at": utc_iso(),
+                }
+                if self.dry_run:
+                    self.log.info("[dry-run] reconcile-outsourced-failed enqueue reqno=%s testid=%s mode=%s", reqno, testid, mode)
+                else:
+                    self.sb.insert_job(jobs_table, job)
+                self.log.info("reconcile-outsourced-failed enqueued reqno=%s testid=%s mode=%s", reqno, testid, mode)
                 added += 1
 
         if added:
