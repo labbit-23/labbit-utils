@@ -209,6 +209,44 @@ class SupabaseRest:
         )
         r.raise_for_status()
 
+    def defer_job_by_id(self, table: str, job_id: int, hours: int, merged_meta: dict) -> None:
+        next_at = (datetime.utcnow() + timedelta(hours=hours)).isoformat() + "Z"
+        patch = {
+            "status": "cooling_off",
+            "next_attempt_at": next_at,
+            "cooloff_minutes": hours * 60,
+            "metadata": merged_meta,
+            "updated_at": utc_iso(),
+        }
+        u = f"{self.base}/{table}"
+        r = self.http.patch(u, headers=self.headers, params={"id": f"eq.{job_id}"},
+                            data=json.dumps(patch), timeout=self.timeout)
+        r.raise_for_status()
+
+    def fail_job_by_id(self, table: str, job_id: int, last_error: str) -> None:
+        u = f"{self.base}/{table}"
+        r = self.http.patch(
+            u,
+            headers=self.headers,
+            params={"id": f"eq.{job_id}"},
+            data=json.dumps({"status": "failed", "last_error": last_error, "updated_at": utc_iso()}),
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+
+    def list_deferred_outsourced_jobs(self, table: str, limit: int = 200) -> List[Dict[str, Any]]:
+        u = f"{self.base}/{table}"
+        p = {
+            "select": "id,reqno,metadata,updated_at",
+            "status": "eq.cooling_off",
+            "metadata->>deferred_reason": "eq.outsourced_split_created",
+            "limit": str(limit),
+        }
+        r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return rows if isinstance(rows, list) else []
+
 
 class EnqueueWorker:
     def __init__(self, cfg: Dict[str, Any], dry_run: bool = False) -> None:
@@ -715,17 +753,45 @@ class EnqueueWorker:
                     self.sb.insert_job(jobs_table, job)
                     if source_job_id:
                         try:
-                            self.sb.cancel_job_by_id(jobs_table, source_job_id)
-                            self.log.info("reconcile-outsourced-failed cancelled source job_id=%s reqno=%s", source_job_id, reqno)
-                            source_job_id = None  # only cancel once per reqno
+                            defer_hours = int(self.cfg.get("enqueue", {}).get("outsourced_defer_hours", 6))
+                            src_meta = dict(row.get("metadata") or {})
+                            src_meta["deferred_reason"] = "outsourced_split_created"
+                            src_meta["deferred_at"] = utc_iso()
+                            self.sb.defer_job_by_id(jobs_table, source_job_id, hours=defer_hours, merged_meta=src_meta)
+                            self.log.info("reconcile-outsourced-failed deferred source job_id=%s reqno=%s hours=%s", source_job_id, reqno, defer_hours)
+                            source_job_id = None  # only defer once per reqno
                         except Exception as e:
-                            self.log.warning("reconcile-outsourced-failed cancel-failed job_id=%s err=%s", source_job_id, e)
+                            self.log.warning("reconcile-outsourced-failed defer-failed job_id=%s err=%s", source_job_id, e)
                 self.log.info("reconcile-outsourced-failed enqueued reqno=%s testid=%s mode=%s", reqno, testid, mode)
                 added += 1
 
         if added:
             self.log.info("Reconcile-outsourced complete. new_outsourced_jobs=%s", added)
         return added
+
+    def _expire_deferred_jobs(self, jobs_table: str) -> None:
+        expire_days = int(self.cfg.get("enqueue", {}).get("outsourced_defer_expire_days", 10))
+        cutoff = datetime.now(timezone.utc) - timedelta(days=expire_days)
+        rows = self.sb.list_deferred_outsourced_jobs(jobs_table, limit=200)
+        for row in rows:
+            meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            deferred_at_str = meta.get("deferred_at")
+            if not deferred_at_str:
+                continue
+            try:
+                deferred_at = datetime.fromisoformat(deferred_at_str.replace("Z", "+00:00"))
+                if deferred_at.tzinfo is None:
+                    deferred_at = deferred_at.replace(tzinfo=timezone.utc)
+                if deferred_at > cutoff:
+                    continue
+            except Exception:
+                continue
+            job_id = row.get("id")
+            try:
+                self.sb.fail_job_by_id(jobs_table, job_id, last_error="outsourced_defer_expired")
+                self.log.warning("outsourced-defer-expired job_id=%s reqno=%s deferred_at=%s", job_id, row.get("reqno"), deferred_at_str)
+            except Exception as e:
+                self.log.warning("outsourced-defer-expired fail-error job_id=%s err=%s", job_id, e)
 
     def _today_ist(self) -> str:
         return now_ist().strftime("%Y-%m-%d")
@@ -911,6 +977,7 @@ class EnqueueWorker:
         self.log.info("Enqueue complete. new_jobs=%s", enqueued)
         self._reconcile_recent(jobs_table)
         self._reconcile_outsourced_jobs(jobs_table)
+        self._expire_deferred_jobs(jobs_table)
 
 
 def main() -> int:
