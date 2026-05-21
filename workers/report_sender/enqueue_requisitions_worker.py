@@ -5,6 +5,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
+import time
+
 import requests
 
 
@@ -141,6 +143,20 @@ class SupabaseRest:
             "or": f"(created_at.gte.{since_iso},updated_at.gte.{since_iso})",
             "order": "updated_at.desc",
             "limit": str(limit)
+        }
+        r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return rows if isinstance(rows, list) else []
+
+    def list_recent_sent_regular_jobs(self, table: str, since_iso: str, limit: int = 500) -> List[Dict[str, Any]]:
+        u = f"{self.base}/{table}"
+        p = {
+            "select": "id,reqno,reqid,mrno,phone,patient_name,last_status_snapshot,metadata",
+            "status": "eq.sent",
+            "or": f"(created_at.gte.{since_iso},updated_at.gte.{since_iso})",
+            "order": "updated_at.desc",
+            "limit": str(limit),
         }
         r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
         r.raise_for_status()
@@ -477,6 +493,127 @@ class EnqueueWorker:
             self.log.info("Reconcile complete. new_followup_jobs=%s", added)
         return added
 
+    def _reconcile_outsourced_jobs(self, jobs_table: str) -> int:
+        """
+        Detect outsourced split jobs that need to be created for previous-day requisitions.
+        Runs against sent regular jobs whose snapshot showed outsourced-ready tests, then
+        confirms PDF availability via the meta endpoint before inserting a split job.
+        Controlled by enqueue.outsourced_lookback_hours (default 0 = disabled).
+        """
+        lookback_hours = int(self.cfg.get("enqueue", {}).get("outsourced_lookback_hours", 0) or 0)
+        if lookback_hours <= 0:
+            return 0
+
+        since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+        rows = self.sb.list_recent_sent_regular_jobs(
+            jobs_table,
+            since.isoformat(),
+            limit=int(self.cfg.get("enqueue", {}).get("outsourced_lookback_max_rows", 500)),
+        )
+        if not rows:
+            return 0
+
+        lab_id = norm(self.cfg.get("whatsapp", {}).get("lab_id"))
+        paused_default = bool(self.cfg.get("enqueue", {}).get("enqueue_paused_default", True))
+        cooloff = int(self.cfg.get("worker", {}).get("cooloff_minutes_default", 30))
+        max_attempts = int(
+            self.cfg.get("worker", {}).get("outsourced_max_attempts")
+            or self.cfg.get("worker", {}).get("max_attempts", 5)
+        )
+        attached_modes = {"attached_base", "attached_qr"}
+        added = 0
+        seen_reqnos: set = set()
+
+        for row in rows:
+            row_meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            if norm(row_meta.get("report_source")).lower() == "outsourced_report":
+                continue
+
+            reqno = norm(row.get("reqno"))
+            reqid = norm(row.get("reqid"))
+            phone = norm(row.get("phone"))
+            if not reqno or not phone or reqno in seen_reqnos:
+                continue
+            seen_reqnos.add(reqno)
+
+            # Pre-filter using stored snapshot — avoids live fetch for rows with no outsourced tests.
+            snap = row.get("last_status_snapshot")
+            if isinstance(snap, str):
+                try:
+                    snap = json.loads(snap)
+                except Exception:
+                    snap = {}
+            if not isinstance(snap, dict) or not snap:
+                continue
+            if not self._extract_outsourced_ready_testids(snap):
+                continue
+
+            try:
+                live = self._fetch_status(reqno=reqno, reqid=reqid)
+            except Exception as e:
+                self.log.warning("reconcile-outsourced status-fetch-failed reqno=%s err=%s", reqno, e)
+                continue
+
+            outsourced_testids = self._extract_outsourced_ready_testids(live)
+            if not outsourced_testids:
+                continue
+
+            mrno = norm(row.get("mrno"))
+            name = norm(row.get("patient_name"))
+
+            for testid in outsourced_testids:
+                if self._has_outsourced_job(
+                    jobs_table,
+                    reqno=reqno,
+                    testid=testid,
+                    statuses={"queued", "cooling_off", "eligible", "retrying", "sending", "processing", "sent"},
+                ):
+                    continue
+
+                # Confirm PDF is available — fail-closed: skip if unavailable or endpoint unreachable.
+                meta_resp = self._fetch_outsourced_meta(reqid=reqid, testid=testid)
+                mode = norm(meta_resp.get("outsourced_mode") or meta_resp.get("mode")).lower()
+                if not mode or mode not in attached_modes:
+                    self.log.info(
+                        "reconcile-outsourced skip reqno=%s testid=%s mode=%s reason=pdf_not_available",
+                        reqno, testid, mode or "unknown",
+                    )
+                    continue
+
+                job = {
+                    "lab_id": lab_id,
+                    "reqno": reqno,
+                    "reqid": reqid or None,
+                    "mrno": mrno or None,
+                    "phone": phone,
+                    "patient_name": name or None,
+                    "status": "queued",
+                    "is_paused": paused_default,
+                    "force_send_now": False,
+                    "cooloff_minutes": cooloff,
+                    "attempt_count": 0,
+                    "max_attempts": max_attempts,
+                    "next_attempt_at": utc_iso(),
+                    "metadata": {
+                        "report_source": "outsourced_report",
+                        "outsourced_testid": testid,
+                        "outsourced_mode": mode,
+                        "reason": "outsourced_reconcile",
+                    },
+                    "created_at": utc_iso(),
+                    "updated_at": utc_iso(),
+                }
+                if self.dry_run:
+                    self.log.info("[dry-run] reconcile-outsourced enqueue reqno=%s testid=%s mode=%s", reqno, testid, mode)
+                else:
+                    self.sb.insert_job(jobs_table, job)
+                self.log.info("reconcile-outsourced enqueued reqno=%s testid=%s mode=%s", reqno, testid, mode)
+                added += 1
+
+        if added:
+            self.log.info("Reconcile-outsourced complete. new_outsourced_jobs=%s", added)
+        return added
+
     def _today_ist(self) -> str:
         return now_ist().strftime("%Y-%m-%d")
 
@@ -660,6 +797,7 @@ class EnqueueWorker:
 
         self.log.info("Enqueue complete. new_jobs=%s", enqueued)
         self._reconcile_recent(jobs_table)
+        self._reconcile_outsourced_jobs(jobs_table)
 
 
 def main() -> int:
@@ -684,9 +822,11 @@ def main() -> int:
         else:
             sleep_seconds = int(cfg.get("enqueue", {}).get("poll_seconds_post_10am", 300))
 
-        worker.run_once()
+        try:
+            worker.run_once()
+        except Exception as exc:
+            worker.log.exception("run_once failed, will retry after sleep: %s", exc)
         worker.log.info("Sleeping %s seconds before next enqueue cycle", sleep_seconds)
-        import time
         time.sleep(max(30, sleep_seconds))
 
     return 0
