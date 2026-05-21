@@ -163,7 +163,7 @@ def resolve_job_report_label(job: Dict[str, Any], status: Dict[str, Any]) -> str
     meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
     report_source = norm_text(meta.get("report_source")).lower()
     if report_source == "outsourced_report":
-        return "outsourced report"
+        return "special report"
     return build_template_report_label(status)
 
 
