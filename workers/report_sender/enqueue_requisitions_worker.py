@@ -198,6 +198,17 @@ class SupabaseRest:
         r = self.http.post(u, headers=self.headers, data=json.dumps(row), timeout=self.timeout)
         r.raise_for_status()
 
+    def cancel_job_by_id(self, table: str, job_id: int) -> None:
+        u = f"{self.base}/{table}"
+        r = self.http.patch(
+            u,
+            headers=self.headers,
+            params={"id": f"eq.{job_id}"},
+            data=json.dumps({"status": "cancelled", "updated_at": utc_iso()}),
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+
 
 class EnqueueWorker:
     def __init__(self, cfg: Dict[str, Any], dry_run: bool = False) -> None:
@@ -636,6 +647,7 @@ class EnqueueWorker:
             if norm(row_meta.get("report_source")).lower() == "outsourced_report":
                 continue
 
+            source_job_id = row.get("id")
             reqno = norm(row.get("reqno"))
             reqid = norm(row.get("reqid"))
             phone = norm(row.get("phone"))
@@ -701,6 +713,13 @@ class EnqueueWorker:
                     self.log.info("[dry-run] reconcile-outsourced-failed enqueue reqno=%s testid=%s mode=%s", reqno, testid, mode)
                 else:
                     self.sb.insert_job(jobs_table, job)
+                    if source_job_id:
+                        try:
+                            self.sb.cancel_job_by_id(jobs_table, source_job_id)
+                            self.log.info("reconcile-outsourced-failed cancelled source job_id=%s reqno=%s", source_job_id, reqno)
+                            source_job_id = None  # only cancel once per reqno
+                        except Exception as e:
+                            self.log.warning("reconcile-outsourced-failed cancel-failed job_id=%s err=%s", source_job_id, e)
                 self.log.info("reconcile-outsourced-failed enqueued reqno=%s testid=%s mode=%s", reqno, testid, mode)
                 added += 1
 
