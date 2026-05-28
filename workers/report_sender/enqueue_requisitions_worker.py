@@ -139,7 +139,7 @@ class SupabaseRest:
     def list_recent_jobs(self, table: str, since_iso: str, limit: int = 2000) -> List[Dict[str, Any]]:
         u = f"{self.base}/{table}"
         p = {
-            "select": "id,lab_id,reqno,reqid,mrno,phone,patient_name,status,report_label,is_paused,created_at,updated_at",
+            "select": "id,lab_id,reqno,reqid,mrno,phone,patient_name,status,report_label,last_error,is_paused,created_at,updated_at",
             "or": f"(created_at.gte.{since_iso},updated_at.gte.{since_iso})",
             "order": "updated_at.desc",
             "limit": str(limit)
@@ -500,6 +500,12 @@ class EnqueueWorker:
                 else:
                     self.sb.insert_job(jobs_table, new_job)
                 added += 1
+                continue
+
+            # Regular job that the sender already determined is outsourced-only: PDF will never be at
+            # the regular URL. Let _reconcile_outsourced_jobs create the correct split job instead.
+            if norm(row.get("last_error")).lower() == "outsourced_only_regular_job":
+                self.log.info("Reconcile skip reqno=%s reason=outsourced_only_regular_job", reqno)
                 continue
 
             # For non-skipped rows, follow-up only when fully ready.

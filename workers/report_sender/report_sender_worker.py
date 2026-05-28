@@ -206,6 +206,17 @@ def has_any_reportable_test(status: Dict[str, Any]) -> bool:
     return any(isinstance(t, dict) and is_lab_or_radiology_test(t) for t in tests)
 
 
+def is_outsourced_only_reportable(status: Dict[str, Any]) -> bool:
+    tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+    reportable = [t for t in tests if isinstance(t, dict) and is_lab_or_radiology_test(t)]
+    if not reportable:
+        return False
+    return all(
+        norm_text(t.get("REPORT_STATUS") or t.get("report_status")).upper() == "OUTSOURCED"
+        for t in reportable
+    )
+
+
 def is_no_reportable_case(status: Dict[str, Any]) -> bool:
     lab_total = int(status.get("lab_total") or 0)
     rad_total = int(status.get("radiology_total") or 0)
@@ -946,6 +957,20 @@ class ReportSenderWorker:
                         "not_ready_tests": not_ready_tests[:30],
                     })
                     return
+
+        # Guard: regular job for an outsourced-only requisition — PDF will never be at the regular URL.
+        # Fail immediately so retries are not wasted; enqueue reconcile will create the outsourced split job.
+        if report_source != "outsourced_report" and is_outsourced_only_reportable(status):
+            self._patch_job(job, {
+                "status": "failed",
+                "last_error": "outsourced_only_regular_job",
+                "report_label": report_label,
+                "last_status_snapshot": status,
+                "next_attempt_at": None,
+            })
+            self._event(job, "failed_outsourced_only", "Regular job for outsourced-only requisition; PDF not at regular URL", {"label": report_label})
+            self.log.warning("outsourced-only-skip %s label=%s reason=all_tests_outsourced", self._job_ctx(job, status), report_label)
+            return
 
         self._patch_job(job, {
             "status": "sending",
