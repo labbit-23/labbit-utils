@@ -54,6 +54,10 @@
     "enqueue_paused_default": true,
     "lookback_hours": 0,
     "lookback_max_rows": 2000,
+    "outsourced_lookback_hours": 120,
+    "outsourced_lookback_max_rows": 500,
+    "outsourced_defer_hours": 6,
+    "outsourced_defer_expire_days": 10,
     "fetch_limit": 1000,
     "request_timeout_seconds": 20,
     "log_level": "INFO"
