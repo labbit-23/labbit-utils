@@ -394,15 +394,17 @@ class EnqueueWorker:
         # Guard against churn: if ANY recent failed INVALID_PHONE exists for this reqno
         # with the same phone, do not create yet another job.
         rows = self.sb.list_jobs_by_reqno(jobs_table, reqno=reqno, limit=200)
-        cur_phone = digits_only(incoming_phone)
-        if not cur_phone:
+        cur_digits = digits_only(incoming_phone)
+        if not cur_digits:
             return False
+        # Compare last 10 digits to handle country-code prefix mismatches.
+        cur_phone_10 = cur_digits[-10:]
         for row in rows:
             status = norm(row.get("status")).lower()
             last_error = norm(row.get("last_error")).upper()
             if status == "failed" and last_error == "INVALID_PHONE":
-                prev_phone = digits_only(row.get("phone"))
-                if prev_phone == cur_phone:
+                prev_digits = digits_only(row.get("phone"))
+                if prev_digits and prev_digits[-10:] == cur_phone_10:
                     return True
         return False
 
@@ -882,6 +884,14 @@ class EnqueueWorker:
                 # If latest is skipped/failed, re-evaluate live status and allow re-activation
                 # when reportable tests are present (e.g., non-same-day culture/TMT pending).
                 if latest_status in {"skipped", "failed"}:
+                    # Never re-enqueue a job that already failed with INVALID_PHONE — the phone
+                    # must be corrected manually before retrying.
+                    if norm(latest.get("last_error")).upper() == "INVALID_PHONE":
+                        self.log.info(
+                            "Skip enqueue reqno=%s reason=latest_job_invalid_phone phone=%s",
+                            reqno, phone,
+                        )
+                        continue
                     try:
                         live = self._fetch_status(reqno=reqno, reqid=reqid)
                     except Exception as e:
