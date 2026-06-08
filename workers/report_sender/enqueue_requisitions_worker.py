@@ -514,6 +514,13 @@ class EnqueueWorker:
             if not self._is_overall_full_ready(live):
                 continue
 
+            # If live status shows all reportable tests are outsourced, creating a regular job
+            # will always fail (PDF not at regular URL). Mirror run_once behaviour and let
+            # _reconcile_outsourced_jobs create the correct split job via the meta endpoint.
+            if self._is_outsourced_only_reportable(live):
+                self.log.info("Reconcile skip reqno=%s reason=outsourced_only_all_tests", reqno)
+                continue
+
             # Duplicate guard: only enqueue follow-up if ready-count increased from latest sent snapshot.
             latest_sent = self.sb.latest_sent_snapshot(jobs_table, reqno)
             if latest_sent:
