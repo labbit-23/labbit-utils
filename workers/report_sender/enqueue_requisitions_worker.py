@@ -393,6 +393,7 @@ class EnqueueWorker:
     def _should_skip_invalid_phone_reenqueue(self, jobs_table: str, reqno: str, incoming_phone: str) -> bool:
         # Guard against churn: if ANY recent failed INVALID_PHONE exists for this reqno
         # with the same phone, do not create yet another job.
+        # Only retry if phone number has actually changed.
         rows = self.sb.list_jobs_by_reqno(jobs_table, reqno=reqno, limit=200)
         cur_digits = digits_only(incoming_phone)
         if not cur_digits:
@@ -406,6 +407,34 @@ class EnqueueWorker:
                 prev_digits = digits_only(row.get("phone"))
                 if prev_digits and prev_digits[-10:] == cur_phone_10:
                     return True
+        return False
+
+    def _should_retry_pdf_not_found(self, jobs_table: str, reqno: str, reqid: str) -> bool:
+        # PDF not found errors are often transient — check if PDF is available NOW
+        # Only retry if PDF exists and hasn't been attempted too many times already
+        if not reqid:
+            return False
+
+        # Find the last "PDF not found" failure for this reqno
+        rows = self.sb.list_jobs_by_reqno(jobs_table, reqno=reqno, limit=100)
+        pdf_not_found_jobs = [
+            r for r in rows
+            if norm(r.get("status")).lower() == "failed"
+            and "PDF WAS NOT FOUND" in norm(r.get("last_error")).upper()
+        ]
+
+        if not pdf_not_found_jobs:
+            return False
+
+        # Check if PDF is actually available now
+        try:
+            live = self._fetch_status(reqno=reqno, reqid=reqid)
+            if live and live.get("report_generated_at"):
+                self.log.info("Reconcile PDF now available reqno=%s, will retry", reqno)
+                return True
+        except Exception as e:
+            self.log.debug("Reconcile PDF check failed reqno=%s err=%s", reqno, e)
+
         return False
 
     def _reconcile_recent(self, jobs_table: str) -> int:
@@ -532,6 +561,23 @@ class EnqueueWorker:
                     continue
 
             # If partial was sent and now fully ready, enqueue a follow-up send job.
+
+            # Check if previous "PDF not found" error is now resolved (PDF generated)
+            last_error = norm(row.get("last_error")).upper()
+            if "PDF WAS NOT FOUND" in last_error:
+                if not self._should_retry_pdf_not_found(jobs_table, reqno, reqid):
+                    self.log.info(
+                        "Reconcile skip reqno=%s reason=pdf_still_not_available",
+                        reqno,
+                    )
+                    continue
+                else:
+                    self.log.info(
+                        "Reconcile retry reqno=%s reason=pdf_now_available",
+                        reqno,
+                    )
+
+            # Skip if invalid phone hasn't changed
             if self._should_skip_invalid_phone_reenqueue(jobs_table, reqno, phone):
                 self.log.info(
                     "Reconcile skip reqno=%s reason=failed_invalid_phone_unchanged phone=%s",

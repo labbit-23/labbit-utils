@@ -19,6 +19,40 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def normalize_patient_sex(value: str) -> str:
+    v = str(value or "").strip().upper()
+    if v in ("M", "MALE"):
+        return "M"
+    if v in ("F", "FEMALE"):
+        return "F"
+    return "O"
+
+
+def dicom_date_from_raw(value: str) -> str:
+    """Convert various DOB formats to DICOM YYYYMMDD. Returns '' on failure."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    # Already YYYYMMDD
+    if len(text) == 8 and text.isdigit():
+        return text
+    # YYYY-MM-DD or YYYY/MM/DD
+    for sep in ("-", "/"):
+        parts = text.split(sep)
+        if len(parts) == 3 and len(parts[0]) == 4:
+            y, m, d = parts
+            if y.isdigit() and m.isdigit() and d.isdigit():
+                return f"{y}{m.zfill(2)}{d.zfill(2)}"
+    # DD-MM-YYYY or DD/MM/YYYY
+    for sep in ("-", "/"):
+        parts = text.split(sep)
+        if len(parts) == 3 and len(parts[2]) == 4:
+            d, m, y = parts
+            if y.isdigit() and m.isdigit() and d.isdigit():
+                return f"{y}{m.zfill(2)}{d.zfill(2)}"
+    return ""
+
+
 def dicom_date_time_pair(raw_value: str) -> Tuple[str, str]:
     text = str(raw_value or "").strip()
     if not text:
@@ -253,6 +287,7 @@ class MWLWorker:
     def build_mwl_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
         mwl_cfg = self.cfg["mwl"]
         dest = self.cfg["destination"]
+        source_cfg = self.cfg.get("source", {})
         defaults = dict(mwl_cfg.get("defaults", {}) or {})
         mapping = mwl_cfg.get("payload_fields", {}) or {}
 
@@ -267,6 +302,19 @@ class MWLWorker:
 
         for target_key, row_field_path in mapping.items():
             payload[target_key] = get_path(row, str(row_field_path), payload.get(target_key))
+
+        # Combine separate date + time fields into scheduled_datetime when present
+        date_field = str(source_cfg.get("scheduled_date_field", "") or "").strip()
+        time_field = str(source_cfg.get("scheduled_time_field", "") or "").strip()
+        if date_field and time_field and not str(payload.get("scheduled_datetime") or "").strip():
+            raw_date = str(get_path(row, date_field, "") or "").strip().replace("-", "").replace("/", "")
+            raw_time = str(get_path(row, time_field, "") or "").strip().replace(":", "").replace(" ", "")
+            if len(raw_date) == 8:
+                d = raw_date
+                t = raw_time[:6] if len(raw_time) >= 4 else "000000"
+                payload["scheduled_datetime"] = (
+                    f"{d[:4]}-{d[4:6]}-{d[6:8]}T{t[:2]}:{t[2:4]}:{t[4:6] if len(t) >= 6 else '00'}"
+                )
 
         payload["raw"] = row
         return payload
@@ -295,8 +343,8 @@ class MWLWorker:
         ds.AccessionNumber = accession
         ds.PatientName = patient_name
         ds.PatientID = patient_id
-        ds.PatientSex = ""
-        ds.PatientBirthDate = ""
+        ds.PatientSex = normalize_patient_sex(str(payload.get("patient_sex") or ""))
+        ds.PatientBirthDate = dicom_date_from_raw(str(payload.get("patient_dob") or ""))
         ds.StudyInstanceUID = generate_uid()
         ds.RequestedProcedureID = accession or generate_uid()
         ds.RequestedProcedureDescription = str(payload.get("requested_procedure_description") or "RADIOLOGY")
@@ -325,7 +373,7 @@ class MWLWorker:
 
         safe_accession = "".join(ch for ch in accession if ch.isalnum() or ch in ("-", "_")) or "NOACC"
         safe_modality = "".join(ch for ch in modality if ch.isalnum() or ch in ("-", "_")) or "MOD"
-        filename = f"MWL_{safe_accession}_{safe_modality}.dcm"
+        filename = f"MWL_{safe_accession}_{safe_modality}.wl"
         full_path = os.path.join(outbox, filename)
 
         ds.save_as(full_path, write_like_original=False)

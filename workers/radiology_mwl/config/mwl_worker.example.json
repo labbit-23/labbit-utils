@@ -1,15 +1,15 @@
 {
   "source": {
-    "poll_url": "https://api.sdrc.in/py/shivam/radiology-worklist",
+    "poll_url": "https://api.sdrc.in/py/delivery/department-worklist?department_name=radiology",
     "poll_method": "GET",
-    "poll_headers": {
-      "Authorization": "Bearer <internal-token>"
-    },
+    "poll_headers": {},
     "poll_timeout_seconds": 20,
     "items_path": "items",
     "performed_field": "performed",
-    "pending_value": 0,
-    "id_field": "id"
+    "pending_value": "0",
+    "id_field": "id",
+    "scheduled_date_field": "reqdt",
+    "scheduled_time_field": "reqtm"
   },
   "destination": {
     "aet": "SDRC_RAD_AE",
@@ -17,23 +17,24 @@
     "port": 4242
   },
   "mwl": {
-    "create_url": "http://127.0.0.1:8042/tools/create-mwl",
+    "create_url": "http://127.0.0.1:8042/wl-ingest",
     "create_method": "POST",
     "create_headers": {},
     "timeout_seconds": 20,
-    "transport": "legacy_json",
+    "transport": "multipart_file",
     "outbox_dir": "./outbox",
-    "include_local_file_path": true,
-    "include_dicom_base64": false,
     "payload_fields": {
       "accession_number": "reqno",
-      "patient_id": "mrno",
+      "patient_id": "patient_id",
       "patient_name": "patient_name",
+      "patient_sex": "patient_sex",
+      "patient_dob": "patient_dob",
       "modality": "modality",
-      "scheduled_datetime": "scheduled_datetime"
+      "scheduled_datetime": "scheduled_datetime",
+      "requested_procedure_description": "procedure_name"
     },
     "defaults": {
-      "modality": "US",
+      "modality": "CR",
       "institution_name": "SDRC",
       "requested_procedure_description": "RADIOLOGY",
       "scheduled_step_description": "RADIOLOGY"
