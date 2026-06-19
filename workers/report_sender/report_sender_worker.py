@@ -644,7 +644,13 @@ class ReportSenderWorker:
 
     def _recover_invalid_phone_jobs(self) -> None:
         rows = self.sb.list_failed_invalid_phone(self.cfg["tables"]["jobs"], limit=100)
+        # Only attempt recovery for recently-failed jobs; stop after 4 hours
+        cutoff = utc_now() - timedelta(hours=4)
         for job in rows:
+            updated_at = parse_iso(job.get("updated_at"))
+            if updated_at and updated_at < cutoff:
+                # Phone correction window has closed; skip old INVALID_PHONE jobs
+                continue
             phone = norm_text(job.get("phone"))
             meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
             failed_phone = norm_text(meta.get("invalid_phone_at_failure") or phone)
