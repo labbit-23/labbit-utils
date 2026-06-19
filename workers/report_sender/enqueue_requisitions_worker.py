@@ -391,9 +391,8 @@ class EnqueueWorker:
         return "complete" in t and "partial" not in t
 
     def _should_skip_invalid_phone_reenqueue(self, jobs_table: str, reqno: str, incoming_phone: str) -> bool:
-        # Guard against churn: if ANY recent failed INVALID_PHONE exists for this reqno
-        # with the same phone, do not create yet another job.
-        # Only retry if phone number has actually changed.
+        # Guard against churn: if ANY INVALID_PHONE failure exists for this reqno with the same phone, skip.
+        # Only retry if phone number has actually changed since the failure.
         rows = self.sb.list_jobs_by_reqno(jobs_table, reqno=reqno, limit=200)
         cur_digits = digits_only(incoming_phone)
         if not cur_digits:
@@ -401,9 +400,8 @@ class EnqueueWorker:
         # Compare last 10 digits to handle country-code prefix mismatches.
         cur_phone_10 = cur_digits[-10:]
         for row in rows:
-            status = norm(row.get("status")).lower()
             last_error = norm(row.get("last_error")).upper()
-            if status == "failed" and last_error == "INVALID_PHONE":
+            if last_error == "INVALID_PHONE":
                 prev_digits = digits_only(row.get("phone"))
                 if prev_digits and prev_digits[-10:] == cur_phone_10:
                     return True
@@ -933,14 +931,6 @@ class EnqueueWorker:
             if latest:
                 latest_status = norm(latest.get("status")).lower()
                 if latest_status in {"queued", "cooling_off", "eligible", "retrying", "sending", "processing", "sent"}:
-                    continue
-                # Never re-enqueue a job that already failed with INVALID_PHONE — the phone
-                # must be corrected manually before retrying.
-                if norm(latest.get("last_error")).upper() == "INVALID_PHONE":
-                    self.log.info(
-                        "Skip enqueue reqno=%s reason=latest_job_invalid_phone phone=%s",
-                        reqno, phone,
-                    )
                     continue
                 # If latest is skipped/failed, re-evaluate live status and allow re-activation
                 # when reportable tests are present (e.g., non-same-day culture/TMT pending).
