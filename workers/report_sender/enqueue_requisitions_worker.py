@@ -934,17 +934,17 @@ class EnqueueWorker:
                 latest_status = norm(latest.get("status")).lower()
                 if latest_status in {"queued", "cooling_off", "eligible", "retrying", "sending", "processing", "sent"}:
                     continue
+                # Never re-enqueue a job that already failed with INVALID_PHONE — the phone
+                # must be corrected manually before retrying.
+                if norm(latest.get("last_error")).upper() == "INVALID_PHONE":
+                    self.log.info(
+                        "Skip enqueue reqno=%s reason=latest_job_invalid_phone phone=%s",
+                        reqno, phone,
+                    )
+                    continue
                 # If latest is skipped/failed, re-evaluate live status and allow re-activation
                 # when reportable tests are present (e.g., non-same-day culture/TMT pending).
                 if latest_status in {"skipped", "failed"}:
-                    # Never re-enqueue a job that already failed with INVALID_PHONE — the phone
-                    # must be corrected manually before retrying.
-                    if norm(latest.get("last_error")).upper() == "INVALID_PHONE":
-                        self.log.info(
-                            "Skip enqueue reqno=%s reason=latest_job_invalid_phone phone=%s",
-                            reqno, phone,
-                        )
-                        continue
                     try:
                         live = self._fetch_status(reqno=reqno, reqid=reqid)
                     except Exception as e:
