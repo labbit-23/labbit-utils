@@ -829,6 +829,26 @@ class ReportSenderWorker:
         status = self._fetch_status(job)
         report_label = resolve_job_report_label(job, status)
         self.log.info("status-check %s overall=%s label=%s", self._job_ctx(job, status), norm_text(status.get("overall_status") or "-"), report_label)
+
+        # Check dispatch constraints before proceeding
+        dispatch_allowed = bool(status.get("dispatch_allowed", True))
+        if not dispatch_allowed:
+            denial_reason = norm_text(status.get("dispatch_denial_reason") or "dispatch_not_allowed")
+            self._patch_job(job, {
+                "status": "skipped",
+                "report_label": report_label,
+                "last_status_snapshot": status,
+                "last_error": None,
+                "next_attempt_at": None,
+                "metadata": {
+                    "skip_reason": denial_reason,
+                    "dispatch_denial_code": norm_text(status.get("dispatch_denial_code")),
+                },
+            })
+            self._event(job, "skipped_dispatch_not_allowed", f"Dispatch denied: {denial_reason}", {"denial_code": norm_text(status.get("dispatch_denial_code"))})
+            self.log.info("skip-dispatch-denied %s reason=%s", self._job_ctx(job, status), denial_reason)
+            return
+
         sameday_total, sameday_ready, not_ready_tests = same_day_counts_and_pending(status)
 
         has_required = has_same_day_required_tests(status)
