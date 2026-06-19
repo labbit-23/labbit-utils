@@ -1005,9 +1005,27 @@ class EnqueueWorker:
                 enqueued += 1
                 outsourced_enqueued += 1
 
-            # For outsourced-only requisitions, avoid creating a regular combined job when
-            # at least one attached outsourced job was created.
+            # For outsourced-only requisitions, convert existing regular job or create outsourced job
             if self._is_outsourced_only_reportable(live) and outsourced_enqueued > 0:
+                # If a single outsourced test exists and there's an existing regular job, convert it
+                if len(outsourced_testids) == 1:
+                    existing_regular = self.sb.latest_job(jobs_table, reqno)
+                    if existing_regular and norm(existing_regular.get("status")).lower() in {"failed", "skipped", "queued", "cooling_off"}:
+                        # Convert existing regular job to outsourced
+                        meta = dict(existing_regular.get("metadata") or {})
+                        meta["report_source"] = "outsourced_report"
+                        meta["outsourced_testid"] = outsourced_testids[0]
+                        if self.dry_run:
+                            self.log.info("[dry-run] convert-to-outsourced reqno=%s", reqno)
+                        else:
+                            self.sb.patch_job(jobs_table, existing_regular.get("id"), {
+                                "metadata": meta,
+                                "status": "queued",
+                                "next_attempt_at": utc_iso(),
+                                "last_error": None,
+                                "updated_at": utc_iso(),
+                            })
+                        self.log.info("Convert regular job to outsourced reqno=%s testid=%s", reqno, outsourced_testids[0])
                 continue
 
             job = {
