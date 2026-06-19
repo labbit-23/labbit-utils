@@ -495,6 +495,28 @@ class ReportSenderWorker:
             "failed_timeout": 0,
             "status_reconciled": 0,
         }
+        self._recover_cooling_off_jobs()
+
+    def _recover_cooling_off_jobs(self) -> None:
+        # On startup: unstick jobs left in cooling_off from previous restarts
+        # Defer them until next morning to avoid sudden burst of old reports to patients
+        try:
+            jobs_table = self.cfg["tables"]["jobs"]
+            rows = self.sb.list_by_status(jobs_table, status="cooling_off", limit=500)
+            recovered_count = 0
+            for job in rows:
+                # Defer to next morning (7:30 AM IST)
+                next_check = utc_now() + timedelta(hours=12)
+                self._patch_job(job, {
+                    "status": "queued",
+                    "next_attempt_at": utc_iso(next_check),
+                    "last_error": None,
+                })
+                recovered_count += 1
+            if recovered_count > 0:
+                self.log.info("Startup recovery: moved %d cooling_off jobs back to queued (deferred to next cycle)", recovered_count)
+        except Exception as exc:
+            self.log.warning("Startup recovery failed: %s", exc)
 
     def _job_ctx(self, job: Dict[str, Any], status: Optional[Dict[str, Any]] = None) -> str:
         reqno = norm_text((status or {}).get("reqno") or job.get("reqno"))
