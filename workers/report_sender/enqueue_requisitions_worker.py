@@ -548,14 +548,19 @@ class EnqueueWorker:
                 self.log.info("Reconcile skip reqno=%s reason=outsourced_only_all_tests", reqno)
                 continue
 
-            # Duplicate guard: only enqueue follow-up if ready-count increased from latest sent snapshot.
+            # Duplicate guard: only enqueue follow-up if overall_status changed from PARTIAL to FULL.
+            # Check against previous sent job's status snapshot (handles outsourced tests correctly).
             latest_sent = self.sb.latest_sent_snapshot(jobs_table, reqno)
             if latest_sent:
                 prev_snap = latest_sent.get("last_status_snapshot") if isinstance(latest_sent.get("last_status_snapshot"), dict) else {}
-                prev_total, prev_ready = self._same_day_ready_counts(prev_snap if isinstance(prev_snap, dict) else {})
-                cur_total, cur_ready = self._same_day_ready_counts(live)
-                if cur_total > 0 and cur_total == prev_total and cur_ready <= prev_ready:
-                    self.log.info("Reconcile skip reqno=%s ready-count unchanged prev=%s/%s cur=%s/%s", reqno, prev_ready, prev_total, cur_ready, cur_total)
+                prev_overall = norm(prev_snap.get("overall_status")).upper()
+                cur_overall = norm(live.get("overall_status")).upper()
+                # Skip if overall status didn't improve (e.g., still PARTIAL, or was already FULL).
+                # Only proceed if: previous was PARTIAL/UNSENT and now is FULL.
+                if prev_overall in {"PARTIAL_REPORT", "UNSENT"} and cur_overall == "FULL_REPORT":
+                    self.log.info("Reconcile follow-up reqno=%s overall_status %s→%s", reqno, prev_overall, cur_overall)
+                else:
+                    self.log.info("Reconcile skip reqno=%s overall_status %s→%s (no improvement)", reqno, prev_overall, cur_overall)
                     continue
 
             # If partial was sent and now fully ready, enqueue a follow-up send job.
