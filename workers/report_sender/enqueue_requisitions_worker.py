@@ -449,11 +449,19 @@ class EnqueueWorker:
         candidates: List[Dict[str, Any]] = []
         for row in recent:
             status = norm(row.get("status")).lower()
+            reqno = norm(row.get("reqno"))
             if status in {"queued", "cooling_off", "eligible", "retrying", "failed", "sending", "skipped"}:
                 candidates.append(row)
                 continue
             if status == "sent" and self._is_partial_label(row.get("report_label")):
                 candidates.append(row)
+                if reqno == "20260701085":
+                    self.log.info("DEBUG: Candidate 20260701085 added (sent partial)")
+
+        if any(norm(c.get("reqno")) == "20260701085" for c in candidates):
+            self.log.info("DEBUG: 20260701085 in candidates list, will process")
+        else:
+            self.log.info("DEBUG: 20260701085 NOT in candidates list")
 
         added = 0
         lab_id = norm(self.cfg.get("whatsapp", {}).get("lab_id"))
@@ -466,23 +474,39 @@ class EnqueueWorker:
             reqno = norm(row.get("reqno"))
             reqid = norm(row.get("reqid"))
             phone = norm(row.get("phone"))
+
+            if reqno == "20260701085":
+                self.log.info("DEBUG: Processing 20260701085, phone=%s reqid=%s", phone, reqid)
+
             if not reqno or not phone or reqno in seen_reqnos:
+                if reqno == "20260701085":
+                    self.log.info("DEBUG: 20260701085 skipped early (missing data or dup)")
                 continue
             seen_reqnos.add(reqno)
 
             # If already has active queue job, let sender handle current flow.
             if self.sb.has_active_job(jobs_table, reqno):
+                if reqno == "20260701085":
+                    self.log.info("DEBUG: 20260701085 skipped - has active job")
                 continue
             if self.sb.has_sent_full(jobs_table, reqno):
+                if reqno == "20260701085":
+                    self.log.info("DEBUG: 20260701085 skipped - has sent full")
                 continue
 
             # Skip reconciled follow-up when already fully sent before.
             if norm(row.get("status")).lower() == "sent" and self._is_full_label(row.get("report_label")):
+                if reqno == "20260701085":
+                    self.log.info("DEBUG: 20260701085 skipped - status sent + full label")
                 continue
 
             try:
                 live = self._fetch_status(reqno=reqno, reqid=reqid)
+                if reqno == "20260701085":
+                    self.log.info("DEBUG: 20260701085 status fetched, overall_status=%s", live.get("overall_status"))
             except Exception as e:
+                if reqno == "20260701085":
+                    self.log.info("DEBUG: 20260701085 status fetch failed: %s", e)
                 self.log.warning("Reconcile status fetch failed reqno=%s err=%s", reqno, e)
                 continue
 
@@ -551,15 +575,21 @@ class EnqueueWorker:
             # Duplicate guard: only enqueue follow-up if overall_status changed from PARTIAL to FULL.
             # Check against previous sent job's status snapshot (handles outsourced tests correctly).
             latest_sent = self.sb.latest_sent_snapshot(jobs_table, reqno)
+            if reqno == "20260701085":
+                self.log.info("DEBUG: 20260701085 has latest_sent=%s", "yes" if latest_sent else "no")
             if latest_sent:
                 prev_snap = latest_sent.get("last_status_snapshot") if isinstance(latest_sent.get("last_status_snapshot"), dict) else {}
                 prev_overall = norm(prev_snap.get("overall_status")).upper()
                 cur_overall = norm(live.get("overall_status")).upper()
+                if reqno == "20260701085":
+                    self.log.info("DEBUG: 20260701085 status check: %s → %s", prev_overall, cur_overall)
                 # Skip if overall status didn't improve (e.g., still PARTIAL, or was already FULL).
                 # Only proceed if: previous was PARTIAL/UNSENT and now is FULL.
                 if prev_overall in {"PARTIAL_REPORT", "UNSENT"} and cur_overall == "FULL_REPORT":
                     self.log.info("Reconcile follow-up reqno=%s overall_status %s→%s", reqno, prev_overall, cur_overall)
                 else:
+                    if reqno == "20260701085":
+                        self.log.info("DEBUG: 20260701085 skipped - status no improvement")
                     self.log.info("Reconcile skip reqno=%s overall_status %s→%s (no improvement)", reqno, prev_overall, cur_overall)
                     continue
 
