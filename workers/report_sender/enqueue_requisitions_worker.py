@@ -150,11 +150,7 @@ class SupabaseRest:
         r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
         r.raise_for_status()
         rows = r.json()
-        if isinstance(rows, list):
-            # Filter in Python for sent jobs: only keep partial labels (complete ones don't need reconciliation)
-            return [row for row in rows if norm(row.get("status")).lower() != "sent"
-                    or self._is_partial_label(row.get("report_label"))]
-        return []
+        return rows if isinstance(rows, list) else []
 
     def list_recent_sent_regular_jobs(self, table: str, since_iso: str, limit: int = 500) -> List[Dict[str, Any]]:
         u = f"{self.base}/{table}"
@@ -453,13 +449,14 @@ class EnqueueWorker:
         if not recent:
             return 0
 
-        # Hit status API for unsent/partial rows, including skipped rows so they can be re-evaluated.
+        # Filter for reconcilable jobs: unsent/failed/etc + partial sends (exclude complete sends)
         candidates: List[Dict[str, Any]] = []
         for row in recent:
             status = norm(row.get("status")).lower()
             if status in {"queued", "cooling_off", "eligible", "retrying", "failed", "sending", "skipped"}:
                 candidates.append(row)
                 continue
+            # For sent jobs, only include partials (complete sends don't need reconciliation)
             if status == "sent" and self._is_partial_label(row.get("report_label")):
                 candidates.append(row)
 
