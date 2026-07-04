@@ -407,6 +407,26 @@ class EnqueueWorker:
         t = norm(label).lower()
         return "complete" in t and "partial" not in t
 
+    def _has_recent_followup(self, table: str, reqno: str) -> bool:
+        """Check if a follow-up job (reconciliation job) was already created for this requisition recently."""
+        u = f"{self.base}/{table}"
+        # Look for any job with metadata.reason = "partial_or_unsent_now_full_ready" (reconciliation follow-up)
+        # This prevents creating duplicate follow-ups every cycle.
+        p = {
+            "select": "id",
+            "reqno": f"eq.{reqno}",
+            "metadata": f'ilike.%"reason":"partial_or_unsent_now_full_ready"%',
+            "created_at": f"gte.{(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}",
+            "limit": "1"
+        }
+        try:
+            r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
+            r.raise_for_status()
+            rows = r.json()
+            return bool(isinstance(rows, list) and rows)
+        except Exception:
+            return False
+
     def _should_skip_invalid_phone_reenqueue(self, jobs_table: str, reqno: str, incoming_phone: str) -> bool:
         # Guard against churn: if ANY INVALID_PHONE failure exists for this reqno with the same phone, skip.
         # Only retry if phone number has actually changed since the failure.
@@ -498,6 +518,14 @@ class EnqueueWorker:
 
             # Skip reconciled follow-up when already fully sent before.
             if norm(row.get("status")).lower() == "sent" and self._is_full_label(row.get("report_label")):
+                continue
+
+            # Early exit: if job was already FULL_REPORT when sent, no point reconciling it.
+            # (It was complete then, still complete now—no improvement possible.)
+            prev_snap = row.get("last_status_snapshot") if isinstance(row.get("last_status_snapshot"), dict) else {}
+            prev_overall = norm(prev_snap.get("overall_status")).upper()
+            if prev_overall == "FULL_REPORT":
+                self.log.debug("Reconcile skip reqno=%s reason=already_full_at_send", reqno)
                 continue
 
             try:
@@ -608,6 +636,12 @@ class EnqueueWorker:
                     phone,
                 )
                 continue
+
+            # Dedup: skip if a follow-up job was already created recently for this requisition.
+            if self._has_recent_followup(jobs_table, reqno):
+                self.log.debug("Reconcile skip reqno=%s reason=followup_already_created", reqno)
+                continue
+
             new_job = {
                 "lab_id": lab_id,
                 "reqno": reqno,
