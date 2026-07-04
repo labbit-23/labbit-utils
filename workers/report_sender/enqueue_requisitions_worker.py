@@ -418,7 +418,14 @@ class EnqueueWorker:
         # Find most recent follow-up job for this reqno
         recent_followup = None
         for row in rows:
-            if norm(row.get("metadata", {}).get("reason")).lower() == "partial_or_unsent_now_full_ready":
+            meta = row.get("metadata")
+            # Handle metadata as dict or JSON string
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            if isinstance(meta, dict) and norm(meta.get("reason")).lower() == "partial_or_unsent_now_full_ready":
                 recent_followup = row
                 break  # Most recent (ordered by creation)
 
