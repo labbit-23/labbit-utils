@@ -407,6 +407,13 @@ class EnqueueWorker:
         t = norm(label).lower()
         return "complete" in t and "partial" not in t
 
+    def _is_valid_phone(self, phone: Any) -> bool:
+        """Check if phone is valid Indian format: 10 digits or 91+10 digits."""
+        if not phone:
+            return False
+        digits = digits_only(phone)
+        return len(digits) == 10 or (len(digits) == 12 and digits.startswith("91"))
+
     def _has_recent_followup(self, table: str, reqno: str) -> bool:
         """Check if an active (non-sent) follow-up job already exists for this requisition.
         Prevents duplicate follow-ups from being created every reconciliation cycle."""
@@ -620,6 +627,11 @@ class EnqueueWorker:
                     reqno,
                     phone,
                 )
+                continue
+
+            # Skip requisitions with invalid phones — don't create follow-ups that will fail
+            if not self._is_valid_phone(phone):
+                self.log.warning("Reconcile skip reqno=%s reason=invalid_phone_format phone=%s", reqno, phone)
                 continue
 
             # Dedup: skip if a follow-up job was already created recently for this requisition.
