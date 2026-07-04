@@ -604,7 +604,7 @@ class EnqueueWorker:
                 "status": "queued",
                 "is_paused": paused_default,
                 "force_send_now": False,
-                "cooloff_minutes": 0,
+                "cooloff_minutes": cooloff,
                 "attempt_count": 0,
                 "max_attempts": max_attempts,
                 "next_attempt_at": utc_iso(),
