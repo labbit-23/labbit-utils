@@ -112,6 +112,20 @@ class SupabaseRest:
         rows = r.json()
         return bool(isinstance(rows, list) and rows)
 
+    def has_sent_partial(self, table: str, reqno: str) -> bool:
+        u = f"{self.base}/{table}"
+        p = {
+            "select": "id,report_label",
+            "reqno": f"eq.{reqno}",
+            "status": "eq.sent",
+            "report_label": "ilike.*partial*",
+            "limit": "1"
+        }
+        r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return bool(isinstance(rows, list) and rows)
+
     def latest_sent_snapshot(self, table: str, reqno: str) -> Dict[str, Any]:
         u = f"{self.base}/{table}"
         p = {
@@ -479,7 +493,8 @@ class EnqueueWorker:
             # If already has active queue job, let sender handle current flow.
             if self.sb.has_active_job(jobs_table, reqno):
                 continue
-            if self.sb.has_sent_full(jobs_table, reqno):
+            # Only reconcile if this reqno has sent a partial report (candidate for follow-up).
+            if not self.sb.has_sent_partial(jobs_table, reqno):
                 continue
 
             # Skip reconciled follow-up when already fully sent before.
