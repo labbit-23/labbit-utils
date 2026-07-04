@@ -446,6 +446,11 @@ class EnqueueWorker:
         since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
         since_iso = since.isoformat()
         recent = self.sb.list_recent_jobs(jobs_table, since_iso, limit=int(self.cfg.get("enqueue", {}).get("lookback_max_rows", 500)))
+        self.log.info("RECONCILE: Fetched %d recent jobs (lookback=%d hrs, since=%s)", len(recent) if recent else 0, lookback_hours, since_iso)
+        if any(norm(r.get("reqno")) == "20260701085" for r in (recent or [])):
+            self.log.info("RECONCILE: P1611609 (20260701085) IS in recent list")
+        else:
+            self.log.info("RECONCILE: P1611609 (20260701085) NOT in recent list")
         if not recent:
             return 0
 
