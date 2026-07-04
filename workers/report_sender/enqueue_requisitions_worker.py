@@ -407,34 +407,10 @@ class EnqueueWorker:
         t = norm(label).lower()
         return "complete" in t and "partial" not in t
 
-    def _has_recent_followup(self, table: str, reqno: str, current_phone: str = None) -> bool:
-        """Check if a recent follow-up exists with the same phone.
-        Returns TRUE (skip) only if follow-up exists AND phone hasn't changed.
-        Returns FALSE (allow new follow-up) if phone changed since last attempt — enables retry with corrected phone."""
-        rows = self.sb.list_jobs_by_reqno(table, reqno=reqno, limit=200)
-        if not rows:
-            return False
-
-        # Find most recent follow-up job for this reqno
-        recent_followup = None
-        for row in rows:
-            if norm(row.get("metadata", {}).get("reason")).lower() == "partial_or_unsent_now_full_ready":
-                recent_followup = row
-                break  # Most recent (ordered by creation)
-
-        if not recent_followup:
-            return False  # No recent follow-up
-
-        # If phone provided, check if it changed since the last follow-up
-        if current_phone:
-            prev_phone = norm(recent_followup.get("phone"))
-            curr_phone = norm(current_phone)
-            if prev_phone and curr_phone and prev_phone != curr_phone:
-                # Phone changed! Allow new follow-up (e.g., corrected from "123456789" to "1234567890")
-                return False
-
-        # Phone is same (or not provided) — don't create duplicate follow-up
-        return True
+    def _has_recent_followup(self, table: str, reqno: str) -> bool:
+        """Check if an active (non-sent) follow-up job already exists for this requisition.
+        Prevents duplicate follow-ups from being created every reconciliation cycle."""
+        return self.sb.has_active_job(table, reqno)
 
     def _should_skip_invalid_phone_reenqueue(self, jobs_table: str, reqno: str, incoming_phone: str) -> bool:
         # Guard against churn: if ANY INVALID_PHONE failure exists for this reqno with the same phone, skip.
@@ -646,9 +622,8 @@ class EnqueueWorker:
                 )
                 continue
 
-            # Dedup: skip if a follow-up job was already created recently with same phone.
-            # If phone changed, allow retry (e.g., corrected phone number).
-            if self._has_recent_followup(jobs_table, reqno, phone):
+            # Dedup: skip if a follow-up job was already created recently for this requisition.
+            if self._has_recent_followup(jobs_table, reqno):
                 self.log.debug("Reconcile skip reqno=%s reason=followup_already_created", reqno)
                 continue
 
