@@ -983,7 +983,9 @@ class ReportSenderWorker:
         report_source = norm_text(meta.get("report_source") or "requisition_report").lower() or "requisition_report"
 
         # Duplicate-send guard: do not resend when same-day ready count has not increased.
-        if report_source != "outsourced_report":
+        # Exception: reconciliation follow-ups bypass this (they're created when partial→full happens).
+        is_reconcile = bool(meta.get("reconcile", False))
+        if report_source != "outsourced_report" and not is_reconcile:
             latest_sent = self.sb.get_latest_sent_job_for_reqno(self.cfg["tables"]["jobs"], norm_text(job.get("reqno")))
             if latest_sent:
                 prev_snap = latest_sent.get("last_status_snapshot") if isinstance(latest_sent.get("last_status_snapshot"), dict) else {}
