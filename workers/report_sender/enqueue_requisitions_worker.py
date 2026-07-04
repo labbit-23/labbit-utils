@@ -143,7 +143,7 @@ class SupabaseRest:
         p = {
             "select": "id,lab_id,reqno,reqid,mrno,phone,patient_name,status,report_label,last_error,is_paused,created_at,updated_at",
             "status": "in.(queued,cooling_off,eligible,retrying,failed,sending,skipped,sent)",
-            "or": f"(created_at.gte.{since_iso},updated_at.gte.{since_iso})",
+            "updated_at": f"gte.{since_iso}",
             "order": "updated_at.desc",
             "limit": str(limit)
         }
@@ -448,11 +448,6 @@ class EnqueueWorker:
         recent = self.sb.list_recent_jobs(jobs_table, since_iso, limit=int(self.cfg.get("enqueue", {}).get("lookback_max_rows", 500)))
         if not recent:
             return 0
-
-        # Check if our test case is in the results
-        has_test_case = any(norm(r.get("reqno")) == "20260701085" for r in recent)
-        if has_test_case:
-            self.log.info("RECONCILE: 20260701085 found in recent list, processing...")
 
         # Filter for reconcilable jobs: unsent/failed/etc + partial sends (exclude complete sends)
         candidates: List[Dict[str, Any]] = []
