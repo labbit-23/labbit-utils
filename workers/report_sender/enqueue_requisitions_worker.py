@@ -158,7 +158,7 @@ class SupabaseRest:
             "select": "id,lab_id,reqno,reqid,mrno,phone,patient_name,status,report_label,last_error,is_paused,created_at,updated_at",
             "status": "in.(queued,cooling_off,eligible,retrying,failed,sending,sent)",
             "updated_at": f"gte.{since_iso}",
-            "order": "updated_at.desc",
+            "order": "updated_at.asc",
             "limit": str(limit)
         }
         r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
