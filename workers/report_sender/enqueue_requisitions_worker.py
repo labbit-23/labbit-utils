@@ -136,10 +136,13 @@ class SupabaseRest:
             return row
         return {}
 
-    def list_recent_jobs(self, table: str, since_iso: str, limit: int = 2000) -> List[Dict[str, Any]]:
+    def list_recent_jobs(self, table: str, since_iso: str, limit: int = 500) -> List[Dict[str, Any]]:
+        # Reconciliation only cares about jobs that need work: unsent, failed, partial sends, etc.
+        # Filter at database level to avoid fetching thousands of complete jobs.
         u = f"{self.base}/{table}"
         p = {
             "select": "id,lab_id,reqno,reqid,mrno,phone,patient_name,status,report_label,last_error,is_paused,created_at,updated_at",
+            "status": "in.(queued,cooling_off,eligible,retrying,failed,sending,skipped,sent)",
             "or": f"(created_at.gte.{since_iso},updated_at.gte.{since_iso})",
             "order": "updated_at.desc",
             "limit": str(limit)
@@ -147,7 +150,11 @@ class SupabaseRest:
         r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
         r.raise_for_status()
         rows = r.json()
-        return rows if isinstance(rows, list) else []
+        if isinstance(rows, list):
+            # Filter in Python for sent jobs: only keep partial labels (complete ones don't need reconciliation)
+            return [row for row in rows if norm(row.get("status")).lower() != "sent"
+                    or self._is_partial_label(row.get("report_label"))]
+        return []
 
     def list_recent_sent_regular_jobs(self, table: str, since_iso: str, limit: int = 500) -> List[Dict[str, Any]]:
         u = f"{self.base}/{table}"
@@ -442,10 +449,7 @@ class EnqueueWorker:
 
         since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
         since_iso = since.isoformat()
-        recent = self.sb.list_recent_jobs(jobs_table, since_iso, limit=int(self.cfg.get("enqueue", {}).get("lookback_max_rows", 2000)))
-        self.log.info("DEBUG: Reconcile fetched %d jobs since %s (lookback=%d hours)", len(recent) if recent else 0, since_iso, lookback_hours)
-        if recent and any(norm(r.get("reqno")) == "20260701085" for r in recent):
-            self.log.info("DEBUG: 20260701085 IS in list_recent_jobs result")
+        recent = self.sb.list_recent_jobs(jobs_table, since_iso, limit=int(self.cfg.get("enqueue", {}).get("lookback_max_rows", 500)))
         if not recent:
             return 0
 
@@ -453,19 +457,11 @@ class EnqueueWorker:
         candidates: List[Dict[str, Any]] = []
         for row in recent:
             status = norm(row.get("status")).lower()
-            reqno = norm(row.get("reqno"))
             if status in {"queued", "cooling_off", "eligible", "retrying", "failed", "sending", "skipped"}:
                 candidates.append(row)
                 continue
             if status == "sent" and self._is_partial_label(row.get("report_label")):
                 candidates.append(row)
-                if reqno == "20260701085":
-                    self.log.info("DEBUG: Candidate 20260701085 added (sent partial)")
-
-        if any(norm(c.get("reqno")) == "20260701085" for c in candidates):
-            self.log.info("DEBUG: 20260701085 in candidates list, will process")
-        else:
-            self.log.info("DEBUG: 20260701085 NOT in candidates list")
 
         added = 0
         lab_id = norm(self.cfg.get("whatsapp", {}).get("lab_id"))
@@ -478,39 +474,23 @@ class EnqueueWorker:
             reqno = norm(row.get("reqno"))
             reqid = norm(row.get("reqid"))
             phone = norm(row.get("phone"))
-
-            if reqno == "20260701085":
-                self.log.info("DEBUG: Processing 20260701085, phone=%s reqid=%s", phone, reqid)
-
             if not reqno or not phone or reqno in seen_reqnos:
-                if reqno == "20260701085":
-                    self.log.info("DEBUG: 20260701085 skipped early (missing data or dup)")
                 continue
             seen_reqnos.add(reqno)
 
             # If already has active queue job, let sender handle current flow.
             if self.sb.has_active_job(jobs_table, reqno):
-                if reqno == "20260701085":
-                    self.log.info("DEBUG: 20260701085 skipped - has active job")
                 continue
             if self.sb.has_sent_full(jobs_table, reqno):
-                if reqno == "20260701085":
-                    self.log.info("DEBUG: 20260701085 skipped - has sent full")
                 continue
 
             # Skip reconciled follow-up when already fully sent before.
             if norm(row.get("status")).lower() == "sent" and self._is_full_label(row.get("report_label")):
-                if reqno == "20260701085":
-                    self.log.info("DEBUG: 20260701085 skipped - status sent + full label")
                 continue
 
             try:
                 live = self._fetch_status(reqno=reqno, reqid=reqid)
-                if reqno == "20260701085":
-                    self.log.info("DEBUG: 20260701085 status fetched, overall_status=%s", live.get("overall_status"))
             except Exception as e:
-                if reqno == "20260701085":
-                    self.log.info("DEBUG: 20260701085 status fetch failed: %s", e)
                 self.log.warning("Reconcile status fetch failed reqno=%s err=%s", reqno, e)
                 continue
 
@@ -579,21 +559,15 @@ class EnqueueWorker:
             # Duplicate guard: only enqueue follow-up if overall_status changed from PARTIAL to FULL.
             # Check against previous sent job's status snapshot (handles outsourced tests correctly).
             latest_sent = self.sb.latest_sent_snapshot(jobs_table, reqno)
-            if reqno == "20260701085":
-                self.log.info("DEBUG: 20260701085 has latest_sent=%s", "yes" if latest_sent else "no")
             if latest_sent:
                 prev_snap = latest_sent.get("last_status_snapshot") if isinstance(latest_sent.get("last_status_snapshot"), dict) else {}
                 prev_overall = norm(prev_snap.get("overall_status")).upper()
                 cur_overall = norm(live.get("overall_status")).upper()
-                if reqno == "20260701085":
-                    self.log.info("DEBUG: 20260701085 status check: %s → %s", prev_overall, cur_overall)
                 # Skip if overall status didn't improve (e.g., still PARTIAL, or was already FULL).
                 # Only proceed if: previous was PARTIAL/UNSENT and now is FULL.
                 if prev_overall in {"PARTIAL_REPORT", "UNSENT"} and cur_overall == "FULL_REPORT":
                     self.log.info("Reconcile follow-up reqno=%s overall_status %s→%s", reqno, prev_overall, cur_overall)
                 else:
-                    if reqno == "20260701085":
-                        self.log.info("DEBUG: 20260701085 skipped - status no improvement")
                     self.log.info("Reconcile skip reqno=%s overall_status %s→%s (no improvement)", reqno, prev_overall, cur_overall)
                     continue
 
