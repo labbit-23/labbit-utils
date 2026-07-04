@@ -335,14 +335,13 @@ class SupabaseRest:
         self.session = requests.Session()
 
     def select_jobs(self, table: str, limit: int, now_iso: str, offset: int = 0) -> List[Dict[str, Any]]:
-        statuses = "(queued,cooling_off,eligible,retrying)"
+        # Fetch jobs due for processing: queued/eligible/retrying with next_attempt_at due, or cooling_off with scheduled_at due.
+        # Avoid OR clause (Supabase bug when combined with status filter).
         url = f"{self.base}/{table}"
         params = {
             "select": "*",
-            "status": f"in.{statuses}",
-            # Only pull due-now rows.
-            # Also include overdue cooling_off by scheduled_at<=now to recover from next_attempt drift.
-            "or": f"(force_send_now.eq.true,next_attempt_at.is.null,next_attempt_at.lte.{now_iso},and(status.eq.cooling_off,scheduled_at.lte.{now_iso}))",
+            "status": "in.(queued,eligible,retrying,cooling_off)",
+            "next_attempt_at": f"lte.{now_iso}",
             # Priority: manual push first, then older due attempts.
             "order": "force_send_now.desc,next_attempt_at.asc.nullsfirst,updated_at.asc",
             "limit": str(limit),
