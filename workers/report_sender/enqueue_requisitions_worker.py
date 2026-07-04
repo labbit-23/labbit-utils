@@ -137,12 +137,12 @@ class SupabaseRest:
         return {}
 
     def list_recent_jobs(self, table: str, since_iso: str, limit: int = 500) -> List[Dict[str, Any]]:
-        # Reconciliation only cares about jobs that need work: unsent, failed, partial sends, etc.
-        # Filter at database level to avoid fetching thousands of complete jobs.
+        # Reconciliation only cares about jobs actively needing work + partial sends (no complete, no skipped).
+        # Filter at database level to avoid fetching thousands of jobs we don't care about.
         u = f"{self.base}/{table}"
         p = {
             "select": "id,lab_id,reqno,reqid,mrno,phone,patient_name,status,report_label,last_error,is_paused,created_at,updated_at",
-            "status": "in.(queued,cooling_off,eligible,retrying,failed,sending,skipped,sent)",
+            "status": "in.(queued,cooling_off,eligible,retrying,failed,sending,sent)",
             "updated_at": f"gte.{since_iso}",
             "order": "updated_at.desc",
             "limit": str(limit)
