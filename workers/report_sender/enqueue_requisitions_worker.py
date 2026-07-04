@@ -449,6 +449,11 @@ class EnqueueWorker:
         if not recent:
             return 0
 
+        # Check if our test case is in the results
+        has_test_case = any(norm(r.get("reqno")) == "20260701085" for r in recent)
+        if has_test_case:
+            self.log.info("RECONCILE: 20260701085 found in recent list, processing...")
+
         # Filter for reconcilable jobs: unsent/failed/etc + partial sends (exclude complete sends)
         candidates: List[Dict[str, Any]] = []
         for row in recent:
