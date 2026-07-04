@@ -408,24 +408,9 @@ class EnqueueWorker:
         return "complete" in t and "partial" not in t
 
     def _has_recent_followup(self, table: str, reqno: str) -> bool:
-        """Check if a follow-up job (reconciliation job) was already created for this requisition recently."""
-        u = f"{self.base}/{table}"
-        # Look for any job with metadata.reason = "partial_or_unsent_now_full_ready" (reconciliation follow-up)
-        # This prevents creating duplicate follow-ups every cycle.
-        p = {
-            "select": "id",
-            "reqno": f"eq.{reqno}",
-            "metadata": f'ilike.%"reason":"partial_or_unsent_now_full_ready"%',
-            "created_at": f"gte.{(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}",
-            "limit": "1"
-        }
-        try:
-            r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
-            r.raise_for_status()
-            rows = r.json()
-            return bool(isinstance(rows, list) and rows)
-        except Exception:
-            return False
+        """Check if an active (non-sent) follow-up job already exists for this requisition.
+        Prevents duplicate follow-ups from being created every reconciliation cycle."""
+        return self.sb.has_active_job(table, reqno)
 
     def _should_skip_invalid_phone_reenqueue(self, jobs_table: str, reqno: str, incoming_phone: str) -> bool:
         # Guard against churn: if ANY INVALID_PHONE failure exists for this reqno with the same phone, skip.
