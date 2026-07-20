@@ -49,6 +49,7 @@
     "start_date": "2026-05-01",
     "poll_start_hhmm": 730,
     "poll_end_hhmm": 2130,
+    "poll_fast_after_hhmm": 1000,
     "poll_seconds_pre_10am": 3600,
     "poll_seconds_post_10am": 300,
     "enqueue_paused_default": true,

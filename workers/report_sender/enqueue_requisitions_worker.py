@@ -1130,7 +1130,8 @@ def main() -> int:
     while True:
         now = datetime.now()
         hhmm = now.hour * 100 + now.minute
-        if hhmm < 1000:
+        fast_after_hhmm = int(cfg.get("enqueue", {}).get("poll_fast_after_hhmm", 1000))
+        if hhmm < fast_after_hhmm:
             sleep_seconds = int(cfg.get("enqueue", {}).get("poll_seconds_pre_10am", 3600))
         else:
             sleep_seconds = int(cfg.get("enqueue", {}).get("poll_seconds_post_10am", 300))
