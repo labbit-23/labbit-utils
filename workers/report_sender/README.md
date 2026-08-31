@@ -10,7 +10,8 @@ Auto-dispatch worker for patient report WhatsApp sends.
 - Applies same-day readiness gating using `SAMEDAYREPORT`
 - Applies cooloff (`latest_approved_at + cooloff_minutes`, default 30m)
 - Supports evening partial-send window with randomized per-job cutoff (`partial_send_cutoff_from_hhmm` to `partial_send_cutoff_to_hhmm`)
-- Sends via existing `report_pdf` template through `/api/internal/whatsapp/send`
+- Sends via existing report template endpoint `/api/internal/whatsapp/report-template-send`
+- Marks sent test IDs back through labit-py's `/delivery/status/update` so Core can store per-report delivery events after cutover
 - Supports `is_paused` and `force_send_now`
 - Includes stuck-job watchdog + state reconciliation:
 - auto-requeue stale `queued_wait` / `cooling_off`

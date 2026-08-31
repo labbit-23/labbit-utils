@@ -16,7 +16,7 @@
     "method": "POST"
   },
   "whatsapp": {
-    "internal_send_url": "https://lab.sdrc.in/api/internal/whatsapp/send",
+    "internal_send_url": "https://lab.sdrc.in/api/internal/whatsapp/report-template-send",
     "internal_send_token": "YOUR_WHATSAPP_INTERNAL_SEND_TOKEN",
     "lab_id": "b539c161-1e2b-480b-9526-d4b37bd37b1e",
     "template_name": "report_pdf",

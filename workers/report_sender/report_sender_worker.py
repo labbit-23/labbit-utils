@@ -284,6 +284,29 @@ def same_day_counts_and_pending(status: Dict[str, Any]) -> Tuple[int, int, List[
     return total, ready, pending
 
 
+def ready_reportable_testids(status: Dict[str, Any]) -> List[str]:
+    tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+    out: List[str] = []
+    seen = set()
+    for row in tests:
+        if not isinstance(row, dict):
+            continue
+        if not is_lab_or_radiology_test(row) or not is_ready_test(row):
+            continue
+        testid = norm_text(
+            row.get("TEST_ID") or
+            row.get("TESTID") or
+            row.get("test_id") or
+            row.get("testid") or
+            row.get("key")
+        )
+        if not testid or testid in seen:
+            continue
+        seen.add(testid)
+        out.append(testid)
+    return out
+
+
 def derive_group_ready_timestamps(status: Dict[str, Any]) -> Tuple[Optional[datetime], Optional[datetime]]:
     tests = status.get("tests") if isinstance(status.get("tests"), list) else []
     required = [t for t in tests if isinstance(t, dict) and is_same_day_required(t)]
@@ -403,6 +426,19 @@ class SupabaseRest:
             "is_paused": "eq.true",
             "sent_at": "is.null",
             "status": "in.(queued,cooling_off,eligible,retrying,processing,sending)",
+            "order": "updated_at.asc",
+            "limit": str(limit),
+        }
+        r = self.session.get(url, headers=self.headers, params=params, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return rows if isinstance(rows, list) else []
+
+    def list_by_status(self, table: str, status: str, limit: int = 500) -> List[Dict[str, Any]]:
+        url = f"{self.base}/{table}"
+        params = {
+            "select": "*",
+            "status": f"eq.{status}",
             "order": "updated_at.asc",
             "limit": str(limit),
         }
@@ -756,10 +792,21 @@ class ReportSenderWorker:
         if report_source == "outsourced_report":
             if not outsourced_testid:
                 raise ValueError("Missing outsourced_testid for outsourced report URL")
-            return f"{base}/outsourced-report?reqid={reqid}&testid={outsourced_testid}"
+            url = f"{base}/outsourced-report?reqid={reqid}&testid={outsourced_testid}"
+            if reqno:
+                url += f"&reqno={reqno}"
+            return url
         if reqno:
             return f"{base}/report/{reqid}?reqno={reqno}"
         return f"{base}/report/{reqid}"
+
+    def _sent_testids_for_job(self, job: Dict[str, Any], status: Dict[str, Any]) -> List[str]:
+        meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+        report_source = norm_text(meta.get("report_source") or "requisition_report").lower() or "requisition_report"
+        outsourced_testid = norm_text(meta.get("outsourced_testid"))
+        if report_source == "outsourced_report":
+            return [outsourced_testid] if outsourced_testid else []
+        return ready_reportable_testids(status)
 
     def _send_template(self, job: Dict[str, Any], status: Dict[str, Any], report_label: str) -> Dict[str, Any]:
         wa = self.cfg["whatsapp"]
@@ -768,6 +815,7 @@ class ReportSenderWorker:
         meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
         report_source = norm_text(meta.get("report_source") or "requisition_report").lower() or "requisition_report"
         outsourced_testid = norm_text(meta.get("outsourced_testid"))
+        sent_testids = self._sent_testids_for_job(job, status)
         patient_name = norm_text(status.get("patient_name") or job.get("patient_name") or "Patient") or "Patient"
         payload = {
             "lab_id": wa["lab_id"],
@@ -778,7 +826,10 @@ class ReportSenderWorker:
             "reqno": reqno or None,
             "reqid": reqid or None,
             "testid": outsourced_testid or None,
-            "source_service": norm_text(wa.get("source_service") or "report_sender_worker")
+            "ready_lab_test_keys": sent_testids,
+            "source_service": norm_text(wa.get("source_service") or "report_sender_worker"),
+            "source_backend": norm_text(wa.get("source_backend") or os.getenv("REPORT_DELIVERY_SOURCE_BACKEND")),
+            "server_tag": norm_text(wa.get("server_tag") or os.getenv("REPORT_DELIVERY_SERVER_TAG")),
         }
 
         if not payload["phone"]:
@@ -797,6 +848,29 @@ class ReportSenderWorker:
         r = self.http.post(wa["internal_send_url"], headers=headers, data=json.dumps(payload), timeout=timeout)
         if not r.ok:
             raise RuntimeError(f"Send failed: {r.status_code} {r.text[:300]}")
+        return r.json() if r.text else {"ok": True}
+
+    def _mark_delivery_status(self, job: Dict[str, Any], status: Dict[str, Any], sent_testids: List[str]) -> Dict[str, Any]:
+        reqno = norm_text(job.get("reqno") or status.get("reqno"))
+        if not reqno:
+            raise ValueError("Missing reqno for delivery status update")
+        base = norm_text(self.cfg["labbit_py"].get("base_url")).rstrip("/")
+        if not base:
+            raise ValueError("Missing labbit_py.base_url for delivery status update")
+        meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+        report_source = norm_text(meta.get("report_source") or "requisition_report").lower() or "requisition_report"
+        payload = {
+            "reqno": reqno,
+            "status": "S",
+            "channel": "WHATSAPP",
+            "message": f"OK {report_source.upper()}",
+            "scope": "all",
+            "testids": sent_testids,
+        }
+        timeout = int(self.cfg.get("worker", {}).get("request_timeout_seconds", 40))
+        r = self.http.post(f"{base}/delivery/status/update", data=json.dumps(payload), headers={"Content-Type": "application/json"}, timeout=timeout)
+        if not r.ok:
+            raise RuntimeError(f"Delivery status update failed: {r.status_code} {r.text[:300]}")
         return r.json() if r.text else {"ok": True}
 
     def _resolve_schedule(self, job: Dict[str, Any], status: Dict[str, Any]) -> datetime:
@@ -1034,15 +1108,40 @@ class ReportSenderWorker:
             report_url = self._build_report_document_url(job, status)
             self.log.info("sending %s label=%s report_url=%s", self._job_ctx(job, status), report_label, report_url)
             response = self._send_template(job, status, report_label)
+            sent_testids = self._sent_testids_for_job(job, status)
+            delivery_status_update = None
+            delivery_status_error = None
+            try:
+                delivery_status_update = self._mark_delivery_status(job, status, sent_testids)
+                self.log.info("delivery-status-marked %s testids=%s", self._job_ctx(job, status), ",".join(sent_testids) or "-")
+            except Exception as mark_exc:
+                delivery_status_error = str(mark_exc)
+                self.log.error("delivery-status-mark-failed %s testids=%s error=%s", self._job_ctx(job, status), ",".join(sent_testids) or "-", delivery_status_error)
+                self._event(job, "delivery_status_mark_failed", delivery_status_error, {
+                    "label": report_label,
+                    "sent_testids": sent_testids,
+                })
+            provider_payload = {
+                "whatsapp": response,
+                "delivery_status_update": delivery_status_update,
+                "delivery_status_error": delivery_status_error,
+                "sent_testids": sent_testids,
+            }
             self._patch_job(job, {
                 "status": "sent",
                 "sent_at": utc_iso(),
                 "last_error": None,
-                "provider_response": response,
+                "provider_response": provider_payload,
             })
             provider_id = norm_text((response or {}).get("provider_message_id") or (response or {}).get("id") or ((response or {}).get("messages") or [{}])[0].get("id") if isinstance((response or {}).get("messages"), list) and (response or {}).get("messages") else "")
             self.log.info("sent %s label=%s provider_message_id=%s", self._job_ctx(job, status), report_label, provider_id or "-")
-            self._event(job, "sent", "Template sent successfully", {"response": response, "label": report_label})
+            self._event(job, "sent", "Template sent successfully", {
+                "response": response,
+                "delivery_status_update": delivery_status_update,
+                "delivery_status_error": delivery_status_error,
+                "sent_testids": sent_testids,
+                "label": report_label,
+            })
         except Exception as exc:
             attempts = attempts + 1
             max_attempts = int(self.cfg.get("worker", {}).get("max_attempts", 5))

@@ -1,7 +1,8 @@
 import unittest
 from datetime import timedelta
+from unittest import mock
 
-from report_sender_worker import ReportSenderWorker, utc_now, utc_iso
+from report_sender_worker import ReportSenderWorker, ready_reportable_testids, utc_now, utc_iso
 
 
 def base_cfg():
@@ -36,6 +37,18 @@ class FakeSB:
     def list_watchdog_candidates(self, table, limit=500):
         return list(self.jobs)
 
+    def list_by_status(self, table, status, limit=500):
+        return [j for j in self.jobs if j.get("status") == status][:limit]
+
+    def list_failed_invalid_phone(self, table, limit=100):
+        return []
+
+    def list_paused_jobs(self, table, limit=25):
+        return []
+
+    def list_stale_inflight(self, table, before_iso, limit=200):
+        return []
+
     def get_latest_event(self, table, job_id):
         return self.latest_event.get(job_id)
 
@@ -61,7 +74,8 @@ class FakeSB:
 
 class WorkerTests(unittest.TestCase):
     def make_worker(self):
-        w = ReportSenderWorker(base_cfg(), dry_run=False)
+        with mock.patch.object(ReportSenderWorker, "_recover_cooling_off_jobs", return_value=None):
+            w = ReportSenderWorker(base_cfg(), dry_run=False)
         w.sb = FakeSB()
         return w
 
@@ -103,7 +117,38 @@ class WorkerTests(unittest.TestCase):
         w.process_once()
         self.assertEqual(called["count"], 1)
 
+    def test_ready_reportable_testids_only_ready_lab_radiology(self):
+        status = {
+            "tests": [
+                {"TEST_ID": "T1", "GROUPNM": "LAB", "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1"},
+                {"TEST_ID": "T2", "GROUPNM": "LAB", "REPORT_STATUS": "PENDING", "APPROVEDFLG": "0"},
+                {"TEST_ID": "T3", "GROUPNM": "RADIOLOGY", "REPORT_STATUS": "RADIOLOGY_READY", "APPROVEDFLG": "1"},
+                {"TEST_ID": "T4", "GROUPNM": "OTHER", "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1"},
+            ]
+        }
+        self.assertEqual(ready_reportable_testids(status), ["T1", "T3"])
+
+    def test_mark_delivery_status_posts_testids(self):
+        w = self.make_worker()
+        calls = []
+
+        class FakeResponse:
+            ok = True
+            text = '{"ok":true}'
+
+            def json(self):
+                return {"ok": True}
+
+        w.http.post = lambda url, **kwargs: calls.append((url, kwargs)) or FakeResponse()
+        result = w._mark_delivery_status(
+            {"id": 5, "reqno": "R5", "metadata": {}},
+            {"reqno": "R5"},
+            ["T1", "T3"],
+        )
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(calls[0][0], "https://api.sdrc.in/py/delivery/status/update")
+        self.assertIn('"testids": ["T1", "T3"]', calls[0][1]["data"])
+
 
 if __name__ == "__main__":
     unittest.main()
-
