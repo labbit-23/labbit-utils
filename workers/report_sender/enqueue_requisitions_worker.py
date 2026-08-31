@@ -33,8 +33,25 @@ def norm(v: Any) -> str:
     return str(v or "").strip()
 
 
+def shivam_reqid(v: Any) -> str:
+    text = norm(v)
+    return text.split(":", 1)[1] if text.startswith("archive:") else text
+
+
 def digits_only(v: Any) -> str:
     return "".join(ch for ch in str(v or "") if ch.isdigit())
+
+
+def parse_metadata(v: Any) -> Dict[str, Any]:
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 class SupabaseRest:
@@ -155,7 +172,7 @@ class SupabaseRest:
         # Filter at database level to avoid fetching thousands of jobs we don't care about.
         u = f"{self.base}/{table}"
         p = {
-            "select": "id,lab_id,reqno,reqid,mrno,phone,patient_name,status,report_label,last_error,is_paused,created_at,updated_at",
+            "select": "id,lab_id,reqno,reqid,mrno,phone,patient_name,status,report_label,last_error,is_paused,metadata,created_at,updated_at",
             "status": "in.(queued,cooling_off,eligible,retrying,failed,sending,sent)",
             "updated_at": f"gte.{since_iso}",
             "order": "updated_at.asc",
@@ -280,12 +297,13 @@ class EnqueueWorker:
         base = norm(self.cfg.get("labbit_py", {}).get("base_url")).rstrip("/")
         mode = norm(self.cfg.get("labbit_py", {}).get("status_mode") or "reqno").lower()
         timeout = int(self.cfg.get("enqueue", {}).get("request_timeout_seconds", 20))
-        if mode == "reqid" and reqid:
-            url = f"{base}/report-status-reqid/{reqid}"
+        status_reqid = self._status_reqid(reqid)
+        if mode == "reqid" and status_reqid:
+            url = f"{base}/report-status-reqid/{status_reqid}"
         elif reqno:
             url = f"{base}/report-status/{reqno}"
-        elif reqid:
-            url = f"{base}/report-status-reqid/{reqid}"
+        elif status_reqid:
+            url = f"{base}/report-status-reqid/{status_reqid}"
         else:
             raise ValueError("Missing reqno/reqid for status fetch")
         r = self.http.get(url, timeout=timeout)
@@ -294,6 +312,44 @@ class EnqueueWorker:
         if not isinstance(data, dict):
             raise ValueError("Unexpected status response")
         return data
+
+    def _strip_archive_reqid_enabled(self) -> bool:
+        return bool(self.cfg.get("enqueue", {}).get("strip_archive_reqid_for_status", False))
+
+    def _tag_job_origin_enabled(self) -> bool:
+        return bool(self.cfg.get("enqueue", {}).get("tag_job_origin", False))
+
+    def _status_reqid(self, reqid: Any) -> str:
+        text = norm(reqid)
+        return shivam_reqid(text) if self._strip_archive_reqid_enabled() else text
+
+    def _source_metadata(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        if not self._tag_job_origin_enabled():
+            return {}
+        meta = parse_metadata(row.get("metadata"))
+        explicit = (
+            norm(row.get("source"))
+            or norm(row.get("SOURCE"))
+            or norm(row.get("source_backend"))
+            or norm(row.get("SOURCE_BACKEND"))
+            or norm(row.get("report_origin"))
+            or norm(row.get("REPORT_ORIGIN"))
+            or norm(meta.get("source_backend"))
+            or norm(meta.get("report_origin"))
+            or norm(self.cfg.get("enqueue", {}).get("source_backend"))
+            or norm(self.cfg.get("enqueue", {}).get("report_origin"))
+        )
+        key = explicit.lower()
+        if not key or key in {"shivam", "legacy", "neosoft"}:
+            return {}
+        if key in {"core", "labit", "labit-core"}:
+            key = "labit_core"
+        return {"source_backend": key, "report_origin": key}
+
+    def _job_metadata(self, row: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+        meta = self._source_metadata(row)
+        meta.update(extra)
+        return meta
 
     def _is_same_day_required(self, row: Dict[str, Any]) -> bool:
         return norm(row.get("SAMEDAYREPORT") or row.get("samedayreport")) == "1"
@@ -365,6 +421,7 @@ class EnqueueWorker:
 
     def _fetch_outsourced_meta(self, reqid: str, testid: str) -> Dict[str, Any]:
         base = norm(self.cfg.get("labbit_py", {}).get("base_url")).rstrip("/")
+        reqid = self._status_reqid(reqid)
         if not base or not reqid or not testid:
             return {}
         timeout = int(self.cfg.get("enqueue", {}).get("request_timeout_seconds", 20))
@@ -556,11 +613,11 @@ class EnqueueWorker:
                     "attempt_count": 0,
                     "max_attempts": max_attempts,
                     "next_attempt_at": utc_iso(),
-                    "metadata": {
+                    "metadata": self._job_metadata(row, {
                         "reconcile": True,
                         "lookback_hours": lookback_hours,
                         "reason": "reactivate_from_skipped_reportable"
-                    },
+                    }),
                     "created_at": utc_iso(),
                     "updated_at": utc_iso(),
                 }
@@ -653,11 +710,11 @@ class EnqueueWorker:
                 "attempt_count": 0,
                 "max_attempts": max_attempts,
                 "next_attempt_at": utc_iso(),
-                "metadata": {
+                "metadata": self._job_metadata(row, {
                     "reconcile": True,
                     "lookback_hours": lookback_hours,
                     "reason": "partial_or_unsent_now_full_ready"
-                },
+                }),
                 "created_at": utc_iso(),
                 "updated_at": utc_iso(),
             }
@@ -772,12 +829,12 @@ class EnqueueWorker:
                     "attempt_count": 0,
                     "max_attempts": max_attempts,
                     "next_attempt_at": utc_iso(),
-                    "metadata": {
+                    "metadata": self._job_metadata(row, {
                         "report_source": "outsourced_report",
                         "outsourced_testid": testid,
                         "outsourced_mode": mode,
                         "reason": "outsourced_reconcile",
-                    },
+                    }),
                     "created_at": utc_iso(),
                     "updated_at": utc_iso(),
                 }
@@ -853,12 +910,12 @@ class EnqueueWorker:
                     "attempt_count": 0,
                     "max_attempts": max_attempts,
                     "next_attempt_at": utc_iso(),
-                    "metadata": {
+                    "metadata": self._job_metadata(row, {
                         "report_source": "outsourced_report",
                         "outsourced_testid": testid,
                         "outsourced_mode": mode,
                         "reason": "outsourced_reconcile_from_failed",
-                    },
+                    }),
                     "created_at": utc_iso(),
                     "updated_at": utc_iso(),
                 }
@@ -1045,12 +1102,12 @@ class EnqueueWorker:
                     "attempt_count": 0,
                     "max_attempts": int(self.cfg.get("worker", {}).get("max_attempts", 5)),
                     "next_attempt_at": utc_iso(),
-                    "metadata": {
+                    "metadata": self._job_metadata(row, {
                         "report_source": "outsourced_report",
                         "outsourced_testid": testid,
                         "outsourced_mode": normalized_mode,
                         "reason": "outsourced_separate_job",
-                    },
+                    }),
                     "created_at": utc_iso(),
                     "updated_at": utc_iso(),
                 }
@@ -1068,7 +1125,7 @@ class EnqueueWorker:
                     existing_regular = self.sb.latest_job(jobs_table, reqno)
                     if existing_regular and norm(existing_regular.get("status")).lower() in {"failed", "skipped", "queued", "cooling_off"}:
                         # Convert existing regular job to outsourced
-                        meta = dict(existing_regular.get("metadata") or {})
+                        meta = parse_metadata(existing_regular.get("metadata"))
                         meta["report_source"] = "outsourced_report"
                         meta["outsourced_testid"] = outsourced_testids[0]
                         if self.dry_run:
@@ -1101,6 +1158,9 @@ class EnqueueWorker:
                 "created_at": utc_iso(),
                 "updated_at": utc_iso(),
             }
+            meta = self._source_metadata(row)
+            if meta:
+                job["metadata"] = meta
             if self.dry_run:
                 self.log.info("[dry-run] enqueue reqno=%s", reqno)
             else:
