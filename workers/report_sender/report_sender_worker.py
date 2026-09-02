@@ -83,6 +83,52 @@ def digits_only(value: Any) -> str:
     return "".join(ch for ch in str(value or "") if ch.isdigit())
 
 
+def phone_last10(value: Any) -> str:
+    d = digits_only(value)
+    return d[-10:] if len(d) >= 10 else d
+
+
+def canonical_india_phone(value: Any) -> str:
+    d = digits_only(value)
+    if not d:
+        return ""
+    if len(d) == 11 and d.startswith("0"):
+        return "91" + d[1:]
+    if len(d) == 10:
+        return "91" + d
+    if len(d) > 12:
+        return "91" + d[-10:]
+    return d
+
+
+def phone_variants_india(value: Any) -> List[str]:
+    raw = norm_text(value)
+    d = digits_only(raw)
+    last10 = phone_last10(raw)
+    canonical = canonical_india_phone(raw)
+    variants = [
+        raw,
+        d,
+        last10,
+        canonical,
+        f"+{canonical}" if canonical else "",
+        f"91{last10}" if last10 else "",
+        f"+91{last10}" if last10 else "",
+        f"whatsapp:+{canonical}" if canonical else "",
+        f"whatsapp:+91{last10}" if last10 else "",
+        f"{canonical}@s.whatsapp.net" if canonical else "",
+        f"91{last10}@s.whatsapp.net" if last10 else "",
+        f"+{canonical}@s.whatsapp.net" if canonical else "",
+    ]
+    out: List[str] = []
+    seen = set()
+    for item in variants:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
 def _digits_changed(prev: Any, cur: Any) -> bool:
     return digits_only(prev) != digits_only(cur)
 
@@ -506,6 +552,62 @@ class SupabaseRest:
             return rows[0]
         return None
 
+    def find_active_chat_session(
+        self,
+        table: str,
+        *,
+        lab_id: str,
+        phone_variants: List[str],
+        since_iso: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not phone_variants:
+            return None
+        url = f"{self.base}/{table}"
+        quoted = ",".join(f'"{p}"' for p in phone_variants)
+        params = {
+            "select": "id,lab_id,phone,status,current_state,last_message_at,last_user_message_at,updated_at",
+            "lab_id": f"eq.{lab_id}",
+            "phone": f"in.({quoted})",
+            "status": "neq.closed",
+            "last_user_message_at": f"gte.{since_iso}",
+            "order": "last_user_message_at.desc.nullslast,updated_at.desc",
+            "limit": "1",
+        }
+        r = self.session.get(url, headers=self.headers, params=params, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        return None
+
+    def find_recent_inbound_message(
+        self,
+        table: str,
+        *,
+        lab_id: str,
+        phone_variants: List[str],
+        since_iso: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not phone_variants:
+            return None
+        url = f"{self.base}/{table}"
+        quoted = ",".join(f'"{p}"' for p in phone_variants)
+        params = {
+            "select": "id,lab_id,phone,direction,message_id,message,created_at",
+            "lab_id": f"eq.{lab_id}",
+            "phone": f"in.({quoted})",
+            "direction": "eq.inbound",
+            "created_at": f"gte.{since_iso}",
+            "order": "created_at.desc",
+            "limit": "1",
+        }
+        r = self.session.get(url, headers=self.headers, params=params, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        return None
+
 
 class ReportSenderWorker:
     def __init__(self, cfg: Dict[str, Any], dry_run: bool = False) -> None:
@@ -850,6 +952,173 @@ class ReportSenderWorker:
             raise RuntimeError(f"Send failed: {r.status_code} {r.text[:300]}")
         return r.json() if r.text else {"ok": True}
 
+    def _document_send_url(self) -> str:
+        wa = self.cfg["whatsapp"]
+        explicit = norm_text(wa.get("session_document_send_url") or wa.get("document_send_url"))
+        if explicit:
+            return explicit
+        template_url = norm_text(wa.get("internal_send_url"))
+        if template_url.endswith("/report-template-send"):
+            return template_url[: -len("/report-template-send")] + "/send"
+        return template_url
+
+    def _trial_number_allowed(self, phone: str) -> bool:
+        cfg = self.cfg.get("whatsapp", {}).get("session_document_route", {})
+        trial_numbers = cfg.get("trial_numbers") or []
+        if not trial_numbers:
+            return True
+        target = phone_last10(phone)
+        return bool(target) and target in {phone_last10(item) for item in trial_numbers}
+
+    def _trial_window_allowed(self) -> bool:
+        cfg = self.cfg.get("whatsapp", {}).get("session_document_route", {})
+        until = parse_iso(cfg.get("trial_until"))
+        if until is None:
+            return True
+        return utc_now() <= until
+
+    def _session_document_route_enabled(self, phone: str) -> bool:
+        cfg = self.cfg.get("whatsapp", {}).get("session_document_route", {})
+        if not bool(cfg.get("enabled", False)):
+            return False
+        return self._trial_window_allowed() and self._trial_number_allowed(phone)
+
+    def _active_whatsapp_session(self, phone: str) -> Tuple[bool, Dict[str, Any]]:
+        route_cfg = self.cfg.get("whatsapp", {}).get("session_document_route", {})
+        lab_id = norm_text(self.cfg.get("whatsapp", {}).get("lab_id"))
+        if not lab_id:
+            return False, {"reason": "missing_lab_id"}
+
+        window_hours = int(route_cfg.get("session_window_hours", 24) or 24)
+        since = utc_now() - timedelta(hours=max(1, window_hours))
+        since_iso = utc_iso(since)
+        variants = phone_variants_india(phone)
+        tables_cfg = self.cfg.get("tables", {})
+        sessions_table = norm_text(route_cfg.get("sessions_table") or tables_cfg.get("chat_sessions") or "chat_sessions")
+        messages_table = norm_text(route_cfg.get("messages_table") or tables_cfg.get("whatsapp_messages") or "whatsapp_messages")
+
+        try:
+            session = self.sb.find_active_chat_session(
+                sessions_table,
+                lab_id=lab_id,
+                phone_variants=variants,
+                since_iso=since_iso,
+            )
+            if session:
+                return True, {
+                    "reason": "active_chat_session",
+                    "session_id": session.get("id"),
+                    "matched_phone": session.get("phone"),
+                    "last_user_message_at": session.get("last_user_message_at"),
+                    "window_hours": window_hours,
+                }
+
+            message = self.sb.find_recent_inbound_message(
+                messages_table,
+                lab_id=lab_id,
+                phone_variants=variants,
+                since_iso=since_iso,
+            )
+            if message:
+                return True, {
+                    "reason": "recent_inbound_message",
+                    "message_id": message.get("id"),
+                    "provider_message_id": message.get("message_id"),
+                    "matched_phone": message.get("phone"),
+                    "created_at": message.get("created_at"),
+                    "window_hours": window_hours,
+                }
+            return False, {"reason": "no_recent_inbound", "window_hours": window_hours}
+        except Exception as exc:
+            return False, {"reason": "lookup_failed", "error": str(exc), "window_hours": window_hours}
+
+    def _build_report_filename(self, job: Dict[str, Any], status: Dict[str, Any]) -> str:
+        reqno = norm_text(job.get("reqno") or status.get("reqno"))
+        reqid = norm_text(job.get("reqid") or status.get("reqid"))
+        patient_name = norm_text(status.get("patient_name") or job.get("patient_name") or "Patient") or "Patient"
+        first = patient_name.split()[0] if patient_name else "Patient"
+        safe_first = "".join(ch for ch in first if ch.isalpha()).upper() or "PATIENT"
+        return f"SDRC_Report_{reqno or reqid or 'Report'}_{safe_first}.pdf"
+
+    def _send_document(self, job: Dict[str, Any], status: Dict[str, Any], report_label: str, report_url: str) -> Dict[str, Any]:
+        wa = self.cfg["whatsapp"]
+        reqno = norm_text(job.get("reqno") or status.get("reqno"))
+        reqid = norm_text(job.get("reqid") or status.get("reqid"))
+        meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+        report_source = norm_text(meta.get("report_source") or "requisition_report").lower() or "requisition_report"
+        sent_testids = self._sent_testids_for_job(job, status)
+        route_cfg = wa.get("session_document_route", {})
+        payload = {
+            "lab_id": wa["lab_id"],
+            "phone": norm_text(job.get("phone") or status.get("patient_phone")),
+            "message_type": "document",
+            "document_url": report_url,
+            "filename": self._build_report_filename(job, status),
+            "caption": norm_text(route_cfg.get("caption") or "Please find your report attached."),
+            "reqno": reqno or None,
+            "reqid": reqid or None,
+            "ready_lab_test_keys": sent_testids,
+            "source_service": norm_text(wa.get("source_service") or "report_sender_worker"),
+            "source_backend": norm_text(wa.get("source_backend") or os.getenv("REPORT_DELIVERY_SOURCE_BACKEND")),
+            "server_tag": norm_text(wa.get("server_tag") or os.getenv("REPORT_DELIVERY_SERVER_TAG")),
+            "report_source": report_source,
+            "session_document_route_label": norm_text(route_cfg.get("label")),
+        }
+
+        if not payload["phone"]:
+            raise ValueError("Missing phone for send")
+        if not is_valid_india_phone(payload["phone"]):
+            raise ValueError(INVALID_PHONE_SENTINEL)
+
+        token = wa["internal_send_token"]
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "x-internal-token": token,
+        }
+        timeout = int(self.cfg.get("worker", {}).get("request_timeout_seconds", 40))
+        r = self.http.post(self._document_send_url(), headers=headers, data=json.dumps(payload), timeout=timeout)
+        if not r.ok:
+            raise RuntimeError(f"Document send failed: {r.status_code} {r.text[:300]}")
+        data = r.json() if r.text else {"ok": True}
+        return {
+            **(data if isinstance(data, dict) else {"response": data}),
+            "dispatch_route": "session_document",
+            "report_label": report_label,
+        }
+
+    def _send_report_message(
+        self,
+        job: Dict[str, Any],
+        status: Dict[str, Any],
+        report_label: str,
+        report_url: str,
+    ) -> Dict[str, Any]:
+        phone = norm_text(job.get("phone") or status.get("patient_phone"))
+        if self._session_document_route_enabled(phone):
+            eligible, evidence = self._active_whatsapp_session(phone)
+            if eligible:
+                try:
+                    response = self._send_document(job, status, report_label, report_url)
+                    self._event(job, "session_document_sent", "Report sent as WhatsApp session document", {
+                        "session_evidence": evidence,
+                        "label": report_label,
+                    })
+                    return response
+                except Exception as exc:
+                    self._event(job, "session_document_failed_fallback_template", "Session document send failed; falling back to report template", {
+                        "session_evidence": evidence,
+                        "error": str(exc),
+                        "label": report_label,
+                    })
+                    self.log.warning("session-document-fallback %s err=%s", self._job_ctx(job, status), exc)
+            else:
+                self._event(job, "session_document_ineligible", "No active WhatsApp customer-service session; using report template", {
+                    "session_evidence": evidence,
+                    "label": report_label,
+                })
+        return self._send_template(job, status, report_label)
+
     def _mark_delivery_status(self, job: Dict[str, Any], status: Dict[str, Any], sent_testids: List[str]) -> Dict[str, Any]:
         reqno = norm_text(job.get("reqno") or status.get("reqno"))
         if not reqno:
@@ -1107,7 +1376,7 @@ class ReportSenderWorker:
         try:
             report_url = self._build_report_document_url(job, status)
             self.log.info("sending %s label=%s report_url=%s", self._job_ctx(job, status), report_label, report_url)
-            response = self._send_template(job, status, report_label)
+            response = self._send_report_message(job, status, report_label, report_url)
             sent_testids = self._sent_testids_for_job(job, status)
             delivery_status_update = None
             delivery_status_error = None
@@ -1135,12 +1404,14 @@ class ReportSenderWorker:
             })
             provider_id = norm_text((response or {}).get("provider_message_id") or (response or {}).get("id") or ((response or {}).get("messages") or [{}])[0].get("id") if isinstance((response or {}).get("messages"), list) and (response or {}).get("messages") else "")
             self.log.info("sent %s label=%s provider_message_id=%s", self._job_ctx(job, status), report_label, provider_id or "-")
-            self._event(job, "sent", "Template sent successfully", {
+            dispatch_route = norm_text((response or {}).get("dispatch_route") or "template")
+            self._event(job, "sent", "Report sent successfully", {
                 "response": response,
                 "delivery_status_update": delivery_status_update,
                 "delivery_status_error": delivery_status_error,
                 "sent_testids": sent_testids,
                 "label": report_label,
+                "dispatch_route": dispatch_route,
             })
         except Exception as exc:
             attempts = attempts + 1

@@ -33,6 +33,8 @@ class FakeSB:
         self.patches = []
         self.events = []
         self.claimed = {}
+        self.active_chat_session = None
+        self.recent_inbound_message = None
 
     def list_watchdog_candidates(self, table, limit=500):
         return list(self.jobs)
@@ -70,6 +72,23 @@ class FakeSB:
             if j.get("id") == row_id:
                 return dict(j)
         return None
+
+    def find_active_chat_session(self, table, *, lab_id, phone_variants, since_iso):
+        return self.active_chat_session
+
+    def find_recent_inbound_message(self, table, *, lab_id, phone_variants, since_iso):
+        return self.recent_inbound_message
+
+
+class FakeResponse:
+    def __init__(self, ok=True, text='{"ok":true,"provider_message_id":"wamid.test"}', status_code=200):
+        self.ok = ok
+        self.text = text
+        self.status_code = status_code
+
+    def json(self):
+        import json
+        return json.loads(self.text) if self.text else {}
 
 
 class WorkerTests(unittest.TestCase):
@@ -132,14 +151,7 @@ class WorkerTests(unittest.TestCase):
         w = self.make_worker()
         calls = []
 
-        class FakeResponse:
-            ok = True
-            text = '{"ok":true}'
-
-            def json(self):
-                return {"ok": True}
-
-        w.http.post = lambda url, **kwargs: calls.append((url, kwargs)) or FakeResponse()
+        w.http.post = lambda url, **kwargs: calls.append((url, kwargs)) or FakeResponse(text='{"ok":true}')
         result = w._mark_delivery_status(
             {"id": 5, "reqno": "R5", "metadata": {}},
             {"reqno": "R5"},
@@ -148,6 +160,103 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
         self.assertEqual(calls[0][0], "https://api.sdrc.in/py/delivery/status/update")
         self.assertIn('"testids": ["T1", "T3"]', calls[0][1]["data"])
+
+    def test_session_document_route_sends_document_when_patient_window_active(self):
+        w = self.make_worker()
+        w.cfg["whatsapp"].update({
+            "internal_send_url": "https://lab/api/internal/whatsapp/report-template-send",
+            "session_document_send_url": "https://lab/api/internal/whatsapp/send",
+            "session_document_route": {
+                "enabled": True,
+                "trial_numbers": ["9849025601"],
+                "trial_until": "2999-01-01T00:00:00+00:00",
+                "label": "Testing 090322026",
+            },
+        })
+        w.sb.active_chat_session = {
+            "id": "sess-1",
+            "phone": "919849025601",
+            "last_user_message_at": utc_iso(),
+        }
+        calls = []
+        w.http.post = lambda url, **kwargs: calls.append((url, kwargs)) or FakeResponse()
+
+        result = w._send_report_message(
+            {"id": 6, "reqno": "R6", "reqid": "REQ6", "phone": "9849025601", "metadata": {}},
+            {"reqno": "R6", "reqid": "REQ6", "patient_name": "Patient", "tests": []},
+            "complete lab",
+            "https://api.sdrc.in/py/report/REQ6?reqno=R6",
+        )
+
+        self.assertEqual(calls[0][0], "https://lab/api/internal/whatsapp/send")
+        self.assertIn('"message_type": "document"', calls[0][1]["data"])
+        self.assertIn('"session_document_route_label": "Testing 090322026"', calls[0][1]["data"])
+        self.assertEqual(result["dispatch_route"], "session_document")
+        self.assertTrue(any(e.get("event_type") == "session_document_sent" for e in w.sb.events))
+
+    def test_session_document_route_falls_back_to_template_without_active_window(self):
+        w = self.make_worker()
+        w.cfg["whatsapp"].update({
+            "internal_send_url": "https://lab/api/internal/whatsapp/report-template-send",
+            "session_document_send_url": "https://lab/api/internal/whatsapp/send",
+            "session_document_route": {
+                "enabled": True,
+                "trial_numbers": ["9849025601"],
+                "trial_until": "2999-01-01T00:00:00+00:00",
+            },
+        })
+        calls = []
+        w.http.post = lambda url, **kwargs: calls.append((url, kwargs)) or FakeResponse()
+
+        w._send_report_message(
+            {"id": 7, "reqno": "R7", "reqid": "REQ7", "phone": "9849025601", "metadata": {}},
+            {"reqno": "R7", "reqid": "REQ7", "patient_name": "Patient", "tests": []},
+            "complete lab",
+            "https://api.sdrc.in/py/report/REQ7?reqno=R7",
+        )
+
+        self.assertEqual(calls[0][0], "https://lab/api/internal/whatsapp/report-template-send")
+        self.assertIn('"report_source": "requisition_report"', calls[0][1]["data"])
+        self.assertTrue(any(e.get("event_type") == "session_document_ineligible" for e in w.sb.events))
+
+    def test_session_document_failure_falls_back_to_template(self):
+        w = self.make_worker()
+        w.cfg["whatsapp"].update({
+            "internal_send_url": "https://lab/api/internal/whatsapp/report-template-send",
+            "session_document_send_url": "https://lab/api/internal/whatsapp/send",
+            "session_document_route": {
+                "enabled": True,
+                "trial_numbers": ["9849025601"],
+                "trial_until": "2999-01-01T00:00:00+00:00",
+            },
+        })
+        w.sb.recent_inbound_message = {
+            "id": "msg-1",
+            "phone": "919849025601",
+            "created_at": utc_iso(),
+        }
+        calls = []
+
+        def fake_post(url, **kwargs):
+            calls.append((url, kwargs))
+            if url.endswith("/send"):
+                return FakeResponse(ok=False, text="gateway rejected document", status_code=502)
+            return FakeResponse()
+
+        w.http.post = fake_post
+        result = w._send_report_message(
+            {"id": 8, "reqno": "R8", "reqid": "REQ8", "phone": "9849025601", "metadata": {}},
+            {"reqno": "R8", "reqid": "REQ8", "patient_name": "Patient", "tests": []},
+            "complete lab",
+            "https://api.sdrc.in/py/report/REQ8?reqno=R8",
+        )
+
+        self.assertEqual([call[0] for call in calls], [
+            "https://lab/api/internal/whatsapp/send",
+            "https://lab/api/internal/whatsapp/report-template-send",
+        ])
+        self.assertEqual(result["provider_message_id"], "wamid.test")
+        self.assertTrue(any(e.get("event_type") == "session_document_failed_fallback_template" for e in w.sb.events))
 
 
 if __name__ == "__main__":
