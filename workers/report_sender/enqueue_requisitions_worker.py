@@ -92,7 +92,11 @@ class SupabaseRest:
     def list_jobs_by_reqno(self, table: str, reqno: str, limit: int = 200) -> List[Dict[str, Any]]:
         u = f"{self.base}/{table}"
         p = {
-            "select": "id,reqno,status,metadata,updated_at,created_at",
+            # phone + last_error are required by the churn guards
+            # (_should_skip_failed_reenqueue, _should_retry_pdf_not_found) --
+            # they were silently absent before, which is why the
+            # INVALID_PHONE re-enqueue guard never actually fired.
+            "select": "id,reqno,phone,status,last_error,metadata,updated_at,created_at",
             "reqno": f"eq.{reqno}",
             "order": "updated_at.desc,created_at.desc,id.desc",
             "limit": str(limit),
@@ -476,22 +480,54 @@ class EnqueueWorker:
         Prevents duplicate follow-ups from being created every reconciliation cycle."""
         return self.sb.has_active_job(table, reqno)
 
-    def _should_skip_invalid_phone_reenqueue(self, jobs_table: str, reqno: str, incoming_phone: str) -> bool:
-        # Guard against churn: if ANY INVALID_PHONE failure exists for this reqno with the same phone, skip.
-        # Only retry if phone number has actually changed since the failure.
-        rows = self.sb.list_jobs_by_reqno(jobs_table, reqno=reqno, limit=200)
+    # WhatsApp delivery-failure signatures where re-sending the SAME number
+    # cannot succeed (recipient has no WhatsApp, blocked the business, window
+    # closed). Matched as substrings of last_error, which the delivery-status
+    # webhook writes as e.g. "WA_DELIVERY_FAILED: 131026 Message undeliverable".
+    _PERMANENT_RECIPIENT_FAILURE_TOKENS = (
+        "INVALID_PHONE",
+        "131026",          # Message undeliverable
+        "131047",          # Re-engagement message required
+        "131049",          # Not delivered (healthy-ecosystem limit)
+        "131050",          # Recipient stopped receiving from this business
+        "UNDELIVERABLE",
+    )
+
+    def _is_permanent_recipient_failure(self, last_error: Any) -> bool:
+        e = norm(last_error).upper()
+        return bool(e) and any(tok in e for tok in self._PERMANENT_RECIPIENT_FAILURE_TOKENS)
+
+    def _should_skip_failed_reenqueue(self, jobs_table: str, reqno: str, incoming_phone: str) -> bool:
+        """Churn guard against dead numbers. Stop re-creating a dispatch job for a
+        (reqno, phone) when:
+          * it has already failed with a PERMANENT recipient error for the SAME
+            number (invalid, or WhatsApp says undeliverable/blocked) — retrying
+            that exact number never succeeds; or
+          * that (reqno, phone) has piled up >= max_failed_reenqueue failed jobs
+            of ANY error — something is wrong and hammering it just burns
+            provider throughput/reputation (Sep-3: 11 dead numbers, ~40 sends
+            each = 439 "failures").
+        A genuine phone correction (different last-10 digits) always resets this.
+        """
+        rows = self.sb.list_jobs_by_reqno(jobs_table, reqno=reqno, limit=300)
         cur_digits = digits_only(incoming_phone)
         if not cur_digits:
             return False
-        # Compare last 10 digits to handle country-code prefix mismatches.
         cur_phone_10 = cur_digits[-10:]
+        max_failed = int(self.cfg.get("worker", {}).get("max_failed_reenqueue", 3) or 3)
+        same_phone_failures = 0
         for row in rows:
-            last_error = norm(row.get("last_error")).upper()
-            if last_error == "INVALID_PHONE":
-                prev_digits = digits_only(row.get("phone"))
-                if prev_digits and prev_digits[-10:] == cur_phone_10:
-                    return True
-        return False
+            prev_digits = digits_only(row.get("phone"))
+            if not (prev_digits and prev_digits[-10:] == cur_phone_10):
+                continue  # different number since — a real correction, allow retry
+            if self._is_permanent_recipient_failure(row.get("last_error")):
+                return True
+            if norm(row.get("status")).lower() == "failed":
+                same_phone_failures += 1
+        return same_phone_failures >= max_failed
+
+    # Back-compat alias for existing call sites / tests.
+    _should_skip_invalid_phone_reenqueue = _should_skip_failed_reenqueue
 
     def _should_retry_pdf_not_found(self, jobs_table: str, reqno: str, reqid: str) -> bool:
         # PDF not found errors are often transient — check if PDF is available NOW
@@ -594,7 +630,7 @@ class EnqueueWorker:
                     continue
                 if self._should_skip_invalid_phone_reenqueue(jobs_table, reqno, phone):
                     self.log.info(
-                        "Reconcile skip reqno=%s reason=failed_invalid_phone_unchanged phone=%s",
+                        "Reconcile skip reqno=%s reason=failed_reenqueue_capped phone=%s",
                         reqno,
                         phone,
                     )
@@ -680,7 +716,7 @@ class EnqueueWorker:
             # Skip if invalid phone hasn't changed
             if self._should_skip_invalid_phone_reenqueue(jobs_table, reqno, phone):
                 self.log.info(
-                    "Reconcile skip reqno=%s reason=failed_invalid_phone_unchanged phone=%s",
+                    "Reconcile skip reqno=%s reason=failed_reenqueue_capped phone=%s",
                     reqno,
                     phone,
                 )
@@ -1034,7 +1070,7 @@ class EnqueueWorker:
 
             if self._should_skip_invalid_phone_reenqueue(jobs_table, reqno, phone):
                 self.log.info(
-                    "Skip enqueue reqno=%s reason=failed_invalid_phone_unchanged phone=%s",
+                    "Skip enqueue reqno=%s reason=failed_reenqueue_capped phone=%s",
                     reqno,
                     phone,
                 )
