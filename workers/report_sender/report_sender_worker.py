@@ -1040,6 +1040,29 @@ class ReportSenderWorker:
         safe_first = "".join(ch for ch in first if ch.isalpha()).upper() or "PATIENT"
         return f"SDRC_Report_{reqno or reqid or 'Report'}_{safe_first}.pdf"
 
+    # Mirrors the approved `reports_pdf` WhatsApp template body so a
+    # free-form document send reads identically to a template send.
+    # {name} <- template {{1}}, {label} <- template {{2}}. Override via
+    # config whatsapp.session_document_route.caption_template if the
+    # template wording changes.
+    _DEFAULT_DOC_CAPTION_TEMPLATE = (
+        "Dear {name}, please find attached your {label} reports for the test/s "
+        "done at SDRC.\n\n"
+        "Please reply with Hi for any queries, appointment booking, trend reports "
+        "or other information. Our Whatsapp Bot will be available to help you.\n\n"
+        "-Team SDRC"
+    )
+
+    def _document_caption(self, patient_name: Any, report_label: Any) -> str:
+        route_cfg = self.cfg.get("whatsapp", {}).get("session_document_route", {})
+        tpl = norm_text(route_cfg.get("caption_template")) or self._DEFAULT_DOC_CAPTION_TEMPLATE
+        name = norm_text(patient_name) or "Patient"
+        label = norm_text(report_label) or "report"
+        try:
+            return tpl.format(name=name, label=label)
+        except Exception:
+            return self._DEFAULT_DOC_CAPTION_TEMPLATE.format(name=name, label=label)
+
     def _send_document(self, job: Dict[str, Any], status: Dict[str, Any], report_label: str, report_url: str) -> Dict[str, Any]:
         wa = self.cfg["whatsapp"]
         reqno = norm_text(job.get("reqno") or status.get("reqno"))
@@ -1054,7 +1077,9 @@ class ReportSenderWorker:
             "message_type": "document",
             "document_url": report_url,
             "filename": self._build_report_filename(job, status),
-            "caption": norm_text(route_cfg.get("caption") or "Please find your report attached."),
+            "caption": self._document_caption(
+                status.get("patient_name") or job.get("patient_name"), report_label
+            ),
             "reqno": reqno or None,
             "reqid": reqid or None,
             "ready_lab_test_keys": sent_testids,
@@ -1377,6 +1402,14 @@ class ReportSenderWorker:
             report_url = self._build_report_document_url(job, status)
             self.log.info("sending %s label=%s report_url=%s", self._job_ctx(job, status), report_label, report_url)
             response = self._send_report_message(job, status, report_label, report_url)
+            _resp = response if isinstance(response, dict) else {}
+            _msgs = _resp.get("messages")
+            provider_id = norm_text(
+                _resp.get("provider_message_id")
+                or _resp.get("id")
+                or ((_msgs[0].get("id") if isinstance(_msgs, list) and _msgs else ""))
+            )
+            dispatch_route = norm_text(_resp.get("dispatch_route") or "template")
             sent_testids = self._sent_testids_for_job(job, status)
             delivery_status_update = None
             delivery_status_error = None
@@ -1392,6 +1425,13 @@ class ReportSenderWorker:
                 })
             provider_payload = {
                 "whatsapp": response,
+                # ALSO at top level: the delivery-status webhook
+                # (reconcileAutoDispatchDeliveryFailure) looks the job up by
+                # provider_response->>provider_message_id, so it must be here,
+                # not only nested under "whatsapp". Applies to both the
+                # template and session-document routes.
+                "provider_message_id": provider_id or None,
+                "dispatch_route": dispatch_route,
                 "delivery_status_update": delivery_status_update,
                 "delivery_status_error": delivery_status_error,
                 "sent_testids": sent_testids,
@@ -1402,9 +1442,7 @@ class ReportSenderWorker:
                 "last_error": None,
                 "provider_response": provider_payload,
             })
-            provider_id = norm_text((response or {}).get("provider_message_id") or (response or {}).get("id") or ((response or {}).get("messages") or [{}])[0].get("id") if isinstance((response or {}).get("messages"), list) and (response or {}).get("messages") else "")
-            self.log.info("sent %s label=%s provider_message_id=%s", self._job_ctx(job, status), report_label, provider_id or "-")
-            dispatch_route = norm_text((response or {}).get("dispatch_route") or "template")
+            self.log.info("sent %s label=%s route=%s provider_message_id=%s", self._job_ctx(job, status), report_label, dispatch_route, provider_id or "-")
             self._event(job, "sent", "Report sent successfully", {
                 "response": response,
                 "delivery_status_update": delivery_status_update,

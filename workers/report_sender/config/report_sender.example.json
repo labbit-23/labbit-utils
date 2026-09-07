@@ -27,9 +27,9 @@
       "enabled": false,
       "session_window_hours": 24,
       "trial_numbers": ["9849025601"],
-      "trial_until": "2026-09-04T23:59:59+05:30",
-      "label": "Testing 090322026",
-      "caption": "Please find your report attached."
+      "trial_until": "2026-09-30T23:59:59+05:30",
+      "label": "session-document-route",
+      "caption_template": "Dear {name}, please find attached your {label} reports for the test/s done at SDRC.\n\nPlease reply with Hi for any queries, appointment booking, trend reports or other information. Our Whatsapp Bot will be available to help you.\n\n-Team SDRC"
     }
   },
   "worker": {
