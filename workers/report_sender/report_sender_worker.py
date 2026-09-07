@@ -1120,6 +1120,16 @@ class ReportSenderWorker:
         report_url: str,
     ) -> Dict[str, Any]:
         phone = norm_text(job.get("phone") or status.get("patient_phone"))
+        meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+
+        # A session-document send that failed delivery is retried here with the
+        # route pinned to "template" (set by labit-main's delivery webhook,
+        # reconcileAutoDispatchDeliveryFailure). Never re-evaluate session
+        # eligibility for such a retry — go straight to template so the retry
+        # cannot loop back onto the cheap route that just failed.
+        if norm_text(meta.get("force_dispatch_route")).lower() == "template":
+            return self._send_template(job, status, report_label)
+
         if self._session_document_route_enabled(phone):
             eligible, evidence = self._active_whatsapp_session(phone)
             if eligible:
@@ -1451,6 +1461,19 @@ class ReportSenderWorker:
                 "label": report_label,
                 "dispatch_route": dispatch_route,
             })
+
+            # Conversion tracking: this send is a forced-template retry of a
+            # session-document send that failed delivery. One row per job that
+            # the cheap route lost and the template recovered -- the signal the
+            # future circuit breaker counts (disable the cheap route after N).
+            if norm_text((job.get("metadata") or {}).get("force_dispatch_route")).lower() == "template" \
+                    and dispatch_route == "template":
+                self._event(job, "cheap_route_conversion",
+                            "Session-document send failed; recovered via report template", {
+                                "converted_from": "session_document",
+                                "provider_message_id": provider_id or None,
+                                "label": report_label,
+                            })
         except Exception as exc:
             attempts = attempts + 1
             max_attempts = int(self.cfg.get("worker", {}).get("max_attempts", 5))
