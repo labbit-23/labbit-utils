@@ -75,5 +75,16 @@
     "fetch_limit": 1000,
     "request_timeout_seconds": 20,
     "log_level": "INFO"
+  },
+  "requisition_ack": {
+    "enabled": false,
+    "poll_start_hhmm": 700,
+    "poll_end_hhmm": 2130,
+    "start_date": null,
+    "max_per_cycle": 60,
+    "trial_numbers": [],
+    "trial_until": null,
+    "send_url": "https://lab.sdrc.in/api/internal/whatsapp/requisition-ack-send",
+    "_note": "Template name + params_order live in labs_apis.templates.templates.requisition_ack (DB). Dedup is server-side by reqid via report_dispatch_logs. Rides the enqueue-watch loop; creates no dispatch job."
   }
 }

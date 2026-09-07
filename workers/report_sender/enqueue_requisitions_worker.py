@@ -1208,6 +1208,120 @@ class EnqueueWorker:
         self._reconcile_outsourced_jobs(jobs_table)
         self._expire_deferred_jobs(jobs_table)
 
+    # ---------------------------------------------------------------------
+    # Requisition registration acknowledgement
+    # ---------------------------------------------------------------------
+    # "Dear <name>, your requisition <reqno> has been registered at SDRC..."
+    # Rides the enqueue-watch poll cycle but creates NO dispatch job -- it
+    # calls labit-main's /api/internal/whatsapp/requisition-ack-send, which
+    # owns dedup (one ack per reqid, ever, via report_dispatch_logs) + send +
+    # audit. Own time window (default 07:00-21:30), own enable flag.
+
+    def _requisition_ack_url(self) -> str:
+        cfg = self.cfg.get("requisition_ack", {})
+        explicit = norm(cfg.get("send_url"))
+        if explicit:
+            return explicit
+        base = norm(self.cfg.get("whatsapp", {}).get("internal_send_url"))
+        if base.endswith("/report-template-send"):
+            return base[: -len("/report-template-send")] + "/requisition-ack-send"
+        return base
+
+    def _req_ack_window_open(self) -> bool:
+        cfg = self.cfg.get("requisition_ack", {})
+        start = int(cfg.get("poll_start_hhmm", 700))
+        end = int(cfg.get("poll_end_hhmm", 2130))
+        return start <= time_hhmm_now() <= end
+
+    def run_requisition_acks_once(self) -> None:
+        cfg = self.cfg.get("requisition_ack", {})
+        if not bool(cfg.get("enabled", False)):
+            return
+        if not self._req_ack_window_open():
+            return
+        start_date = norm(cfg.get("start_date") or "")
+        if start_date and self._today_ist() < start_date:
+            return
+        trial_until = norm(cfg.get("trial_until"))
+        if trial_until:
+            try:
+                if now_ist() > datetime.fromisoformat(trial_until.replace("Z", "")).replace(tzinfo=None):
+                    return
+            except ValueError:
+                pass
+        try:
+            rows = self._fetch_rows()
+        except Exception as exc:
+            self.log.warning("requisition-ack: requisition fetch failed: %s", exc)
+            return
+        self._send_requisition_acks(rows)
+
+    def _send_requisition_acks(self, rows: List[Dict[str, Any]]) -> None:
+        cfg = self.cfg.get("requisition_ack", {})
+        url = self._requisition_ack_url()
+        if not url:
+            self.log.warning("requisition-ack: no send_url resolved; skipping")
+            return
+        lab_id = norm(self.cfg.get("whatsapp", {}).get("lab_id"))
+        token = norm(self.cfg.get("whatsapp", {}).get("internal_send_token"))
+        max_per_cycle = int(cfg.get("max_per_cycle", 60))
+        trial_numbers = {
+            digits_only(n)[-10:] for n in (cfg.get("trial_numbers") or []) if digits_only(n)
+        }
+        timeout = int(self.cfg.get("enqueue", {}).get("request_timeout_seconds", 20))
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "x-internal-token": token,
+        }
+        sent = skipped = failed = 0
+        for row in rows:
+            if sent >= max_per_cycle:
+                break
+            reqno = norm(row.get("REQNO") or row.get("reqno"))
+            reqid = norm(row.get("REQID") or row.get("reqid"))
+            phone = norm(
+                row.get("PHONENO") or row.get("phoneno")
+                or row.get("MOBILENO") or row.get("mobileno") or row.get("phone")
+            )
+            name = norm(row.get("PATIENTNM") or row.get("patient_name"))
+            mrno = norm(row.get("MRNO") or row.get("mrno"))
+            org_name = norm(row.get("org_name") or row.get("ORG_NAME"))
+            if not reqid or not phone:
+                continue
+            if not self._is_valid_phone(phone):
+                continue
+            if trial_numbers and digits_only(phone)[-10:] not in trial_numbers:
+                continue
+            body = {
+                "lab_id": lab_id,
+                "reqno": reqno or None,
+                "reqid": reqid,
+                "phone": phone,
+                "patient_name": name or None,
+                "mrno": mrno or None,
+                "org_name": org_name or None,
+            }
+            if self.dry_run:
+                self.log.info("[dry-run] requisition-ack reqno=%s phone=%s", reqno, phone)
+                continue
+            try:
+                r = self.http.post(url, headers=headers, data=json.dumps(body), timeout=timeout)
+                if r.ok:
+                    j = r.json() if r.text else {}
+                    if j.get("skipped"):
+                        skipped += 1
+                    elif j.get("sent"):
+                        sent += 1
+                else:
+                    failed += 1
+                    self.log.warning("requisition-ack send %s -> %s %s", reqno, r.status_code, r.text[:200])
+            except Exception as exc:
+                failed += 1
+                self.log.warning("requisition-ack send %s failed: %s", reqno, exc)
+        if sent or failed:
+            self.log.info("requisition-ack: sent=%s skipped=%s failed=%s", sent, skipped, failed)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Requisition enqueue worker")
@@ -1236,6 +1350,10 @@ def main() -> int:
             worker.run_once()
         except Exception as exc:
             worker.log.exception("run_once failed, will retry after sleep: %s", exc)
+        try:
+            worker.run_requisition_acks_once()
+        except Exception as exc:
+            worker.log.exception("requisition acks failed, will retry after sleep: %s", exc)
         worker.log.info("Sleeping %s seconds before next enqueue cycle", sleep_seconds)
         time.sleep(max(30, sleep_seconds))
 
