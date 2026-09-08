@@ -1295,16 +1295,18 @@ class ReportSenderWorker:
         dispatch_allowed = bool(status.get("dispatch_allowed", True))
         if not dispatch_allowed:
             denial_reason = norm_text(status.get("dispatch_denial_reason") or "dispatch_not_allowed")
+            skip_meta = dict(job.get("metadata")) if isinstance(job.get("metadata"), dict) else {}
+            skip_meta.update({
+                "skip_reason": denial_reason,
+                "dispatch_denial_code": norm_text(status.get("dispatch_denial_code")),
+            })
             self._patch_job(job, {
                 "status": "skipped",
                 "report_label": report_label,
                 "last_status_snapshot": status,
                 "last_error": None,
                 "next_attempt_at": None,
-                "metadata": {
-                    "skip_reason": denial_reason,
-                    "dispatch_denial_code": norm_text(status.get("dispatch_denial_code")),
-                },
+                "metadata": skip_meta,
             })
             self._event(job, "skipped_dispatch_not_allowed", f"Dispatch denied: {denial_reason}", {"denial_code": norm_text(status.get("dispatch_denial_code"))})
             self.log.info("skip-dispatch-denied %s reason=%s", self._job_ctx(job, status), denial_reason)
@@ -1318,18 +1320,26 @@ class ReportSenderWorker:
             reason = "no_lab_or_radiology_tests"
             if has_any_reportable_test(status):
                 reason = "non_reportable_by_policy"
+            # Merge, don't replace -- metadata carries source_backend/report_origin
+            # stamped by the enqueue worker (labit-core vs archive). A literal
+            # metadata dict here wiped that on every skip, making a labit-core
+            # requisition with no reportable tests display as "Shivam" on the
+            # Report Dispatch screen (user, 2026-09-08, live: R202609080082/080
+            # -- R-prefixed reqnos are labit-core's own format, never Shivam's).
+            skip_meta = dict(job.get("metadata")) if isinstance(job.get("metadata"), dict) else {}
+            skip_meta.update({
+                "skip_reason": reason,
+                "overall_status": norm_text(status.get("overall_status")).upper(),
+                "lab_total": int(status.get("lab_total") or 0),
+                "radiology_total": int(status.get("radiology_total") or 0),
+            })
             self._patch_job(job, {
                 "status": "skipped",
                 "report_label": report_label,
                 "last_status_snapshot": status,
                 "last_error": None,
                 "next_attempt_at": None,
-                "metadata": {
-                    "skip_reason": reason,
-                    "overall_status": norm_text(status.get("overall_status")).upper(),
-                    "lab_total": int(status.get("lab_total") or 0),
-                    "radiology_total": int(status.get("radiology_total") or 0),
-                },
+                "metadata": skip_meta,
             })
             self._event(job, "skipped_no_reportable_tests", "No reportable lab/radiology tests found", {"reason": reason})
             self.log.info("skip-no-reportable %s reason=%s", self._job_ctx(job, status), reason)
