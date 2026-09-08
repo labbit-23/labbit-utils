@@ -522,6 +522,24 @@ class SupabaseRest:
         rows = r.json()
         return rows if isinstance(rows, list) else []
 
+    def list_stale_sent_inflight(self, table: str, before_iso: str, limit: int = 200) -> List[Dict[str, Any]]:
+        # Jobs that WERE sent, then parked in processing/sending (by the
+        # delivery-status reconcile webhook) and never moved again.
+        # list_stale_inflight only covers the never-sent case (sent_at IS NULL).
+        url = f"{self.base}/{table}"
+        params = {
+            "select": "*",
+            "status": "in.(processing,sending)",
+            "sent_at": "not.is.null",
+            "updated_at": f"lt.{before_iso}",
+            "order": "updated_at.asc",
+            "limit": str(limit),
+        }
+        r = self.session.get(url, headers=self.headers, params=params, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return rows if isinstance(rows, list) else []
+
     def list_failed_invalid_phone(self, table: str, limit: int = 100) -> List[Dict[str, Any]]:
         url = f"{self.base}/{table}"
         params = {
@@ -759,6 +777,50 @@ class ReportSenderWorker:
             })
             self.metrics["auto_requeued"] += 1
             self.log.warning("auto_requeued_inflight job_id=%s reqno=%s prev=%s threshold_min=%s", job.get("id"), norm_text(job.get("reqno")), prev, inflight_minutes)
+
+        # Sent-then-stuck: a delivery-status reconcile parked the job in
+        # processing/sending after it was already sent, and nothing moved it.
+        # Out of attempts -> fail (retrying an undeliverable number is noise);
+        # attempts left -> one requeue.
+        sent_inflight_hours = int(os.getenv(
+            "REPORT_SENDER_STUCK_SENT_INFLIGHT_HOURS",
+            worker_cfg.get("stuck_sent_inflight_hours", 12)))
+        sent_before_iso = utc_iso(now - timedelta(hours=max(1, sent_inflight_hours)))
+        max_attempts_default = int(worker_cfg.get("max_attempts", 5))
+        for job in self.sb.list_stale_sent_inflight(self.cfg["tables"]["jobs"], before_iso=sent_before_iso, limit=inflight_limit):
+            prev = norm_text(job.get("status")).lower()
+            attempts = int(job.get("attempt_count") or 0)
+            max_att = int(job.get("max_attempts") or max_attempts_default)
+            if attempts >= max_att:
+                self._patch_job(job, {
+                    "status": "failed",
+                    "next_attempt_at": None,
+                    "last_error": norm_text(job.get("last_error")) or "stuck_sent_inflight",
+                })
+                self._event(job, "failed_timeout", "Watchdog failed a stuck sent-inflight job past max attempts", {
+                    "previous_status": prev,
+                    "attempt_count": attempts,
+                    "max_attempts": max_att,
+                    "threshold_hours": sent_inflight_hours,
+                    "reason": "stuck_processing_after_send",
+                })
+                self.metrics["failed_timeout"] += 1
+                self.log.warning("failed_stuck_sent_inflight job_id=%s reqno=%s prev=%s att=%s/%s", job.get("id"), norm_text(job.get("reqno")), prev, attempts, max_att)
+            else:
+                self._patch_job(job, {
+                    "status": "queued",
+                    "next_attempt_at": utc_iso(now),
+                    "last_error": None,
+                })
+                self._event(job, "auto_requeue_stuck_inflight", "Watchdog requeued a stuck sent-inflight job with attempts left", {
+                    "previous_status": prev,
+                    "attempt_count": attempts,
+                    "max_attempts": max_att,
+                    "threshold_hours": sent_inflight_hours,
+                    "reason": "stuck_processing_after_send",
+                })
+                self.metrics["auto_requeued"] += 1
+                self.log.warning("auto_requeued_stuck_sent_inflight job_id=%s reqno=%s prev=%s att=%s/%s", job.get("id"), norm_text(job.get("reqno")), prev, attempts, max_att)
 
         rows = self.sb.list_watchdog_candidates(self.cfg["tables"]["jobs"], limit=scan_limit)
         for job in rows:

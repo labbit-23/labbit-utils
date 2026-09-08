@@ -51,6 +51,9 @@ class FakeSB:
     def list_stale_inflight(self, table, before_iso, limit=200):
         return []
 
+    def list_stale_sent_inflight(self, table, before_iso, limit=200):
+        return []
+
     def get_latest_event(self, table, job_id):
         return self.latest_event.get(job_id)
 
