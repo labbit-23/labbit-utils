@@ -76,15 +76,20 @@
     "request_timeout_seconds": 20,
     "log_level": "INFO"
   },
-  "requisition_ack": {
-    "enabled": false,
-    "poll_start_hhmm": 700,
-    "poll_end_hhmm": 2130,
-    "start_date": null,
-    "max_per_cycle": 60,
-    "trial_numbers": [],
-    "trial_until": null,
-    "send_url": "https://lab.sdrc.in/api/internal/whatsapp/requisition-ack-send",
-    "_note": "Template name + params_order live in labs_apis.templates.templates.requisition_ack (DB). Dedup is server-side by reqid via report_dispatch_logs. Rides the enqueue-watch loop; creates no dispatch job."
-  }
+  "patient_message_jobs_send_url": "https://lab.sdrc.in/api/internal/whatsapp/campaign-send",
+  "patient_message_jobs": [
+    {
+      "key": "requisition_ack",
+      "enabled": false,
+      "window": { "start_hhmm": 700, "end_hhmm": 2130 },
+      "start_date": null,
+      "max_per_cycle": 60,
+      "trigger": {
+        "source_url": "https://api.sdrc.in/py/delivery/requisitions-by-date/{today}",
+        "rows_path": "rows",
+        "dedup_by": "reqid"
+      },
+      "_note": "recipient / template.{name,language,params} / attachment.{kind,ref_field} / trial.{numbers,until} live in labs_apis.templates.patient_message_jobs (DB, keyed by 'key'). Dedup is server-side by report_dispatch_logs (reqid, report_type=key). This array only carries the schedule + source. Adding a job elsewhere = a DB edit; adding a variable/attachment kind = one registry line in labit-main / labit-core."
+    }
+  ]
 }
