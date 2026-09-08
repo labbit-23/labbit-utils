@@ -1291,8 +1291,7 @@ class EnqueueWorker:
                 except Exception as exc:
                     failed += 1
                     self.log.warning("pmj %s send failed: %s", key, exc)
-            if sent or failed:
-                self.log.info("pmj %s: sent=%s skipped=%s failed=%s (of %s)", key, sent, skipped, failed, len(rows))
+            self.log.info("pmj %s: rows=%s sent=%s skipped=%s failed=%s", key, len(rows), sent, skipped, failed)
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Requisition enqueue worker")
@@ -1308,25 +1307,41 @@ def main() -> int:
         worker.run_once()
         return 0
 
+    # Enqueue keeps its lazy morning cadence (hourly pre-10am, 5-min after).
+    # Patient-message-jobs need tighter, window-independent coverage (a
+    # requisition registered at 07:15 should not wait an hour for its
+    # welcome), so the loop itself ticks on the SHORTER interval and only
+    # runs the heavy enqueue pass on its own schedule.
+    pmj_active = any(
+        isinstance(j, dict) and j.get("enabled")
+        for j in (cfg.get("patient_message_jobs") or [])
+    )
+    pmj_poll = int(cfg.get("patient_message_jobs_poll_seconds", 300))
+    last_enqueue_at = 0.0
+
     while True:
         now = datetime.now()
         hhmm = now.hour * 100 + now.minute
         fast_after_hhmm = int(cfg.get("enqueue", {}).get("poll_fast_after_hhmm", 1000))
         if hhmm < fast_after_hhmm:
-            sleep_seconds = int(cfg.get("enqueue", {}).get("poll_seconds_pre_10am", 3600))
+            enqueue_interval = int(cfg.get("enqueue", {}).get("poll_seconds_pre_10am", 3600))
         else:
-            sleep_seconds = int(cfg.get("enqueue", {}).get("poll_seconds_post_10am", 300))
+            enqueue_interval = int(cfg.get("enqueue", {}).get("poll_seconds_post_10am", 300))
 
-        try:
-            worker.run_once()
-        except Exception as exc:
-            worker.log.exception("run_once failed, will retry after sleep: %s", exc)
+        if time.time() - last_enqueue_at >= enqueue_interval:
+            try:
+                worker.run_once()
+            except Exception as exc:
+                worker.log.exception("run_once failed, will retry after sleep: %s", exc)
+            last_enqueue_at = time.time()
+
         try:
             worker.run_patient_message_jobs_once()
         except Exception as exc:
-            worker.log.exception("requisition acks failed, will retry after sleep: %s", exc)
-        worker.log.info("Sleeping %s seconds before next enqueue cycle", sleep_seconds)
-        time.sleep(max(30, sleep_seconds))
+            worker.log.exception("patient_message_jobs failed, will retry after sleep: %s", exc)
+
+        loop_sleep = min(enqueue_interval, pmj_poll) if pmj_active else enqueue_interval
+        time.sleep(max(30, loop_sleep))
 
     return 0
 
