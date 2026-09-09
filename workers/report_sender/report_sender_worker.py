@@ -205,10 +205,46 @@ def build_template_report_label(status: Dict[str, Any]) -> str:
     return text
 
 
-def resolve_job_report_label(job: Dict[str, Any], status: Dict[str, Any]) -> str:
+DEFAULT_SPECIAL_TEST_DEPARTMENT_MARKERS = {"DPT00033", "SPECIAL TESTS"}
+
+
+def special_test_department_markers(cfg: Optional[Dict[str, Any]] = None) -> set:
+    """Departments (id or display name) treated as 'special' for report labelling.
+    Override via SPECIAL_TEST_DEPARTMENT_MARKERS env var (comma-separated) or
+    cfg["enqueue"]["special_test_department_markers"] (list) -- never hardcode
+    a department id at a call site."""
+    env_value = os.environ.get("SPECIAL_TEST_DEPARTMENT_MARKERS")
+    if env_value:
+        return {norm_text(v).upper() for v in env_value.split(",") if norm_text(v)}
+    if isinstance(cfg, dict):
+        configured = cfg.get("enqueue", {}).get("special_test_department_markers")
+        if isinstance(configured, list) and configured:
+            return {norm_text(v).upper() for v in configured if norm_text(v)}
+    return set(DEFAULT_SPECIAL_TEST_DEPARTMENT_MARKERS)
+
+
+def _status_has_special_test(status: Dict[str, Any], markers: set) -> bool:
+    if not markers:
+        return False
+    tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+    for t in tests:
+        if not isinstance(t, dict):
+            continue
+        deptid = norm_text(t.get("DEPTID") or t.get("deptid")).upper()
+        department = norm_text(t.get("DEPARTMENT") or t.get("department") or t.get("GROUPNM") or t.get("groupnm")).upper()
+        if deptid in markers or department in markers:
+            return True
+    return False
+
+
+def resolve_job_report_label(job: Dict[str, Any], status: Dict[str, Any], special_markers: Optional[set] = None) -> str:
     meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
     report_source = norm_text(meta.get("report_source")).lower()
     if report_source == "outsourced_report":
+        return "special report"
+    # Special-department tests are reported as "special" whether the result came
+    # in transcribed (typed into the LIS) or as an attachment -- same patient-facing wording.
+    if _status_has_special_test(status, special_markers if special_markers is not None else special_test_department_markers()):
         return "special report"
     return build_template_report_label(status)
 
@@ -630,6 +666,7 @@ class SupabaseRest:
 class ReportSenderWorker:
     def __init__(self, cfg: Dict[str, Any], dry_run: bool = False) -> None:
         self.cfg = cfg
+        self.special_test_markers = special_test_department_markers(cfg)
         worker_cfg = cfg.get("worker", {})
         self.dry_run = dry_run or bool(worker_cfg.get("dry_run", False))
         log_level = str(worker_cfg.get("log_level", "INFO")).upper()
@@ -931,7 +968,7 @@ class ReportSenderWorker:
         for job in rows:
             try:
                 status = self._fetch_status(job)
-                report_label = resolve_job_report_label(job, status)
+                report_label = resolve_job_report_label(job, status, self.special_test_markers)
                 patch = {
                     "status": "queued",
                     "report_label": report_label,
@@ -1288,7 +1325,7 @@ class ReportSenderWorker:
             return
 
         status = self._fetch_status(job)
-        report_label = resolve_job_report_label(job, status)
+        report_label = resolve_job_report_label(job, status, self.special_test_markers)
         self.log.info("status-check %s overall=%s label=%s", self._job_ctx(job, status), norm_text(status.get("overall_status") or "-"), report_label)
 
         # Check dispatch constraints before proceeding

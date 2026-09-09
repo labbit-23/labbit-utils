@@ -133,13 +133,17 @@ class SupabaseRest:
         rows = r.json()
         return bool(isinstance(rows, list) and rows)
 
-    def has_sent_partial(self, table: str, reqno: str) -> bool:
+    def has_sent_non_full(self, table: str, reqno: str) -> bool:
+        """True if a 'sent' job exists whose label wasn't a complete send -- covers
+        both 'partial' (some tests ready) and 'pending' (overall_status was
+        LAB_PENDING/NO_REPORT at send time, e.g. a same-day-required test forced
+        an early send) labels, either of which is a valid follow-up candidate."""
         u = f"{self.base}/{table}"
         p = {
             "select": "id,report_label",
             "reqno": f"eq.{reqno}",
             "status": "eq.sent",
-            "report_label": "ilike.*partial*",
+            "or": "(report_label.ilike.*partial*,report_label.ilike.*pending*)",
             "limit": "1"
         }
         r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
@@ -597,8 +601,8 @@ class EnqueueWorker:
             # If already has active queue job, let sender handle current flow.
             if self.sb.has_active_job(jobs_table, reqno):
                 continue
-            # Only reconcile if this reqno has sent a partial report (candidate for follow-up).
-            if not self.sb.has_sent_partial(jobs_table, reqno):
+            # Only reconcile if this reqno has sent a non-full report (candidate for follow-up).
+            if not self.sb.has_sent_non_full(jobs_table, reqno):
                 continue
 
             # Skip reconciled follow-up when already fully sent before.
@@ -689,8 +693,11 @@ class EnqueueWorker:
                 prev_overall = norm(prev_snap.get("overall_status")).upper()
                 cur_overall = norm(live.get("overall_status")).upper()
                 # Skip if overall status didn't improve (e.g., still PARTIAL, or was already FULL).
-                # Only proceed if: previous was PARTIAL/UNSENT and now is FULL.
-                if prev_overall in {"PARTIAL_REPORT", "UNSENT"} and cur_overall == "FULL_REPORT":
+                # Proceed for any non-FULL prior state now reaching FULL -- covers PARTIAL_REPORT,
+                # UNSENT, and also LAB_PENDING/NO_REPORT (a same-day-required test can force an
+                # early "pending lab" send before every test, incl. a later-approved SPECIAL TESTS
+                # result, is ready).
+                if prev_overall and prev_overall != "FULL_REPORT" and cur_overall == "FULL_REPORT":
                     self.log.info("Reconcile follow-up reqno=%s overall_status %s→%s", reqno, prev_overall, cur_overall)
                 else:
                     self.log.info("Reconcile skip reqno=%s overall_status %s→%s (no improvement)", reqno, prev_overall, cur_overall)
