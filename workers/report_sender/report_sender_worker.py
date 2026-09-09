@@ -690,15 +690,23 @@ class ReportSenderWorker:
         self._recover_cooling_off_jobs()
 
     def _recover_cooling_off_jobs(self) -> None:
-        # On startup: unstick jobs left in cooling_off from previous restarts
-        # Defer them until next morning to avoid sudden burst of old reports to patients
+        # On startup: unstick jobs left in cooling_off from a previous restart.
+        # 2026-09-09 incident: this used to defer EVERY cooling_off job by a flat
+        # +12h on every restart -- including routine mid-day deploy restarts --
+        # stranding same-day-ready reports for hours, with no event-log trail
+        # (silent). User, 2026-09-09: "don't push them any further than 10 min,
+        # what's the pushing further for anyway? It must be a dev thing written
+        # once to ensure reports don't start going till debug session is done."
+        # The existing batch_size/cooloff machinery already throttles sends, so
+        # there's no real "sudden burst" risk to guard against -- just requeue
+        # promptly (a short, fixed cap) so a deploy never silently strands ready
+        # reports for hours.
         try:
             jobs_table = self.cfg["tables"]["jobs"]
             rows = self.sb.list_by_status(jobs_table, status="cooling_off", limit=500)
             recovered_count = 0
+            next_check = utc_now() + timedelta(minutes=10)
             for job in rows:
-                # Defer to next morning (7:30 AM IST)
-                next_check = utc_now() + timedelta(hours=12)
                 self._patch_job(job, {
                     "status": "queued",
                     "next_attempt_at": utc_iso(next_check),
@@ -706,7 +714,10 @@ class ReportSenderWorker:
                 })
                 recovered_count += 1
             if recovered_count > 0:
-                self.log.info("Startup recovery: moved %d cooling_off jobs back to queued (deferred to next cycle)", recovered_count)
+                self.log.info(
+                    "Startup recovery: moved %d cooling_off jobs back to queued (next_attempt_at=%s)",
+                    recovered_count, utc_iso(next_check),
+                )
         except Exception as exc:
             self.log.warning("Startup recovery failed: %s", exc)
 
