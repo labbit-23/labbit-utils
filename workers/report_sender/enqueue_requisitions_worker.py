@@ -587,15 +587,17 @@ class EnqueueWorker:
         if not recent:
             return 0
 
-        # Filter for reconcilable jobs: unsent/failed/etc + partial sends (exclude complete sends)
+        # Filter for reconcilable jobs: unsent/failed/etc + non-full sends (exclude complete sends).
+        # A "pending lab" send (overall_status was LAB_PENDING/NO_REPORT at send time, e.g. a
+        # same-day-required test forced an early send) is just as reconcilable as "partial" --
+        # only "complete"-labeled sends are genuinely done. See _is_full_label.
         candidates: List[Dict[str, Any]] = []
         for row in recent:
             status = norm(row.get("status")).lower()
             if status in {"queued", "cooling_off", "eligible", "retrying", "failed", "sending", "skipped"}:
                 candidates.append(row)
                 continue
-            # For sent jobs, only include partials (complete sends don't need reconciliation)
-            if status == "sent" and self._is_partial_label(row.get("report_label")):
+            if status == "sent" and not self._is_full_label(row.get("report_label")):
                 candidates.append(row)
 
         added = 0
