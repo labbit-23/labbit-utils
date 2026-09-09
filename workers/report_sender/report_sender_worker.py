@@ -697,15 +697,16 @@ class ReportSenderWorker:
         # (silent). User, 2026-09-09: "don't push them any further than 10 min,
         # what's the pushing further for anyway? It must be a dev thing written
         # once to ensure reports don't start going till debug session is done."
-        # The existing batch_size/cooloff machinery already throttles sends, so
-        # there's no real "sudden burst" risk to guard against -- just requeue
-        # promptly (a short, fixed cap) so a deploy never silently strands ready
-        # reports for hours.
+        # Then, on reflection: no real justification even for a 10-minute buffer
+        # either -- the existing batch_size/cooloff machinery already throttles
+        # sends, so there's no "sudden burst" risk to guard against at all. Just
+        # requeue immediately, same as every other legitimate requeue path in
+        # this file.
         try:
             jobs_table = self.cfg["tables"]["jobs"]
             rows = self.sb.list_by_status(jobs_table, status="cooling_off", limit=500)
             recovered_count = 0
-            next_check = utc_now() + timedelta(minutes=10)
+            next_check = utc_now()
             for job in rows:
                 self._patch_job(job, {
                     "status": "queued",
