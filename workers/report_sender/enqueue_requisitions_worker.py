@@ -413,6 +413,21 @@ class EnqueueWorker:
                 return False
         return True
 
+    def _outsourced_tests_need_split_job(self, status: Dict[str, Any], reqid: str) -> bool:
+        """True if at least one outsourced-ready test on this requisition will
+        actually get its own attached-PDF split job from _reconcile_outsourced_jobs
+        (mode attached_base/attached_qr). False for transcribed-only results,
+        which are typed into the consolidated report and must go through the
+        normal follow-up job instead -- otherwise the split-job path silently
+        never creates anything for them and the regular path shouldn't skip either."""
+        attached_modes = {"attached_base", "attached_qr"}
+        for testid in self._extract_outsourced_ready_testids(status):
+            meta = self._fetch_outsourced_meta(reqid=reqid, testid=testid)
+            mode = norm(meta.get("outsourced_mode") or meta.get("mode")).lower()
+            if mode in attached_modes:
+                return True
+        return False
+
     def _has_outsourced_job(self, jobs_table: str, reqno: str, testid: str, statuses: set[str]) -> bool:
         rows = self.sb.list_jobs_by_reqno(jobs_table, reqno=reqno, limit=300)
         wanted = norm(testid).upper()
@@ -678,10 +693,16 @@ class EnqueueWorker:
             if not self._is_overall_full_ready(live):
                 continue
 
-            # If live status shows all reportable tests are outsourced, creating a regular job
-            # will always fail (PDF not at regular URL). Mirror run_once behaviour and let
-            # _reconcile_outsourced_jobs create the correct split job via the meta endpoint.
-            if self._is_outsourced_only_reportable(live):
+            # If live status shows all reportable tests are outsourced, a regular job
+            # only fails when the result is an attached PDF (not at the regular report
+            # URL) -- mirror run_once and let _reconcile_outsourced_jobs create the
+            # split job instead. But a "transcribed" outsourced result is typed
+            # directly into the consolidated report, so the regular URL DOES have it;
+            # _reconcile_outsourced_jobs deliberately never makes a split job for
+            # transcribed mode ("remains on regular flow"). Skipping here too would
+            # leave the requisition in a gap where neither path ever sends it -- only
+            # skip when at least one outsourced-ready test actually needs a split job.
+            if self._is_outsourced_only_reportable(live) and self._outsourced_tests_need_split_job(live, reqid):
                 self.log.info("Reconcile skip reqno=%s reason=outsourced_only_all_tests", reqno)
                 continue
 
