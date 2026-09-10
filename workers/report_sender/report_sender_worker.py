@@ -224,11 +224,21 @@ def special_test_department_markers(cfg: Optional[Dict[str, Any]] = None) -> set
 
 
 def _status_has_special_test(status: Dict[str, Any], markers: set) -> bool:
+    # User, 2026-09-10, R202609090115/NAGALAXMI P: an NT Scan (SONOLOGY, ready,
+    # actually sent) got labelled "special report" because the SAME requisition
+    # also carries a Double Marker Test (SPECIAL TESTS) that was still
+    # "Awaiting results" -- not ready, not in the PDF that went out at all.
+    # Must only look at tests that are actually READY (i.e. part of what's
+    # being sent right now), not every test ever ordered on the requisition --
+    # a not-yet-ready SPECIAL TESTS item elsewhere on the same reqno is not
+    # this send's content.
     if not markers:
         return False
     tests = status.get("tests") if isinstance(status.get("tests"), list) else []
     for t in tests:
         if not isinstance(t, dict):
+            continue
+        if not is_ready_test(t):
             continue
         deptid = norm_text(t.get("DEPTID") or t.get("deptid")).upper()
         department = norm_text(t.get("DEPARTMENT") or t.get("department") or t.get("GROUPNM") or t.get("groupnm")).upper()
