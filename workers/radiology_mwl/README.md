@@ -49,6 +49,32 @@ Run one worker instance per department+modality. Each instance has its own confi
 
 Set `mwl.defaults.modality` to the DICOM modality code for that department.
 
+## Splitting one department across multiple machines by procedure type
+
+Some departments aren't one-instance-per-machine -- e.g. sonology has two US
+machines where general dopplers/sonology can be performed on either one, but
+cardiology dopplers always go to one fixed machine. `destination.aet` alone
+can't express "usually either, but sometimes exactly this one," so use
+`mwl.station_overrides` on top of it:
+
+```json
+"destination": { "aet": "", "host": "100.84.172.71", "port": 4242 },
+"mwl": {
+  "station_overrides": [
+    { "keyword": "CARDIOLOGY", "aet": "ESAOTE" }
+  ]
+}
+```
+
+The worker checks the resolved `requested_procedure_description` (from the
+source's `procedure_name`) for each `keyword`, case-insensitively. A match
+sets `ScheduledStationAETitle` to that override's `aet`, so only that
+machine's worklist query picks it up. No match falls back to
+`destination.aet` -- leave that blank for a shared department so any
+registered machine querying Orthanc can pick up the study; set it to a real
+AET for a single-machine department (the pre-existing behavior, unaffected
+if `station_overrides` is omitted).
+
 ## Source fields → DICOM mapping
 
 | Source field    | DICOM tag                       |

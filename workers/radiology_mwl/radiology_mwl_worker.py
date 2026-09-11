@@ -319,6 +319,29 @@ class MWLWorker:
         payload["raw"] = row
         return payload
 
+    def resolve_station_aet(self, payload: Dict[str, Any]) -> str:
+        """Some departments split work across multiple machines by procedure
+        type rather than by a fixed one-instance-per-machine assignment --
+        e.g. sonology: general dopplers/sonology can be performed on any
+        registered US machine, but cardiology dopplers always go to one
+        fixed machine. Configure via mwl.station_overrides:
+        [{"keyword": "CARDIOLOGY", "aet": "ESAOTE"}]. No match (or no
+        overrides configured) -> blank ScheduledStationAETitle, so any
+        machine that queries can pick up the study, matching the
+        destination.aet default behavior for single-machine departments.
+        """
+        overrides = self.cfg.get("mwl", {}).get("station_overrides", []) or []
+        procedure_text = str(
+            payload.get("requested_procedure_description")
+            or payload.get("scheduled_step_description")
+            or ""
+        ).upper()
+        for override in overrides:
+            keyword = str(override.get("keyword", "")).upper()
+            if keyword and keyword in procedure_text:
+                return str(override.get("aet", "")).strip()
+        return str(self.cfg.get("destination", {}).get("aet") or "").strip()
+
     def build_mwl_dataset(self, payload: Dict[str, Any]) -> FileDataset:
         accession = str(payload.get("accession_number") or "").strip()
         patient_id = str(payload.get("patient_id") or "").strip()
@@ -326,6 +349,7 @@ class MWLWorker:
         modality = str(payload.get("modality") or "US").strip() or "US"
         sched_raw = str(payload.get("scheduled_datetime") or "").strip()
         sched_date, sched_time = dicom_date_time_pair(sched_raw)
+        station_aet = self.resolve_station_aet(payload)
 
         file_meta = FileMetaDataset()
         file_meta.FileMetaInformationVersion = b"\x00\x01"
@@ -350,11 +374,11 @@ class MWLWorker:
         ds.RequestedProcedureDescription = str(payload.get("requested_procedure_description") or "RADIOLOGY")
         ds.ReferringPhysicianName = str(payload.get("referring_physician_name") or "")
         ds.InstitutionName = str(payload.get("institution_name") or "SDRC")
-        ds.StationAETitle = str(self.cfg.get("destination", {}).get("aet") or "")
+        ds.StationAETitle = station_aet
 
         sps_item = Dataset()
         sps_item.Modality = modality
-        sps_item.ScheduledStationAETitle = str(self.cfg.get("destination", {}).get("aet") or "")
+        sps_item.ScheduledStationAETitle = station_aet
         sps_item.ScheduledProcedureStepStartDate = sched_date
         sps_item.ScheduledProcedureStepStartTime = sched_time
         sps_item.ScheduledProcedureStepDescription = str(payload.get("scheduled_step_description") or "RADIOLOGY")
