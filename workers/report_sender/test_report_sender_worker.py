@@ -1,5 +1,5 @@
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest import mock
 
 from report_sender_worker import ReportSenderWorker, ready_reportable_testids, utc_now, utc_iso
@@ -138,6 +138,42 @@ class WorkerTests(unittest.TestCase):
         w.process_once()
         w.process_once()
         self.assertEqual(called["count"], 1)
+
+    def test_partial_cutoff_window_sunday_override(self):
+        w = self.make_worker()
+        w.cfg["worker"]["partial_send_cutoff_from_hhmm"] = 1730
+        w.cfg["worker"]["partial_send_cutoff_to_hhmm"] = 1800
+        w.cfg["worker"]["partial_send_cutoff_overrides"] = {
+            "sunday": {"from_hhmm": 1430, "to_hhmm": 1500}
+        }
+
+        monday = datetime(2026, 9, 14).astimezone()  # a Monday
+        sunday = datetime(2026, 9, 13).astimezone()  # a Sunday
+        self.assertEqual(w._partial_cutoff_window(monday), (1730, 1800))
+        self.assertEqual(w._partial_cutoff_window(sunday), (1430, 1500))
+
+    def test_partial_cutoff_window_sunday_falls_back_when_unset(self):
+        # No overrides configured at all -- Sunday must behave exactly
+        # like every other day (this is a no-op until someone opts in).
+        w = self.make_worker()
+        w.cfg["worker"]["partial_send_cutoff_from_hhmm"] = 1730
+        w.cfg["worker"]["partial_send_cutoff_to_hhmm"] = 1800
+        sunday = datetime(2026, 9, 13).astimezone()
+        self.assertEqual(w._partial_cutoff_window(sunday), (1730, 1800))
+
+    def test_partial_cutoff_window_other_weekday_override(self):
+        # Config-driven for ANY day, not just Sunday -- e.g. a Saturday
+        # half-day, with no code change needed.
+        w = self.make_worker()
+        w.cfg["worker"]["partial_send_cutoff_from_hhmm"] = 1730
+        w.cfg["worker"]["partial_send_cutoff_to_hhmm"] = 1800
+        w.cfg["worker"]["partial_send_cutoff_overrides"] = {
+            "saturday": {"from_hhmm": 1500, "to_hhmm": 1530}
+        }
+        saturday = datetime(2026, 9, 12).astimezone()  # a Saturday
+        sunday = datetime(2026, 9, 13).astimezone()
+        self.assertEqual(w._partial_cutoff_window(saturday), (1500, 1530))
+        self.assertEqual(w._partial_cutoff_window(sunday), (1730, 1800))
 
     def test_ready_reportable_testids_only_ready_lab_radiology(self):
         status = {

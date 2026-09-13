@@ -738,17 +738,45 @@ class ReportSenderWorker:
         phone = norm_text(job.get("phone") or (status or {}).get("patient_phone"))
         return f"job_id={job.get('id')} reqno={reqno or '-'} reqid={reqid or '-'} phone={phone or '-'}"
 
-    def _partial_cutoff_due(self, job: Dict[str, Any]) -> Tuple[bool, Optional[datetime]]:
+    _WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+    def _partial_cutoff_window(self, now_local: datetime) -> Tuple[int, int]:
+        """User, 2026-09-13: a day the lab shuts early (Sunday today; later,
+        designated half-days -- not yet built) needs the partial-report
+        cutoff to run earlier too, otherwise a same-day test that isn't
+        ready by the normal window never gets a partial sent at all, because
+        the lab is already closed with no one there to still work the
+        backlog. Entirely config-driven, no day name hardcoded here: reads
+        `worker.partial_send_cutoff_overrides.<weekday-name>.{from_hhmm,
+        to_hhmm}` (e.g. "sunday") from the JSON config, same place every
+        other cutoff setting lives -- so tomorrow's half-day override, or
+        Saturday, or any other day, is a config-only change, no deploy
+        needed to logic. Falls back to the standard `partial_send_cutoff_
+        from_hhmm`/`_to_hhmm` for a day with no override configured, so
+        this is a no-op until someone actually adds one."""
         worker_cfg = self.cfg.get("worker", {})
-        start_hhmm = int(worker_cfg.get("partial_send_cutoff_from_hhmm", 1700))
-        end_hhmm = int(worker_cfg.get("partial_send_cutoff_to_hhmm", 1730))
+        default_from = int(worker_cfg.get("partial_send_cutoff_from_hhmm", 1700))
+        default_to = int(worker_cfg.get("partial_send_cutoff_to_hhmm", 1730))
+        overrides = worker_cfg.get("partial_send_cutoff_overrides") or {}
+        day_name = self._WEEKDAY_NAMES[now_local.weekday()]
+        day_override = overrides.get(day_name) if isinstance(overrides, dict) else None
+        if isinstance(day_override, dict):
+            start_hhmm = int(day_override.get("from_hhmm", default_from))
+            end_hhmm = int(day_override.get("to_hhmm", default_to))
+        else:
+            start_hhmm = default_from
+            end_hhmm = default_to
         if end_hhmm < start_hhmm:
             end_hhmm = start_hhmm
+        return start_hhmm, end_hhmm
+
+    def _partial_cutoff_due(self, job: Dict[str, Any]) -> Tuple[bool, Optional[datetime]]:
+        now_local = datetime.now().astimezone()
+        start_hhmm, end_hhmm = self._partial_cutoff_window(now_local)
 
         start_minutes = (start_hhmm // 100) * 60 + (start_hhmm % 100)
         end_minutes = (end_hhmm // 100) * 60 + (end_hhmm % 100)
 
-        now_local = datetime.now().astimezone()
         today_local = now_local.date()
 
         seed_key = f"{norm_text(job.get('lab_id'))}:{norm_text(job.get('reqno'))}:{norm_text(job.get('reqid'))}:{today_local.isoformat()}"
