@@ -35,6 +35,10 @@ class FakeSB:
         self.claimed = {}
         self.active_chat_session = None
         self.recent_inbound_message = None
+        self.half_day_dates = set()
+
+    def half_day_exists(self, date_iso):
+        return date_iso in self.half_day_dates
 
     def list_watchdog_candidates(self, table, limit=500):
         return list(self.jobs)
@@ -160,6 +164,20 @@ class WorkerTests(unittest.TestCase):
         w.cfg["worker"]["partial_send_cutoff_to_hhmm"] = 1800
         sunday = datetime(2026, 9, 13).astimezone()
         self.assertEqual(w._partial_cutoff_window(sunday), (1730, 1800))
+
+    def test_partial_cutoff_window_seeded_half_day_takes_priority(self):
+        w = self.make_worker()
+        w.cfg["worker"]["partial_send_cutoff_from_hhmm"] = 1730
+        w.cfg["worker"]["partial_send_cutoff_to_hhmm"] = 1800
+        w.cfg["worker"]["partial_send_cutoff_overrides"] = {
+            "half_day": {"from_hhmm": 1430, "to_hhmm": 1500}
+        }
+        tuesday = datetime(2026, 9, 15).astimezone()  # a Tuesday, no weekday override
+        w.sb.half_day_dates.add(tuesday.date().isoformat())
+        self.assertEqual(w._partial_cutoff_window(tuesday), (1430, 1500))
+        # cached -- a second call must not need another lookup
+        w.sb.half_day_dates.clear()
+        self.assertEqual(w._partial_cutoff_window(tuesday), (1430, 1500))
 
     def test_partial_cutoff_window_other_weekday_override(self):
         # Config-driven for ANY day, not just Sunday -- e.g. a Saturday

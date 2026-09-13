@@ -6,7 +6,7 @@ import logging
 import os
 import random
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -539,6 +539,19 @@ class SupabaseRest:
         rows = r.json()
         return rows if isinstance(rows, list) else []
 
+    def half_day_exists(self, date_iso: str) -> bool:
+        """Staff-seeded via labit-main's "Set Half Days" modal (Report
+        Dispatch workspace), public.report_half_days -- a date-specific
+        early-closure override on top of the fixed weekday one. Own table,
+        not this worker's `jobs`/`events` tables, so a plain URL (not the
+        configurable table-name pattern the rest of this class uses)."""
+        url = f"{self.base}/report_half_days"
+        params = {"select": "id", "half_date": f"eq.{date_iso}", "limit": "1"}
+        r = self.session.get(url, headers=self.headers, params=params, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return bool(rows)
+
     def list_watchdog_candidates(self, table: str, limit: int = 500) -> List[Dict[str, Any]]:
         url = f"{self.base}/{table}"
         params = {
@@ -740,26 +753,54 @@ class ReportSenderWorker:
 
     _WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
+    def _is_seeded_half_day(self, today_local: date) -> bool:
+        """Staff-seeded ahead of time via labit-main's "Set Half Days" modal
+        (public.report_half_days). Cached per calendar day -- this is
+        checked on every job's cutoff calculation, and a live Supabase
+        round-trip per job would be wasteful when the answer can't change
+        within the same day. A lookup failure is treated as "not a half
+        day" (fails toward the normal, later cutoff -- never toward holding
+        reports MORE aggressively on an unconfirmed guess)."""
+        cached = getattr(self, "_half_day_cache", None)
+        if cached and cached.get("date") == today_local:
+            return cached["is_half_day"]
+        try:
+            is_half_day = self.sb.half_day_exists(today_local.isoformat())
+        except Exception as exc:
+            self.log.warning("half_day_exists lookup failed, treating %s as not a half day: %s", today_local, exc)
+            is_half_day = False
+        self._half_day_cache = {"date": today_local, "is_half_day": is_half_day}
+        return is_half_day
+
     def _partial_cutoff_window(self, now_local: datetime) -> Tuple[int, int]:
-        """User, 2026-09-13: a day the lab shuts early (Sunday today; later,
-        designated half-days -- not yet built) needs the partial-report
-        cutoff to run earlier too, otherwise a same-day test that isn't
-        ready by the normal window never gets a partial sent at all, because
-        the lab is already closed with no one there to still work the
-        backlog. Entirely config-driven, no day name hardcoded here: reads
-        `worker.partial_send_cutoff_overrides.<weekday-name>.{from_hhmm,
-        to_hhmm}` (e.g. "sunday") from the JSON config, same place every
-        other cutoff setting lives -- so tomorrow's half-day override, or
-        Saturday, or any other day, is a config-only change, no deploy
-        needed to logic. Falls back to the standard `partial_send_cutoff_
-        from_hhmm`/`_to_hhmm` for a day with no override configured, so
-        this is a no-op until someone actually adds one."""
+        """User, 2026-09-13: a day the lab shuts early (Sunday every week;
+        also any date staff seed ahead of time as a half day, e.g. a
+        festival) needs the partial-report cutoff to run earlier too,
+        otherwise a same-day test that isn't ready by the normal window
+        never gets a partial sent at all, because the lab is already closed
+        with no one there to still work the backlog.
+
+        Two layers, both config/data-driven, no day name or date hardcoded
+        in logic: (1) a seeded half-day date (public.report_half_days, see
+        _is_seeded_half_day) takes priority when present -- uses
+        `worker.partial_send_cutoff_overrides.half_day`; (2) otherwise
+        `worker.partial_send_cutoff_overrides.<weekday-name>` (e.g.
+        "sunday"), same JSON config every other cutoff setting lives in.
+        Falls back to the standard `partial_send_cutoff_from_hhmm`/`_to_hhmm`
+        when neither applies, so this is a no-op until someone configures
+        an override or seeds a half day."""
         worker_cfg = self.cfg.get("worker", {})
         default_from = int(worker_cfg.get("partial_send_cutoff_from_hhmm", 1700))
         default_to = int(worker_cfg.get("partial_send_cutoff_to_hhmm", 1730))
         overrides = worker_cfg.get("partial_send_cutoff_overrides") or {}
-        day_name = self._WEEKDAY_NAMES[now_local.weekday()]
-        day_override = overrides.get(day_name) if isinstance(overrides, dict) else None
+
+        day_override = None
+        if isinstance(overrides, dict) and self._is_seeded_half_day(now_local.date()):
+            day_override = overrides.get("half_day")
+        if not isinstance(day_override, dict) and isinstance(overrides, dict):
+            day_name = self._WEEKDAY_NAMES[now_local.weekday()]
+            day_override = overrides.get(day_name)
+
         if isinstance(day_override, dict):
             start_hhmm = int(day_override.get("from_hhmm", default_from))
             end_hhmm = int(day_override.get("to_hhmm", default_to))
