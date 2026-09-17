@@ -96,6 +96,30 @@ class OrthancClient:
             log.warning("get_metadata(%s/%s, %s) failed: %s", resource_type, resource_id, key, exc)
             return default
 
+    def get_all_metadata(self, resource_id, resource_type="studies"):
+        """One call for every metadata key on a resource (Orthanc's
+        ?expand form), instead of one GET per key. Used by the read-heavy
+        LIST endpoint, which was making 5 separate metadata calls per
+        study (phone/status/attempts/timestamp/pdfUrl) on top of the
+        study+series lookups -- confirmed live as the main cause of a slow
+        dashboard load (roughly 7 sequential Orthanc round-trips per
+        study). Not used by anything send-gating (cr.py/ct.py keep using
+        the single-key get_metadata with raise_on_error where it matters)
+        -- this is purely a read-path optimization."""
+        try:
+            resp = self.session.get(
+                f"{self.base_url}/{resource_type}/{resource_id}/metadata?expand",
+                auth=self.auth,
+                timeout=self.timeout,
+            )
+            if resp.status_code == 404:
+                return {}
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as exc:
+            log.warning("get_all_metadata(%s/%s) failed: %s", resource_type, resource_id, exc)
+            return {}
+
     def put_metadata(self, resource_id, key, value, dry_run=True, resource_type="studies"):
         if dry_run:
             log.info(
@@ -143,8 +167,19 @@ class OrthancClient:
     def find_studies(self, query):
         return self.post_json("/tools/find", {"Level": "Study", "Query": query})
 
-    def get_study(self, study_id):
-        return self.get_json(f"/studies/{study_id}")
+    def get_study(self, study_id, requested_tags=None):
+        """requested_tags (e.g. ["ModalitiesInStudy"]) asks Orthanc to
+        include those computed tags under a "RequestedTags" key in one
+        call -- used by the LIST endpoint to get modality without a
+        per-series lookup loop (confirmed live: that loop, not the
+        metadata reads, was the single biggest cost per study, ~600ms for
+        a 2-series study since /series/{id} returns the full Instances
+        array). Default (no requested_tags) is unchanged for every other
+        caller (cr.py/ct.py's own get_study calls)."""
+        path = f"/studies/{study_id}"
+        if requested_tags:
+            path += "?requestedTags=" + ",".join(requested_tags)
+        return self.get_json(path)
 
     def get_series(self, series_id):
         return self.get_json(f"/series/{series_id}")

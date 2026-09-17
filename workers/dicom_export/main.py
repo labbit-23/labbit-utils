@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -11,6 +12,16 @@ from urllib.parse import urlparse
 import core
 import cr
 import ct
+
+# Caps concurrent Orthanc calls from the LIST endpoint. Each per-study
+# lookup is ~500ms of mostly Orthanc-side work (confirmed live -- not our
+# round-trip count, Orthanc itself is slow to compute per-study), so
+# running them one at a time made LIST take ~15s for one day's studies.
+# Bounded, not unlimited, so this can't repeat tonight's other incident
+# (the CT thumbnail grid firing 150+ concurrent Orthanc requests with no
+# cap and getting connections refused) -- 8 is enough to get most of the
+# parallelism benefit without hammering the same box.
+LIST_CONCURRENCY = 8
 
 log = logging.getLogger("dicom_export")
 
@@ -38,44 +49,62 @@ def build_orthanc(cfg):
     return core.OrthancClient(cfg["orthanc"]["base_url"], cfg["orthanc"]["user"], cfg["orthanc"]["password"])
 
 
+def _fetch_study_row(orthanc, study_id):
+    """One study's worth of work for list_studies_for_date, split out so
+    it can run in a thread pool -- each call is mostly Orthanc-side wait
+    time (I/O), not CPU work here, so threads (not async) are a fine fit.
+    Returns None if the study couldn't be fetched (logged, skipped)."""
+    try:
+        # requestedTags=ModalitiesInStudy gets modality in this same call
+        # -- replaces a per-series lookup loop that was the single
+        # biggest cost per study (confirmed live: ~600ms for a 2-series
+        # study, since /series/{id} returns each series' full Instances
+        # array just to read one Modality field).
+        study = orthanc.get_study(study_id, requested_tags=["ModalitiesInStudy"])
+    except Exception as exc:
+        log.warning("LIST: could not fetch study %s: %s", study_id, exc)
+        return None
+    main_tags = study.get("MainDicomTags") or {}
+    patient_tags = study.get("PatientMainDicomTags") or {}
+    # ModalitiesInStudy can list more than one modality (space-separated)
+    # if a study genuinely mixes them; take the first -- every real study
+    # seen in this system so far is single-modality.
+    modality = (study.get("RequestedTags") or {}).get("ModalitiesInStudy", "").split()
+    modality = modality[0] if modality else ""
+
+    # One call for all 5 keys instead of 5 separate calls -- see
+    # get_all_metadata's docstring.
+    meta = orthanc.get_all_metadata(study_id)
+    return {
+        "studyId": study_id,
+        "accession": main_tags.get("AccessionNumber", ""),
+        "patientName": (patient_tags.get("PatientName") or "").replace("^", " ").strip(),
+        "phone": meta.get("WhatsappPhone", ""),
+        "status": meta.get("WhatsappStatus", ""),
+        "attempts": meta.get("WhatsappAttempts", "0"),
+        "timestamp": meta.get("WhatsappTimestamp", ""),
+        "pdfUrl": meta.get("WhatsappPdfUrl", ""),
+        "modality": modality,
+    }
+
+
 def list_studies_for_date(orthanc, date_str):
     """Matches the dashboard's LIST contract: one row per study, with
-    WhatsApp status/attempts/timestamp read from Orthanc metadata."""
+    WhatsApp status/attempts/timestamp read from Orthanc metadata.
+
+    Fetches studies concurrently (bounded, see LIST_CONCURRENCY) -- each
+    per-study lookup is dominated by Orthanc's own response time (~500ms,
+    confirmed live, not our round-trip count), so running them one at a
+    time made a single day's LIST take ~15s. requests.Session (used by
+    OrthancClient) is documented thread-safe for concurrent calls, so one
+    shared client across the pool is the correct/standard approach here,
+    not a separate client per thread."""
     study_ids = orthanc.find_studies({"StudyDate": date_str}) or []
-    rows = []
-    for study_id in study_ids:
-        try:
-            study = orthanc.get_study(study_id)
-        except Exception as exc:
-            log.warning("LIST: could not fetch study %s: %s", study_id, exc)
-            continue
-        main_tags = study.get("MainDicomTags") or {}
-        patient_tags = study.get("PatientMainDicomTags") or {}
-
-        modality = None
-        for series_id in study.get("Series", []):
-            try:
-                series = orthanc.get_series(series_id)
-                modality = (series.get("MainDicomTags") or {}).get("Modality")
-                if modality:
-                    break
-            except Exception:
-                continue
-
-        rows.append(
-            {
-                "studyId": study_id,
-                "accession": main_tags.get("AccessionNumber", ""),
-                "patientName": (patient_tags.get("PatientName") or "").replace("^", " ").strip(),
-                "phone": orthanc.get_metadata(study_id, "WhatsappPhone", ""),
-                "status": orthanc.get_metadata(study_id, "WhatsappStatus", ""),
-                "attempts": orthanc.get_metadata(study_id, "WhatsappAttempts", "0"),
-                "timestamp": orthanc.get_metadata(study_id, "WhatsappTimestamp", ""),
-                "pdfUrl": orthanc.get_metadata(study_id, "WhatsappPdfUrl", ""),
-                "modality": modality or "",
-            }
-        )
-    return rows
+    if not study_ids:
+        return []
+    with ThreadPoolExecutor(max_workers=LIST_CONCURRENCY) as pool:
+        results = list(pool.map(lambda sid: _fetch_study_row(orthanc, sid), study_ids))
+    return [row for row in results if row is not None]
 
 
 def get_study_instances_payload(orthanc, study_id):
