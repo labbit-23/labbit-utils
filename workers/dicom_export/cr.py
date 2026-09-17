@@ -191,7 +191,11 @@ def build_accession_page(annotated_paths, out_path, magick_path):
         *annotated_paths,
         "-tile", f"{cols}x",
         "-geometry", "+10+10",
-        "-background", "white",
+        # Black, not white, for the gap/padding fill between grid tiles --
+        # true to the X-ray viewing look (the header/footer strips are
+        # already black; a white montage background looked inconsistent
+        # against them).
+        "-background", "black",
         out_path,
     ]
     try:
@@ -199,7 +203,7 @@ def build_accession_page(annotated_paths, out_path, magick_path):
     except (subprocess.CalledProcessError, FileNotFoundError):
         # Fall back to `magick montage` invocation form if the standalone
         # `montage` binary isn't on PATH.
-        cmd = [magick_path, "montage", *annotated_paths, "-tile", f"{cols}x", "-geometry", "+10+10", "-background", "white", out_path]
+        cmd = [magick_path, "montage", *annotated_paths, "-tile", f"{cols}x", "-geometry", "+10+10", "-background", "black", out_path]
         subprocess.run(cmd, check=True, capture_output=True)
     return out_path
 
