@@ -159,6 +159,19 @@ def build_accession_page(annotated_paths, out_path, magick_path):
     return out_path
 
 
+def build_accession_annotated_images(orthanc, study, tmp_dir, magick_path):
+    """Resolve every CR instance under one study to an annotated JPEG path."""
+    annotated = []
+    for series_id in study.get("Series", []):
+        series = orthanc.get_series(series_id)
+        if (series.get("MainDicomTags") or {}).get("Modality") != "CR":
+            continue
+        for instance_id in series.get("Instances", []):
+            tags = orthanc.get_simplified_tags(instance_id)
+            annotated.append(download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path))
+    return annotated
+
+
 def build_group_pdf(orthanc, group, tmp_dir, magick_path):
     """One PDF, one page per distinct accession within the group."""
     by_accession = defaultdict(list)
@@ -169,14 +182,9 @@ def build_group_pdf(orthanc, group, tmp_dir, magick_path):
     for accession, members in sorted(by_accession.items()):
         annotated = []
         for member in members:
-            study = member["study"]
-            for series_id in study.get("Series", []):
-                series = orthanc.get_series(series_id)
-                if (series.get("MainDicomTags") or {}).get("Modality") != "CR":
-                    continue
-                for instance_id in series.get("Instances", []):
-                    tags = orthanc.get_simplified_tags(instance_id)
-                    annotated.append(download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path))
+            annotated.extend(
+                build_accession_annotated_images(orthanc, member["study"], tmp_dir, magick_path)
+            )
 
         if not annotated:
             log.warning("Accession=%s has no CR instances, skipping page.", accession)
@@ -261,3 +269,54 @@ def process_once(cfg, orthanc):
             mark_group_error(orthanc, group, dry_run)
 
     return sent_count
+
+
+def manual_send(cfg, orthanc, accession, phone):
+    """
+    Explicit human-triggered override for one accession, matching the
+    dashboard's manual-send form (accession + phone, no date/grouping).
+    Bypasses WhatsappStatus/Attempts gating entirely -- a human asked for
+    this specific resend, so the normal skip-if-already-sent/skip-if-
+    max-attempts logic does not apply. Still respects DRY_RUN.
+    """
+    dry_run = cfg["dry_run"]
+    tmp_dir = os.path.abspath(cfg["worker"]["tmp_dir"])
+    os.makedirs(tmp_dir, exist_ok=True)
+    magick_path = cfg["worker"]["magick_path"]
+    log_prefix = f"[ManualSend | Accession={accession}] "
+
+    study_ids = orthanc.find_studies({"AccessionNumber": accession})
+    if not study_ids:
+        raise ValueError(f"No study found for accession={accession}")
+    study_id = study_ids[0]
+    study = orthanc.get_study(study_id)
+    patient_tags = study.get("PatientMainDicomTags") or {}
+    patient_name = (patient_tags.get("PatientName") or "").replace("^", " ").strip() or "Patient"
+
+    log.info(log_prefix + f"StudyId={study_id} Phone={phone} (manual override, bypassing status/attempts gate)")
+
+    annotated = build_accession_annotated_images(orthanc, study, tmp_dir, magick_path)
+    if not annotated:
+        raise RuntimeError(f"No CR instances found for accession={accession}")
+
+    page_path = os.path.join(tmp_dir, f"page_{accession}.jpg")
+    build_accession_page(annotated, page_path, magick_path)
+
+    pdf_path = os.path.join(tmp_dir, f"CR_MANUAL_{accession}.pdf")
+    subprocess.run([magick_path, page_path, pdf_path], check=True, capture_output=True)
+
+    effective_phone = phone or core.fetch_phone_from_labit(
+        accession, cfg["labit"]["base_url"], cfg["labit"]["dispatch_user"], cfg["labit"]["dispatch_password"]
+    ) or cfg["whatsapp"]["default_phone"]
+
+    public_url = core.upload_file_to_ftp(pdf_path, study_id, cfg["ftp"], dry_run=dry_run)
+    core.send_whatsapp_document(
+        effective_phone, patient_name, public_url, os.path.basename(pdf_path), cfg["whatsapp"], dry_run=dry_run
+    )
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    orthanc.put_metadata(study_id, "WhatsappStatus", "SENT", dry_run=dry_run)
+    orthanc.put_metadata(study_id, "WhatsappTimestamp", ts, dry_run=dry_run)
+
+    log.info(log_prefix + f"Manual send complete. PDF={pdf_path} URL={public_url}")
+    return {"ok": True, "studyId": study_id, "publicUrl": public_url, "phone": effective_phone}

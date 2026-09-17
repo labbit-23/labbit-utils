@@ -95,15 +95,11 @@ def make_handler(cfg, orthanc):
                 if data.get("sendMode") == "MANUAL":
                     accession = data.get("accession")
                     phone = data.get("phone")
-                    log.info(
-                        "[DRY_RUN=%s] Manual send requested for accession=%s phone=%s "
-                        "(manual single-accession resend not yet wired to the CR group "
-                        "pipeline in this first pass)",
-                        cfg["dry_run"],
-                        accession,
-                        phone,
-                    )
-                    self._send_json({"ok": True, "note": "manual send accepted (dry_run=%s)" % cfg["dry_run"]})
+                    if not accession:
+                        self._send_json({"error": "accession is required"}, 400)
+                        return
+                    result = cr.manual_send(cfg, orthanc, accession, phone)
+                    self._send_json(result)
                     return
 
                 self._send_json({"error": "unrecognized request shape"}, 400)
