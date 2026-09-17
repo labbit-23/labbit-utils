@@ -157,7 +157,14 @@ def download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path, inst
         raw_path,
         # Full diagnostic resolution (often 4000px+) is unnecessary for a
         # WhatsApp-delivered patient report and is what was blowing past
-        # the 5MB PDF cap; cap the long edge before annotating.
+        # the 5MB PDF cap; cap the long edge before annotating. Real CR
+        # X-rays are always comfortably above 900px so this floor never
+        # fires for them -- it exists because CT source images (thumbnail-
+        # derived, via ct.py) can be narrow enough that the fixed-size
+        # header/footer text clips off the edge of the canvas; found on a
+        # real CT test render ("SHIVA B" clipped to "IVA B"). Enlarge-if-
+        # too-small first, then the existing shrink-if-too-large cap.
+        "-resize", "900x900<",
         "-resize", "1600x1600>",
         "-gravity", "North",
         "-background", "black",
