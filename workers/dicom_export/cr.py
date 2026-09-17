@@ -133,6 +133,11 @@ def download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path, inst
     study_date = tags.get("StudyDate", "")
     study_time = tags.get("StudyTime", "")
     centre_name = tags.get("InstitutionName") or institution_name
+    # Distinguishes e.g. "X-RAY CHEST PA VIEW" from "...AP VIEW" -- without
+    # this, two views of the same body part are visually indistinguishable
+    # in the header. BodyPartExamined alone doesn't carry the PA/AP
+    # distinction (both say just "CHEST"), so prefer the more specific tag.
+    study_desc = tags.get("AcquisitionDeviceProcessingDescription") or tags.get("BodyPartExamined") or ""
 
     annotated_path = os.path.join(tmp_dir, f"{instance_id}_annotated.jpg")
     cmd = [
@@ -147,7 +152,7 @@ def download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path, inst
         "-splice", "0x60",
         "-fill", "white",
         "-pointsize", "22",
-        "-annotate", "+0+8", f"{patient_name}  |  {age_sex}  |  Acc: {accession}  |  {study_date} {study_time}",
+        "-annotate", "+0+8", f"{patient_name}  |  {age_sex}  |  Acc: {accession}  |  {study_date} {study_time}  |  {study_desc}",
         "-gravity", "South",
         "-background", "black",
         "-splice", "0x50",
