@@ -9,6 +9,7 @@ import io
 import logging
 import logging.handlers
 import os
+import re
 import sys
 
 import requests
@@ -109,15 +110,27 @@ class OrthancClient:
         return self.get_json(f"/series/{series_id}")
 
 
+def normalize_reqno(reqno):
+    """
+    Labit's reqno lookups are exact-match: case-sensitive (confirmed
+    2026-09-16) and whitespace-sensitive (confirmed 2026-09-17 on a real
+    stuck CT study whose AccessionNumber tag was "R 202609170059" -- a
+    stray embedded space from the imaging console/RIS broke every lookup
+    silently, no error, just an empty result each time). Collapse/strip
+    all whitespace before uppercasing so a malformed tag still resolves.
+    """
+    return re.sub(r"\s+", "", str(reqno)).upper()
+
+
 def fetch_phone_from_labit(reqno, base_url, user, password, timeout=15):
     """
     Labit's /api/dispatch-phone/{reqno} lookup is case-sensitive on reqno
     (confirmed 2026-09-16: lowercase returns phone=null, correct uppercase
-    reqno returns the real phone). Always uppercase before calling.
+    reqno returns the real phone). Always normalize before calling.
     """
     if not reqno:
         raise ValueError("fetch_phone_from_labit: reqno is missing")
-    reqno_upper = str(reqno).upper()
+    reqno_upper = normalize_reqno(reqno)
     url = f"{base_url.rstrip('/')}/api/dispatch-phone/{reqno_upper}"
     resp = requests.get(
         url,
@@ -149,7 +162,7 @@ def push_report_link_to_labit(reqno, urls, base_url, internal_token, report_read
     if not urls:
         raise ValueError("push_report_link_to_labit: urls is empty")
 
-    reqno_upper = str(reqno).upper()
+    reqno_upper = normalize_reqno(reqno)
     payload = {"links": [{"url": u} for u in urls]}
     if report_ready_at:
         payload["report_ready_at"] = report_ready_at
