@@ -11,7 +11,8 @@
   "labit": {
     "base_url": "https://labit.sdrc.in",
     "dispatch_user": "CHANGEME",
-    "dispatch_password": "CHANGEME"
+    "dispatch_password": "CHANGEME",
+    "internal_token": "CHANGEME"
   },
   "ftp": {
     "host": "CHANGEME",

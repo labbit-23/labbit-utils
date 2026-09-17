@@ -328,6 +328,20 @@ def process_once(cfg, orthanc):
             remote_folder = group[0]["study_id"]  # matches Mirth's studyId-as-folder convention
             public_url = core.upload_file_to_ftp(pdf_path, remote_folder, cfg["ftp"], dry_run=dry_run)
 
+            # Link-only push to Labit Core -- one PDF can cover multiple
+            # accessions in this group (same patient/day), so push the
+            # same URL to every accession's own reqno, not just the one
+            # used for phone lookup. Never let a Labit-side failure here
+            # block the WhatsApp send, which is the critical path.
+            for reqno_for_link in accessions:
+                try:
+                    core.push_report_link_to_labit(
+                        reqno_for_link, [public_url], cfg["labit"]["base_url"], cfg["labit"]["internal_token"],
+                        dry_run=dry_run,
+                    )
+                except Exception as exc:
+                    log.warning(log_prefix + f"push_report_link_to_labit failed for reqno={reqno_for_link}: {exc}")
+
             patient_name = group[0]["patient_name"] or "Patient"
             core.send_whatsapp_document(
                 phone, patient_name, public_url, os.path.basename(pdf_path), cfg["whatsapp"], dry_run=dry_run
@@ -386,6 +400,14 @@ def manual_send(cfg, orthanc, accession, phone):
     ) or cfg["whatsapp"]["default_phone"]
 
     public_url = core.upload_file_to_ftp(pdf_path, study_id, cfg["ftp"], dry_run=dry_run)
+
+    try:
+        core.push_report_link_to_labit(
+            accession, [public_url], cfg["labit"]["base_url"], cfg["labit"]["internal_token"], dry_run=dry_run,
+        )
+    except Exception as exc:
+        log.warning(log_prefix + f"push_report_link_to_labit failed: {exc}")
+
     core.send_whatsapp_document(
         effective_phone, patient_name, public_url, os.path.basename(pdf_path), cfg["whatsapp"], dry_run=dry_run
     )

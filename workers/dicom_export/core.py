@@ -135,6 +135,44 @@ def fetch_phone_from_labit(reqno, base_url, user, password, timeout=15):
     return str(data["phone"])
 
 
+def push_report_link_to_labit(reqno, urls, base_url, internal_token, report_ready_at=None, notes=None, timeout=15, dry_run=True):
+    """
+    POST /machine-api/report-link/{reqno} -- link-only, no file upload.
+    Labit Core just records each URL as its own requisition_attachment row
+    (kind="radiology_images"); it never fetches or inspects the bytes.
+    Accepts multiple links per call; a bad link in the batch doesn't drop
+    the others. Same reqno case-sensitivity applies as dispatch-phone, so
+    uppercase here too.
+    """
+    if not reqno:
+        raise ValueError("push_report_link_to_labit: reqno is missing")
+    if not urls:
+        raise ValueError("push_report_link_to_labit: urls is empty")
+
+    reqno_upper = str(reqno).upper()
+    payload = {"links": [{"url": u} for u in urls]}
+    if report_ready_at:
+        payload["report_ready_at"] = report_ready_at
+    if notes:
+        payload["notes"] = notes
+
+    if dry_run:
+        log.info("[DRY_RUN] would POST report-link reqno=%s: %s", reqno_upper, payload)
+        return {"ok": True, "dry_run": True}
+
+    url = f"{base_url.rstrip('/')}/machine-api/report-link/{reqno_upper}"
+    resp = requests.post(
+        url,
+        headers={"X-Internal-Token": internal_token, "Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    log.info("REPORT_LINK_PUSHED | reqno=%s | result=%s", reqno_upper, result)
+    return result
+
+
 def upload_file_to_ftp(local_path, remote_folder, ftp_cfg, dry_run=True):
     """
     Ports the Mirth channel's uploadFileToFTP(): connect, cd into base dir,
