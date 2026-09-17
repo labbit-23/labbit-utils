@@ -1,0 +1,44 @@
+{
+  "dry_run": true,
+  "ct": {
+    "enabled": false
+  },
+  "institution": {
+    "name": "SDRC Diagnostics"
+  },
+  "orthanc": {
+    "base_url": "http://ORTHANC_HOST:8042",
+    "user": "CHANGEME",
+    "password": "CHANGEME"
+  },
+  "labit": {
+    "base_url": "https://labit.sdrc.in",
+    "dispatch_user": "CHANGEME",
+    "dispatch_password": "CHANGEME",
+    "internal_token": "CHANGEME"
+  },
+  "ftp": {
+    "host": "CHANGEME",
+    "port": 21,
+    "user": "CHANGEME",
+    "password": "CHANGEME",
+    "base_dir": "domains/sdrc.in/public_html/dicom_exports",
+    "public_base_url": "https://files.sdrc.in"
+  },
+  "whatsapp": {
+    "api_url": "CHANGEME",
+    "api_key": "CHANGEME",
+    "template_pdf": "dicom_pdf",
+    "default_phone": "CHANGEME"
+  },
+  "http": {
+    "port": 8086
+  },
+  "worker": {
+    "poll_seconds": 60,
+    "log_level": "INFO",
+    "log_dir": "./logs",
+    "magick_path": "/usr/local/bin/magick",
+    "tmp_dir": "./tmp"
+  }
+}
