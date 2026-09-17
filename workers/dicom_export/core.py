@@ -61,10 +61,13 @@ class OrthancClient:
         resp.raise_for_status()
         return resp.json()
 
-    def get_metadata(self, study_id, key, default=""):
+    def get_metadata(self, resource_id, key, default="", resource_type="studies"):
+        """resource_type is "studies" (default, matches every existing
+        study-level caller -- WhatsappStatus etc.) or "instances" (used
+        for CT's per-instance SelectedForReport)."""
         try:
             resp = self.session.get(
-                f"{self.base_url}/studies/{study_id}/metadata/{key}",
+                f"{self.base_url}/{resource_type}/{resource_id}/metadata/{key}",
                 auth=self.auth,
                 timeout=self.timeout,
             )
@@ -73,29 +76,49 @@ class OrthancClient:
             resp.raise_for_status()
             return resp.text.strip()
         except requests.RequestException as exc:
-            log.warning("get_metadata(%s, %s) failed: %s", study_id, key, exc)
+            log.warning("get_metadata(%s/%s, %s) failed: %s", resource_type, resource_id, key, exc)
             return default
 
-    def put_metadata(self, study_id, key, value, dry_run=True):
+    def put_metadata(self, resource_id, key, value, dry_run=True, resource_type="studies"):
         if dry_run:
             log.info(
-                "[DRY_RUN] would PUT metadata studies/%s/metadata/%s = %r",
-                study_id,
+                "[DRY_RUN] would PUT metadata %s/%s/metadata/%s = %r",
+                resource_type,
+                resource_id,
                 key,
                 value,
             )
             return
         resp = self.session.put(
-            f"{self.base_url}/studies/{study_id}/metadata/{key}",
+            f"{self.base_url}/{resource_type}/{resource_id}/metadata/{key}",
             auth=self.auth,
             data=str(value),
             timeout=self.timeout,
         )
         resp.raise_for_status()
 
+    def delete_metadata(self, resource_id, key, dry_run=True, resource_type="studies"):
+        if dry_run:
+            log.info("[DRY_RUN] would DELETE metadata %s/%s/metadata/%s", resource_type, resource_id, key)
+            return
+        resp = self.session.delete(
+            f"{self.base_url}/{resource_type}/{resource_id}/metadata/{key}",
+            auth=self.auth,
+            timeout=self.timeout,
+        )
+        if resp.status_code not in (200, 404):
+            resp.raise_for_status()
+
     def get_rendered_png(self, instance_id):
         resp = self.get(f"/instances/{instance_id}/frames/0/rendered")
         return resp.content
+
+    def get_preview_png(self, instance_id):
+        """Orthanc's own downsized preview -- much cheaper than the full
+        rendered frame, used for the CT selection UI's thumbnail grid
+        where dozens of images may load on one page."""
+        resp = self.get(f"/instances/{instance_id}/preview")
+        return resp.content, resp.headers.get("Content-Type", "image/png")
 
     def get_simplified_tags(self, instance_id):
         return self.get_json(f"/instances/{instance_id}/simplified-tags")

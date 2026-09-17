@@ -6,9 +6,11 @@ import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 import core
 import cr
+import ct
 
 log = logging.getLogger("dicom_export")
 
@@ -62,6 +64,53 @@ def list_studies_for_date(orthanc, date_str):
     return rows
 
 
+def get_study_instances_payload(orthanc, study_id):
+    """CT selection UI's data source: every series/instance in a study,
+    each instance's current SelectedForReport order (0 = unselected)."""
+    study = orthanc.get_study(study_id)
+    series_out = []
+    for series_id in study.get("Series", []):
+        series = orthanc.get_series(series_id)
+        tags = series.get("MainDicomTags") or {}
+        instances = []
+        for instance_id in series.get("Instances", []):
+            order = ct._selected_order(orthanc, instance_id)
+            instances.append({"instanceId": instance_id, "selectedOrder": order})
+        series_out.append(
+            {
+                "seriesId": series_id,
+                "seriesNumber": tags.get("SeriesNumber", ""),
+                "seriesDescription": tags.get("SeriesDescription", ""),
+                "modality": tags.get("Modality", ""),
+                "instances": instances,
+            }
+        )
+    return {"studyId": study_id, "series": series_out}
+
+
+def save_selection(orthanc, cfg, study_id, selected_instance_ids):
+    """Writes SelectedForReport = 1-based position for every instance in
+    selected_instance_ids (the operator's chosen order), and clears it
+    from any instance in this study that was previously selected but is
+    no longer in the list. dry_run always respected."""
+    dry_run = cfg["dry_run"]
+    study = orthanc.get_study(study_id)
+    all_instance_ids = set()
+    for series_id in study.get("Series", []):
+        series = orthanc.get_series(series_id)
+        all_instance_ids.update(series.get("Instances", []))
+
+    selected_set = set(selected_instance_ids)
+    for iid in all_instance_ids - selected_set:
+        if ct._selected_order(orthanc, iid) > 0:
+            orthanc.delete_metadata(iid, "SelectedForReport", dry_run=dry_run, resource_type="instances")
+
+    for position, iid in enumerate(selected_instance_ids, start=1):
+        orthanc.put_metadata(iid, "SelectedForReport", position, dry_run=dry_run, resource_type="instances")
+
+    return {"ok": True, "studyId": study_id, "selectedCount": len(selected_instance_ids)}
+
+
 def make_handler(cfg, orthanc):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -103,10 +152,53 @@ def make_handler(cfg, orthanc):
                     self._send_json(result)
                     return
 
+                if data.get("action") == "GET_STUDY_INSTANCES":
+                    study_id = data.get("studyId")
+                    if not study_id:
+                        self._send_json({"error": "studyId is required"}, 400)
+                        return
+                    self._send_json(get_study_instances_payload(orthanc, study_id))
+                    return
+
+                if data.get("action") == "SAVE_SELECTION":
+                    study_id = data.get("studyId")
+                    selected = data.get("selectedInstanceIds")
+                    if not study_id or not isinstance(selected, list):
+                        self._send_json({"error": "studyId and selectedInstanceIds[] are required"}, 400)
+                        return
+                    self._send_json(save_selection(orthanc, cfg, study_id, selected))
+                    return
+
                 self._send_json({"error": "unrecognized request shape"}, 400)
             except Exception as exc:
                 log.exception("HTTP handler error: %s", exc)
                 self._send_json({"error": str(exc)}, 500)
+
+        def do_GET(self):
+            # Thumbnail proxy: the browser can't reach Orthanc directly
+            # (different network, and doing so would mean shipping Orthanc
+            # credentials client-side) -- so the CT selection grid's <img>
+            # tags point here, and this fetches the bytes from Orthanc
+            # server-side using the worker's own credentials.
+            parsed = urlparse(self.path)
+            if parsed.path.startswith("/api/dicom-thumbnail/"):
+                instance_id = parsed.path.rsplit("/", 1)[-1]
+                try:
+                    content, content_type = orthanc.get_preview_png(instance_id)
+                except Exception as exc:
+                    log.warning("Thumbnail proxy failed for instance=%s: %s", instance_id, exc)
+                    self.send_response(502)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(content)))
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.end_headers()
+                self.wfile.write(content)
+                return
+            self.send_response(404)
+            self.end_headers()
 
     return Handler
 
@@ -120,14 +212,20 @@ def run_http_server(cfg, orthanc):
 
 def run_poll_loop(cfg, orthanc):
     poll_seconds = cfg["worker"]["poll_seconds"]
-    log.info("Starting CR export poll loop. poll_seconds=%s dry_run=%s", poll_seconds, cfg["dry_run"])
+    log.info("Starting CR+CT export poll loop. poll_seconds=%s dry_run=%s", poll_seconds, cfg["dry_run"])
     while True:
         try:
             sent = cr.process_once(cfg, orthanc)
             if sent:
                 log.info("Processed %d CR group(s) this cycle.", sent)
         except Exception as exc:
-            log.exception("Poll loop error: %s", exc)
+            log.exception("CR poll loop error: %s", exc)
+        try:
+            sent = ct.process_once(cfg, orthanc)
+            if sent:
+                log.info("Processed %d CT group(s) this cycle.", sent)
+        except Exception as exc:
+            log.exception("CT poll loop error: %s", exc)
         time.sleep(poll_seconds)
 
 
