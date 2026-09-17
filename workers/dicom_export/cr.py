@@ -121,12 +121,17 @@ def download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path):
     cmd = [
         magick_path,
         raw_path,
+        # Full diagnostic resolution (often 4000px+) is unnecessary for a
+        # WhatsApp-delivered patient report and is what was blowing past
+        # the 5MB PDF cap; cap the long edge before annotating.
+        "-resize", "1600x1600>",
         "-gravity", "North",
         "-background", "black",
         "-splice", "0x60",
         "-fill", "white",
         "-pointsize", "22",
         "-annotate", "+0+8", f"{patient_name}  |  {age_sex}  |  Acc: {accession}  |  {study_date} {study_time}",
+        "-quality", "82",
         annotated_path,
     ]
     subprocess.run(cmd, check=True, capture_output=True)
@@ -199,7 +204,10 @@ def build_group_pdf(orthanc, group, tmp_dir, magick_path):
     patient_id = group[0]["patient_id"]
     study_date = group[0]["study"].get("MainDicomTags", {}).get("StudyDate", "")
     pdf_path = os.path.join(tmp_dir, f"CR_{patient_id}_{study_date}.pdf")
-    cmd = [magick_path, *page_paths, pdf_path]
+    # Without an explicit density, ImageMagick assumes 1 pixel = 1 point
+    # (72 DPI), turning a ~1600px-wide page image into a ~22-inch-wide PDF
+    # page -- correct physical page size here instead.
+    cmd = [magick_path, "-density", "150", *page_paths, pdf_path]
     subprocess.run(cmd, check=True, capture_output=True)
     return pdf_path
 
@@ -303,7 +311,7 @@ def manual_send(cfg, orthanc, accession, phone):
     build_accession_page(annotated, page_path, magick_path)
 
     pdf_path = os.path.join(tmp_dir, f"CR_MANUAL_{accession}.pdf")
-    subprocess.run([magick_path, page_path, pdf_path], check=True, capture_output=True)
+    subprocess.run([magick_path, "-density", "150", page_path, pdf_path], check=True, capture_output=True)
 
     effective_phone = phone or core.fetch_phone_from_labit(
         accession, cfg["labit"]["base_url"], cfg["labit"]["dispatch_user"], cfg["labit"]["dispatch_password"]
