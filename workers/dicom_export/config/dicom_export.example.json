@@ -11,6 +11,11 @@
     "user": "CHANGEME",
     "password": "CHANGEME"
   },
+  "orthanc_backup": {
+    "base_url": "http://ORTHANC_BACKUP_HOST:8042",
+    "user": "CHANGEME",
+    "password": "CHANGEME"
+  },
   "labit": {
     "base_url": "https://labit.sdrc.in",
     "dispatch_user": "CHANGEME",

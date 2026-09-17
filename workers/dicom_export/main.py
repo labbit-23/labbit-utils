@@ -5,9 +5,9 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import core
 import cr
@@ -58,6 +58,67 @@ def build_orthanc(cfg):
     return core.OrthancClient(cfg["orthanc"]["base_url"], cfg["orthanc"]["user"], cfg["orthanc"]["password"])
 
 
+def build_orthanc_backup(cfg):
+    """The Ubuntu "ORTHANCNEW" DR/backup box (100.100.21.90). Historical
+    (non-today/yesterday) CT lookups route here instead of the primary
+    Windows Orthanc, mirroring the live dashboard's existing Mirth routing
+    (Labit ORTHANC_ManualTrigger's orthancBaseUrl/LIST logic) -- the whole
+    point being the primary ("just a Windows machine") never gets loaded by
+    historical-lookup read traffic. Returns None if not configured, so this
+    stays optional rather than a hard startup dependency."""
+    backup_cfg = cfg.get("orthanc_backup") or {}
+    if not backup_cfg.get("base_url"):
+        return None
+    return core.OrthancClient(backup_cfg["base_url"], backup_cfg["user"], backup_cfg["password"])
+
+
+def _today_str():
+    return datetime.now().strftime("%Y%m%d")
+
+
+def _is_recent_date(date_str):
+    """Matches the live dashboard's Mirth routing exactly: today OR
+    yesterday always goes to the primary Orthanc, never the backup."""
+    today = datetime.now()
+    yesterday = today - timedelta(days=1)
+    return date_str in (today.strftime("%Y%m%d"), yesterday.strftime("%Y%m%d"))
+
+
+def _resolve_studies_for_date(orthanc, orthanc_backup, date_str):
+    """Picks which Orthanc serves a given date's LIST query, and returns the
+    studyIds from that call in the same pass (avoids querying twice, same
+    as the Mirth version). today/yesterday -> primary only. Older -> try
+    the backup first; only fall through to primary if the backup errors or
+    genuinely has no studies for that date (mirrors Mirth's "use first non-
+    empty base, else the last one" loop).
+
+    Returns (client, source, study_ids) where source is "primary" or
+    "backup" -- callers MUST propagate this exact source to every
+    downstream call for these studies (GET_STUDY_INSTANCES, thumbnails),
+    not re-derive it from the date, since an old date can still resolve to
+    primary when the backup comes up empty."""
+    if _is_recent_date(date_str) or orthanc_backup is None:
+        return orthanc, "primary", (orthanc.find_studies({"StudyDate": date_str}) or [])
+    try:
+        backup_ids = orthanc_backup.find_studies({"StudyDate": date_str}) or []
+    except Exception as exc:
+        log.warning("Backup Orthanc unreachable for date=%s, using primary: %s", date_str, exc)
+        backup_ids = []
+    if backup_ids:
+        return orthanc_backup, "backup", backup_ids
+    return orthanc, "primary", (orthanc.find_studies({"StudyDate": date_str}) or [])
+
+
+def pick_orthanc_client(orthanc, orthanc_backup, source):
+    """Resolves an explicit source string (as returned in a LIST row, and
+    echoed back by the frontend on GET_STUDY_INSTANCES / thumbnail calls)
+    to an actual client. Falls back to primary if backup was requested but
+    isn't configured -- never silently drop a request."""
+    if source == "backup" and orthanc_backup is not None:
+        return orthanc_backup, "backup"
+    return orthanc, "primary"
+
+
 def _fetch_study_row(orthanc, study_id):
     """One study's worth of work for list_studies_for_date, split out so
     it can run in a thread pool -- each call is mostly Orthanc-side wait
@@ -97,9 +158,12 @@ def _fetch_study_row(orthanc, study_id):
     }
 
 
-def list_studies_for_date(orthanc, date_str):
+def list_studies_for_date(orthanc, orthanc_backup, date_str):
     """Matches the dashboard's LIST contract: one row per study, with
-    WhatsApp status/attempts/timestamp read from Orthanc metadata.
+    WhatsApp status/attempts/timestamp read from Orthanc metadata, plus a
+    "source" field ("primary"/"backup") every row is tagged with -- the
+    frontend must echo this exact value back on GET_STUDY_INSTANCES and
+    thumbnail requests for that study (see _resolve_studies_for_date).
 
     Fetches studies concurrently (bounded, see LIST_CONCURRENCY) -- each
     per-study lookup is dominated by Orthanc's own response time (~500ms,
@@ -108,12 +172,15 @@ def list_studies_for_date(orthanc, date_str):
     OrthancClient) is documented thread-safe for concurrent calls, so one
     shared client across the pool is the correct/standard approach here,
     not a separate client per thread."""
-    study_ids = orthanc.find_studies({"StudyDate": date_str}) or []
+    client, source, study_ids = _resolve_studies_for_date(orthanc, orthanc_backup, date_str)
     if not study_ids:
         return []
     with ThreadPoolExecutor(max_workers=LIST_CONCURRENCY) as pool:
-        results = list(pool.map(lambda sid: _fetch_study_row(orthanc, sid), study_ids))
-    return [row for row in results if row is not None]
+        results = list(pool.map(lambda sid: _fetch_study_row(client, sid), study_ids))
+    rows = [row for row in results if row is not None]
+    for row in rows:
+        row["source"] = source
+    return rows
 
 
 def get_study_instances_payload(orthanc, study_id):
@@ -163,7 +230,7 @@ def save_selection(orthanc, cfg, study_id, selected_instance_ids):
     return {"ok": True, "studyId": study_id, "selectedCount": len(selected_instance_ids)}
 
 
-def make_handler(cfg, orthanc):
+def make_handler(cfg, orthanc, orthanc_backup):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             log.info("HTTP %s - %s", self.address_string(), fmt % args)
@@ -190,7 +257,7 @@ def make_handler(cfg, orthanc):
             try:
                 if data.get("action") == "LIST":
                     date_str = data.get("date") or datetime.now().strftime("%Y%m%d")
-                    rows = list_studies_for_date(orthanc, date_str)
+                    rows = list_studies_for_date(orthanc, orthanc_backup, date_str)
                     self._send_json(rows)
                     return
 
@@ -209,7 +276,13 @@ def make_handler(cfg, orthanc):
                     if not study_id:
                         self._send_json({"error": "studyId is required"}, 400)
                         return
-                    self._send_json(get_study_instances_payload(orthanc, study_id))
+                    client, resolved_source = pick_orthanc_client(orthanc, orthanc_backup, data.get("source"))
+                    payload = get_study_instances_payload(client, study_id)
+                    # Echo back whichever source actually served this study --
+                    # the frontend must pass this exact value on to every
+                    # thumbnail request for it, not re-derive from date.
+                    payload["source"] = resolved_source
+                    self._send_json(payload)
                     return
 
                 if data.get("action") == "SAVE_SELECTION":
@@ -218,7 +291,8 @@ def make_handler(cfg, orthanc):
                     if not study_id or not isinstance(selected, list):
                         self._send_json({"error": "studyId and selectedInstanceIds[] are required"}, 400)
                         return
-                    self._send_json(save_selection(orthanc, cfg, study_id, selected))
+                    client, _ = pick_orthanc_client(orthanc, orthanc_backup, data.get("source"))
+                    self._send_json(save_selection(client, cfg, study_id, selected))
                     return
 
                 self._send_json({"error": "unrecognized request shape"}, 400)
@@ -248,9 +322,11 @@ def make_handler(cfg, orthanc):
             parsed = urlparse(self.path)
             if parsed.path.startswith("/api/dicom-thumbnail/"):
                 instance_id = parsed.path.rsplit("/", 1)[-1]
+                query_source = parse_qs(parsed.query).get("source", [None])[0]
+                client, _ = pick_orthanc_client(orthanc, orthanc_backup, query_source)
                 with _thumbnail_semaphore:
                     try:
-                        content, content_type = orthanc.get_preview_png(instance_id)
+                        content, content_type = client.get_preview_png(instance_id)
                     except Exception as exc:
                         log.warning("Thumbnail proxy failed for instance=%s: %s", instance_id, exc)
                         self.send_response(502)
@@ -269,10 +345,13 @@ def make_handler(cfg, orthanc):
     return Handler
 
 
-def run_http_server(cfg, orthanc):
+def run_http_server(cfg, orthanc, orthanc_backup):
     port = cfg["http"]["port"]
-    server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(cfg, orthanc))
-    log.info("HTTP API listening on 0.0.0.0:%d (LIST / manualsend, dry_run=%s)", port, cfg["dry_run"])
+    server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(cfg, orthanc, orthanc_backup))
+    log.info(
+        "HTTP API listening on 0.0.0.0:%d (LIST / manualsend, dry_run=%s, orthanc_backup=%s)",
+        port, cfg["dry_run"], "configured" if orthanc_backup else "not configured",
+    )
     server.serve_forever()
 
 
@@ -336,8 +415,9 @@ if __name__ == "__main__":
     log.info("Loaded config from %s. dry_run=%s", args.config, cfg["dry_run"])
 
     orthanc = build_orthanc(cfg)
+    orthanc_backup = build_orthanc_backup(cfg)
 
-    http_thread = threading.Thread(target=run_http_server, args=(cfg, orthanc), daemon=True)
+    http_thread = threading.Thread(target=run_http_server, args=(cfg, orthanc, orthanc_backup), daemon=True)
     http_thread.start()
 
     run_poll_loop(cfg, orthanc)
