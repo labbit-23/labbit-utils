@@ -1,5 +1,8 @@
 {
   "dry_run": true,
+  "institution": {
+    "name": "SDRC Diagnostics"
+  },
   "orthanc": {
     "base_url": "http://ORTHANC_HOST:8042",
     "user": "CHANGEME",

@@ -102,10 +102,13 @@ def mark_group_error(orthanc, group, dry_run):
         orthanc.put_metadata(member["study_id"], "WhatsappStatus", "ERROR", dry_run=dry_run)
 
 
-def download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path):
+def download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path, institution_name=""):
     """Fetch the rendered PNG and burn in a header strip (patient name,
-    age/sex, accession, date/time) -- same fields the Mirth channel
-    already annotates, via the same ImageMagick binary."""
+    age/sex, accession, date/time) and a footer strip (institution
+    branding) -- same fields/layout the Mirth channel already annotates,
+    via the same ImageMagick binary. Institution name prefers the DICOM
+    tag (matching the original's per-image InstitutionName source) and
+    falls back to the configured default."""
     png_bytes = orthanc.get_rendered_png(instance_id)
     raw_path = os.path.join(tmp_dir, f"{instance_id}_raw.png")
     with open(raw_path, "wb") as f:
@@ -116,6 +119,7 @@ def download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path):
     accession = tags.get("AccessionNumber", "")
     study_date = tags.get("StudyDate", "")
     study_time = tags.get("StudyTime", "")
+    centre_name = tags.get("InstitutionName") or institution_name
 
     annotated_path = os.path.join(tmp_dir, f"{instance_id}_annotated.jpg")
     cmd = [
@@ -131,6 +135,12 @@ def download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path):
         "-fill", "white",
         "-pointsize", "22",
         "-annotate", "+0+8", f"{patient_name}  |  {age_sex}  |  Acc: {accession}  |  {study_date} {study_time}",
+        "-gravity", "South",
+        "-background", "black",
+        "-splice", "0x50",
+        "-fill", "white",
+        "-pointsize", "24",
+        "-annotate", "+0+8", centre_name,
         "-quality", "82",
         annotated_path,
     ]
@@ -164,7 +174,7 @@ def build_accession_page(annotated_paths, out_path, magick_path):
     return out_path
 
 
-def build_accession_annotated_images(orthanc, study, tmp_dir, magick_path):
+def build_accession_annotated_images(orthanc, study, tmp_dir, magick_path, institution_name=""):
     """Resolve every CR instance under one study to an annotated JPEG path."""
     annotated = []
     for series_id in study.get("Series", []):
@@ -173,11 +183,11 @@ def build_accession_annotated_images(orthanc, study, tmp_dir, magick_path):
             continue
         for instance_id in series.get("Instances", []):
             tags = orthanc.get_simplified_tags(instance_id)
-            annotated.append(download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path))
+            annotated.append(download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path, institution_name))
     return annotated
 
 
-def build_group_pdf(orthanc, group, tmp_dir, magick_path):
+def build_group_pdf(orthanc, group, tmp_dir, magick_path, institution_name=""):
     """One PDF, one page per distinct accession within the group."""
     by_accession = defaultdict(list)
     for member in group:
@@ -188,7 +198,7 @@ def build_group_pdf(orthanc, group, tmp_dir, magick_path):
         annotated = []
         for member in members:
             annotated.extend(
-                build_accession_annotated_images(orthanc, member["study"], tmp_dir, magick_path)
+                build_accession_annotated_images(orthanc, member["study"], tmp_dir, magick_path, institution_name)
             )
 
         if not annotated:
@@ -217,6 +227,7 @@ def process_once(cfg, orthanc):
     tmp_dir = os.path.abspath(cfg["worker"]["tmp_dir"])
     os.makedirs(tmp_dir, exist_ok=True)
     magick_path = cfg["worker"]["magick_path"]
+    institution_name = cfg.get("institution", {}).get("name", "")
 
     study_ids = find_todays_cr_studies(orthanc)
     if not study_ids:
@@ -247,7 +258,7 @@ def process_once(cfg, orthanc):
         lock_group(orthanc, group, attempts, dry_run)
 
         try:
-            pdf_path = build_group_pdf(orthanc, group, tmp_dir, magick_path)
+            pdf_path = build_group_pdf(orthanc, group, tmp_dir, magick_path, institution_name)
             if not pdf_path:
                 raise RuntimeError("No pages generated for this group.")
 
@@ -291,6 +302,7 @@ def manual_send(cfg, orthanc, accession, phone):
     tmp_dir = os.path.abspath(cfg["worker"]["tmp_dir"])
     os.makedirs(tmp_dir, exist_ok=True)
     magick_path = cfg["worker"]["magick_path"]
+    institution_name = cfg.get("institution", {}).get("name", "")
     log_prefix = f"[ManualSend | Accession={accession}] "
 
     study_ids = orthanc.find_studies({"AccessionNumber": accession})
@@ -303,7 +315,7 @@ def manual_send(cfg, orthanc, accession, phone):
 
     log.info(log_prefix + f"StudyId={study_id} Phone={phone} (manual override, bypassing status/attempts gate)")
 
-    annotated = build_accession_annotated_images(orthanc, study, tmp_dir, magick_path)
+    annotated = build_accession_annotated_images(orthanc, study, tmp_dir, magick_path, institution_name)
     if not annotated:
         raise RuntimeError(f"No CR instances found for accession={accession}")
 
