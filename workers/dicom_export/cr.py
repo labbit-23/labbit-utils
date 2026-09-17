@@ -88,10 +88,17 @@ def group_status(orthanc, group):
     """Reads metadata across every study in a group; returns
     (status, attempts) representing the group as a whole. status=='SENT'
     if any member already shows SENT (idempotent re-runs). attempts is
-    the max across members."""
+    the max across members.
+
+    raise_on_error=True on the WhatsappStatus read specifically: this is
+    the gate that decides whether a real send happens, so a transient
+    Orthanc read failure must propagate and abort this cycle rather than
+    being silently treated as "no status" (which would look identical to
+    a genuinely-never-sent study and cause a duplicate real send -- this
+    happened live on 2026-09-17, see get_metadata's docstring)."""
     max_attempts = 0
     for member in group:
-        status = orthanc.get_metadata(member["study_id"], "WhatsappStatus").upper()
+        status = orthanc.get_metadata(member["study_id"], "WhatsappStatus", raise_on_error=True).upper()
         if status == "SENT":
             return "SENT", max_attempts
         if status == "PROCESSING":
@@ -304,7 +311,15 @@ def process_once(cfg, orthanc):
         patient_id, study_date = key
         log_prefix = f"[Patient={patient_id} | Date={study_date}] "
 
-        status, attempts = group_status(orthanc, group)
+        try:
+            status, attempts = group_status(orthanc, group)
+        except Exception as exc:
+            # Could not confirm this group's real WhatsappStatus (e.g. a
+            # transient Orthanc connection failure) -- skip this cycle
+            # rather than risk treating "unknown" as "not sent". Retried
+            # automatically on the next poll once Orthanc is responsive.
+            log.warning(log_prefix + f"Could not verify send status this cycle, skipping: {exc}")
+            continue
         if status == "SENT":
             log.info(log_prefix + "Already SENT. Skipping.")
             continue

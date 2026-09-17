@@ -61,10 +61,25 @@ class OrthancClient:
         resp.raise_for_status()
         return resp.json()
 
-    def get_metadata(self, resource_id, key, default="", resource_type="studies"):
+    def get_metadata(self, resource_id, key, default="", resource_type="studies", raise_on_error=False):
         """resource_type is "studies" (default, matches every existing
         study-level caller -- WhatsappStatus etc.) or "instances" (used
-        for CT's per-instance SelectedForReport)."""
+        for CT's per-instance SelectedForReport).
+
+        raise_on_error distinguishes "confirmed absent" from "couldn't
+        check": a 404 always means the key is genuinely not set (safe to
+        return `default`), but with raise_on_error=True a network-level
+        failure (timeout, connection reset, 5xx) re-raises instead of
+        silently returning `default`. This matters because the swallow-
+        and-default behavior is safe for low-stakes reads (a dashboard
+        row shows blank) but was found live-caused a real duplicate
+        WhatsApp send: a transient Orthanc connection blip while reading
+        WhatsappStatus returned the same "" a genuinely-never-sent study
+        would give, letting cr.group_status() treat an already-SENT
+        study as eligible again. Callers gating a real send action must
+        pass raise_on_error=True and treat the exception as "unknown,
+        skip this cycle, retry next poll" -- never as "not sent."
+        """
         try:
             resp = self.session.get(
                 f"{self.base_url}/{resource_type}/{resource_id}/metadata/{key}",
@@ -76,6 +91,8 @@ class OrthancClient:
             resp.raise_for_status()
             return resp.text.strip()
         except requests.RequestException as exc:
+            if raise_on_error:
+                raise
             log.warning("get_metadata(%s/%s, %s) failed: %s", resource_type, resource_id, key, exc)
             return default
 
