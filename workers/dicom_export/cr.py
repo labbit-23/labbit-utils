@@ -103,11 +103,16 @@ def lock_group(orthanc, group, attempts, dry_run):
         orthanc.put_metadata(member["study_id"], "WhatsappAttempts", attempts + 1, dry_run=dry_run)
 
 
-def mark_group_sent(orthanc, group, dry_run):
+def mark_group_sent(orthanc, group, dry_run, public_url=""):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for member in group:
         orthanc.put_metadata(member["study_id"], "WhatsappStatus", "SENT", dry_run=dry_run)
         orthanc.put_metadata(member["study_id"], "WhatsappTimestamp", ts, dry_run=dry_run)
+        # Persisted so the dashboard's preview link can be reconstructed
+        # later without regenerating/guessing the FTP path -- this used to
+        # only ever get logged, never actually saved anywhere.
+        if public_url:
+            orthanc.put_metadata(member["study_id"], "WhatsappPdfUrl", public_url, dry_run=dry_run)
 
 
 def mark_group_error(orthanc, group, dry_run):
@@ -296,7 +301,7 @@ def process_once(cfg, orthanc):
                 phone, patient_name, public_url, os.path.basename(pdf_path), cfg["whatsapp"], dry_run=dry_run
             )
 
-            mark_group_sent(orthanc, group, dry_run)
+            mark_group_sent(orthanc, group, dry_run, public_url)
             log.info(log_prefix + f"Sent. PDF={pdf_path} URL={public_url}")
             sent_count += 1
             time.sleep(1)
@@ -355,6 +360,8 @@ def manual_send(cfg, orthanc, accession, phone):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     orthanc.put_metadata(study_id, "WhatsappStatus", "SENT", dry_run=dry_run)
     orthanc.put_metadata(study_id, "WhatsappTimestamp", ts, dry_run=dry_run)
+    if public_url:
+        orthanc.put_metadata(study_id, "WhatsappPdfUrl", public_url, dry_run=dry_run)
 
     log.info(log_prefix + f"Manual send complete. PDF={pdf_path} URL={public_url}")
     return {"ok": True, "studyId": study_id, "publicUrl": public_url, "phone": effective_phone}

@@ -55,6 +55,7 @@ def list_studies_for_date(orthanc, date_str):
                 "status": orthanc.get_metadata(study_id, "WhatsappStatus", ""),
                 "attempts": orthanc.get_metadata(study_id, "WhatsappAttempts", "0"),
                 "timestamp": orthanc.get_metadata(study_id, "WhatsappTimestamp", ""),
+                "pdfUrl": orthanc.get_metadata(study_id, "WhatsappPdfUrl", ""),
                 "modality": modality or "",
             }
         )
