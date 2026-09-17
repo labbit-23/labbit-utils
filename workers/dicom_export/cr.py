@@ -178,6 +178,18 @@ def download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path, inst
     return annotated_path
 
 
+def _is_landscape(path, magick_path):
+    try:
+        out = subprocess.run(
+            [magick_path, "identify", "-format", "%w %h", path],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        width, height = (int(v) for v in out.split())
+        return width > height
+    except Exception:
+        return False
+
+
 def build_accession_page(annotated_paths, out_path, magick_path):
     """Combine one accession's annotated images into a single page image.
     Single image -> used directly; multiple -> gridded via montage."""
@@ -185,7 +197,15 @@ def build_accession_page(annotated_paths, out_path, magick_path):
         os.rename(annotated_paths[0], out_path)
         return out_path
 
-    cols = 2 if len(annotated_paths) <= 4 else 3
+    # Two landscape films (e.g. Chest PA + AP) side by side each get
+    # squeezed into a narrow column for no reason -- stack them vertically
+    # instead so each keeps its natural width. Only handling the 2-image
+    # case; beyond that every layout choice is a judgment call and the
+    # existing fixed grid is already clear enough for reference viewing.
+    if len(annotated_paths) == 2 and all(_is_landscape(p, magick_path) for p in annotated_paths):
+        cols = 1
+    else:
+        cols = 2 if len(annotated_paths) <= 4 else 3
     cmd = [
         magick_path.replace("magick", "montage") if "magick" in magick_path else "montage",
         *annotated_paths,
