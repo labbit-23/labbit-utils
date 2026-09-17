@@ -14,6 +14,7 @@ accession. No local database.
 
 import logging
 import os
+import re
 import subprocess
 import time
 from collections import defaultdict
@@ -22,6 +23,12 @@ from datetime import datetime
 import core
 
 log = logging.getLogger("dicom_export")
+
+
+def _filename_safe(text, max_len=40):
+    """Strip to filesystem-safe characters for use in a PDF filename."""
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", (text or "").strip()).strip("_")
+    return cleaned[:max_len] or "UNKNOWN"
 
 MAX_ATTEMPTS = 3
 
@@ -235,8 +242,9 @@ def build_group_pdf(orthanc, group, tmp_dir, magick_path, institution_name=""):
         return None
 
     patient_id = group[0]["patient_id"]
+    patient_name_safe = _filename_safe(group[0]["patient_name"])
     study_date = group[0]["study"].get("MainDicomTags", {}).get("StudyDate", "")
-    pdf_path = os.path.join(tmp_dir, f"CR_{patient_id}_{study_date}.pdf")
+    pdf_path = os.path.join(tmp_dir, f"CR_{patient_name_safe}_{patient_id}_{study_date}.pdf")
     # Without an explicit density, ImageMagick assumes 1 pixel = 1 point
     # (72 DPI), turning a ~1600px-wide page image into a ~22-inch-wide PDF
     # page -- correct physical page size here instead.
@@ -345,7 +353,8 @@ def manual_send(cfg, orthanc, accession, phone):
     page_path = os.path.join(tmp_dir, f"page_{accession}.jpg")
     build_accession_page(annotated, page_path, magick_path)
 
-    pdf_path = os.path.join(tmp_dir, f"CR_MANUAL_{accession}.pdf")
+    patient_name_safe = _filename_safe(patient_name)
+    pdf_path = os.path.join(tmp_dir, f"CR_MANUAL_{patient_name_safe}_{accession}.pdf")
     subprocess.run([magick_path, "-density", "150", page_path, pdf_path], check=True, capture_output=True)
 
     effective_phone = phone or core.fetch_phone_from_labit(
