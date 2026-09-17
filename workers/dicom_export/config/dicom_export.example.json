@@ -1,5 +1,8 @@
 {
   "dry_run": true,
+  "ct": {
+    "enabled": false
+  },
   "institution": {
     "name": "SDRC Diagnostics"
   },

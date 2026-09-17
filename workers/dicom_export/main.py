@@ -212,7 +212,18 @@ def run_http_server(cfg, orthanc):
 
 def run_poll_loop(cfg, orthanc):
     poll_seconds = cfg["worker"]["poll_seconds"]
-    log.info("Starting CR+CT export poll loop. poll_seconds=%s dry_run=%s", poll_seconds, cfg["dry_run"])
+    # CT has its OWN activation flag (cfg["ct"]["enabled"], default False),
+    # deliberately separate from cfg["dry_run"]. Found live on 2026-09-17:
+    # ct.process_once() was committed and wired into this loop unconditionally,
+    # sharing CR's dry_run -- the moment CR's own approved go-live set
+    # dry_run=False, a later unrelated restart (to deploy an unrelated fix)
+    # silently activated real CT sends too, with no explicit approval step of
+    # its own. CT must never again be able to piggyback on CR's dry_run state.
+    ct_enabled = cfg.get("ct", {}).get("enabled", False)
+    log.info(
+        "Starting export poll loop. poll_seconds=%s dry_run=%s ct_enabled=%s",
+        poll_seconds, cfg["dry_run"], ct_enabled,
+    )
     while True:
         try:
             sent = cr.process_once(cfg, orthanc)
@@ -220,12 +231,13 @@ def run_poll_loop(cfg, orthanc):
                 log.info("Processed %d CR group(s) this cycle.", sent)
         except Exception as exc:
             log.exception("CR poll loop error: %s", exc)
-        try:
-            sent = ct.process_once(cfg, orthanc)
-            if sent:
-                log.info("Processed %d CT group(s) this cycle.", sent)
-        except Exception as exc:
-            log.exception("CT poll loop error: %s", exc)
+        if ct_enabled:
+            try:
+                sent = ct.process_once(cfg, orthanc)
+                if sent:
+                    log.info("Processed %d CT group(s) this cycle.", sent)
+            except Exception as exc:
+                log.exception("CT poll loop error: %s", exc)
         time.sleep(poll_seconds)
 
 
