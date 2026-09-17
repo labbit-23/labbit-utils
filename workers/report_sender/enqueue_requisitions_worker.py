@@ -1122,8 +1122,16 @@ class EnqueueWorker:
                     if not self._has_any_reportable_tests(live):
                         continue
 
-            if self.sb.dispatched_exists(reqno, phone):
-                continue
+            # Checked here (not an early `continue`) rather than before the live-status
+            # fetch: report_dispatch_logs only ever tells us a REGULAR report already
+            # went out once. It says nothing about a genuine outsourced test approved
+            # AFTER that send -- gating the whole row on it used to hard-skip the
+            # outsourced split-job detection below too, silently dropping that
+            # follow-up job forever. already_dispatched now only gates the final
+            # regular-job enqueue at the bottom of this loop; the outsourced block
+            # always runs. No change in behavior for the common case
+            # (already_dispatched False).
+            already_dispatched = self.sb.dispatched_exists(reqno, phone)
 
             # Live status is used for outsourced split-job detection and reactivation decisions.
             try:
@@ -1205,6 +1213,9 @@ class EnqueueWorker:
                                 "updated_at": utc_iso(),
                             })
                         self.log.info("Convert regular job to outsourced reqno=%s testid=%s", reqno, outsourced_testids[0])
+                continue
+
+            if already_dispatched:
                 continue
 
             job = {
