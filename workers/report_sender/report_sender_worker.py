@@ -1384,6 +1384,27 @@ class ReportSenderWorker:
             cooloff_lab = j
             cooloff_rad = j
 
+        # Director, 2026-09-17: "Outsourced/Special reports dont have a
+        # Cooling off? Its needed same as the lab." Confirmed real:
+        # derive_group_ready_timestamps() below only buckets tests into
+        # LAB/RADIOLOGY by GROUPNM/GROUPID -- an outsourced/special test's
+        # group matches neither, so it returns (None, None) for an
+        # outsourced-only job and this function falls through to
+        # status.get("latest_approved_at"), the ORIGINAL requisition's lab
+        # approval time. _reconcile_outsourced_jobs only creates this split
+        # job well after that (once the reference-lab PDF actually
+        # arrives, which can be days later) -- adding cooloff_default to an
+        # already-days-stale timestamp puts base_schedule in the past, so
+        # the "cooloff" is a no-op in practice: instant dispatch instead of
+        # the same grace period a regular lab report gets. Use the job's
+        # own created_at (the moment the PDF was confirmed available) as
+        # the real "ready" signal for outsourced jobs specifically.
+        meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+        report_source = norm_text(meta.get("report_source") or "").lower()
+        if report_source == "outsourced_report":
+            created_at = parse_iso(job.get("created_at")) or utc_now()
+            return created_at + timedelta(minutes=cooloff_default)
+
         lab_ready_at, rad_ready_at = derive_group_ready_timestamps(status)
         candidates = []
         if lab_ready_at is not None:
