@@ -14,6 +14,20 @@ import ct
 
 log = logging.getLogger("dicom_export")
 
+# Shared between the poll-loop thread and the HTTP server thread, read by
+# GET /health for external monitoring (labbit-py's services.local.ini).
+# Plain dict + lock rather than anything fancier -- one writer (the poll
+# loop), occasional readers, low contention.
+_state_lock = threading.Lock()
+_worker_state = {
+    "started_at": None,
+    "last_poll_at": None,
+    "last_poll_ok": None,
+    "last_poll_error": None,
+    "cr_sent_total": 0,
+    "ct_sent_total": 0,
+}
+
 
 def load_config(path):
     with open(path) as f:
@@ -175,6 +189,19 @@ def make_handler(cfg, orthanc):
                 self._send_json({"error": str(exc)}, 500)
 
         def do_GET(self):
+            if self.path == "/health":
+                # For labbit-py's monitoring (services.local.ini, type=http_json)
+                # -- mirrors what the Mirth channel checks already surface
+                # (state/received/sent/errors), scoped to what's meaningful
+                # for a poll-loop worker: is it alive, when did it last run
+                # a cycle, did that cycle succeed, how many real sends so
+                # far since this process started.
+                with _state_lock:
+                    state = dict(_worker_state)
+                state["dry_run"] = cfg["dry_run"]
+                state["ct_enabled"] = cfg.get("ct", {}).get("enabled", False)
+                self._send_json(state)
+                return
             # Thumbnail proxy: the browser can't reach Orthanc directly
             # (different network, and doing so would mean shipping Orthanc
             # credentials client-side) -- so the CT selection grid's <img>
@@ -224,20 +251,39 @@ def run_poll_loop(cfg, orthanc):
         "Starting export poll loop. poll_seconds=%s dry_run=%s ct_enabled=%s",
         poll_seconds, cfg["dry_run"], ct_enabled,
     )
+    with _state_lock:
+        _worker_state["started_at"] = datetime.now().isoformat()
+
     while True:
+        cycle_ok = True
+        cycle_error = None
         try:
             sent = cr.process_once(cfg, orthanc)
             if sent:
                 log.info("Processed %d CR group(s) this cycle.", sent)
+                with _state_lock:
+                    _worker_state["cr_sent_total"] += sent
         except Exception as exc:
             log.exception("CR poll loop error: %s", exc)
+            cycle_ok = False
+            cycle_error = f"CR: {exc}"
         if ct_enabled:
             try:
                 sent = ct.process_once(cfg, orthanc)
                 if sent:
                     log.info("Processed %d CT group(s) this cycle.", sent)
+                    with _state_lock:
+                        _worker_state["ct_sent_total"] += sent
             except Exception as exc:
                 log.exception("CT poll loop error: %s", exc)
+                cycle_ok = False
+                cycle_error = (cycle_error + " | " if cycle_error else "") + f"CT: {exc}"
+
+        with _state_lock:
+            _worker_state["last_poll_at"] = datetime.now().isoformat()
+            _worker_state["last_poll_ok"] = cycle_ok
+            _worker_state["last_poll_error"] = cycle_error
+
         time.sleep(poll_seconds)
 
 
