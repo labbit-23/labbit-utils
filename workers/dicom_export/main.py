@@ -23,6 +23,15 @@ import ct
 # parallelism benefit without hammering the same box.
 LIST_CONCURRENCY = 8
 
+# Caps concurrent thumbnail-proxy fetches to Orthanc. Found live tonight:
+# opening a large CT study's selection grid fired 150+ near-simultaneous
+# thumbnail requests (ThreadingHTTPServer gives each incoming request its
+# own thread, so nothing bounded this), and Orthanc's DICOM box actually
+# refused connections under that burst. This semaphore queues extra
+# requests instead of letting them all hit Orthanc at once -- browser
+# requests wait briefly rather than the server being overwhelmed.
+_thumbnail_semaphore = threading.Semaphore(6)
+
 log = logging.getLogger("dicom_export")
 
 # Shared between the poll-loop thread and the HTTP server thread, read by
@@ -239,13 +248,14 @@ def make_handler(cfg, orthanc):
             parsed = urlparse(self.path)
             if parsed.path.startswith("/api/dicom-thumbnail/"):
                 instance_id = parsed.path.rsplit("/", 1)[-1]
-                try:
-                    content, content_type = orthanc.get_preview_png(instance_id)
-                except Exception as exc:
-                    log.warning("Thumbnail proxy failed for instance=%s: %s", instance_id, exc)
-                    self.send_response(502)
-                    self.end_headers()
-                    return
+                with _thumbnail_semaphore:
+                    try:
+                        content, content_type = orthanc.get_preview_png(instance_id)
+                    except Exception as exc:
+                        log.warning("Thumbnail proxy failed for instance=%s: %s", instance_id, exc)
+                        self.send_response(502)
+                        self.end_headers()
+                        return
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(content)))
