@@ -1,0 +1,13 @@
+{
+  "enabled": false,
+  "calling_ae": "ORTHANC",
+  "called_ae": "DRYPIX",
+  "host": "10.16.18.40",
+  "port": 104,
+  "film_size": "14INX17IN",
+  "film_orientation": "PORTRAIT",
+  "film_layout": "6x4",
+  "color": false,
+  "allow_print": false,
+  "notes": "Phase 1 profile. Do not enable until network path and approved controlled test procedure exist."
+}
