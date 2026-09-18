@@ -57,6 +57,38 @@ def validate_film_layout(layout):
 
 
 
+def build_composer_raster(orthanc, study, selected_instance_ids, layout,
+                          tmp_dir, magick_path, institution_name=""):
+    """Render the selected page as PNG bytes for PDF or gated DICOM Print."""
+    rows, cols = validate_film_layout(layout)
+    selected = list(dict.fromkeys(selected_instance_ids or []))
+    if not selected:
+        raise ValueError("at least one image must be selected")
+    known = {iid for sid in study.get("Series", [])
+             for iid in orthanc.get_series(sid).get("Instances", [])}
+    if any(iid not in known for iid in selected):
+        raise ValueError("selection contains an instance outside this study")
+    import shutil
+    render_dir = os.path.join(os.path.abspath(tmp_dir), "composer-raster", uuid.uuid4().hex)
+    os.makedirs(render_dir, exist_ok=True)
+    try:
+        annotated = []
+        for instance_id in selected:
+            tags = orthanc.get_simplified_tags(instance_id)
+            annotated.append(cr.download_and_annotate(orthanc, instance_id, tags, render_dir, magick_path, institution_name))
+        output = os.path.join(render_dir, "film.png")
+        montage = magick_path.replace("magick", "montage") if "magick" in magick_path else "montage"
+        cmd = [montage, *annotated, "-tile", f"{cols}x{rows}", "-geometry", "1200x900+8+8", "-background", "black", output]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            subprocess.run([magick_path, "montage", *annotated, "-tile", f"{cols}x{rows}", "-geometry", "1200x900+8+8", "-background", "black", output], check=True, capture_output=True)
+        with open(output, "rb") as handle:
+            return handle.read()
+    finally:
+        shutil.rmtree(render_dir, ignore_errors=True)
+
+
 def build_composer_preview(orthanc, study, selected_instance_ids, layout,
                            tmp_dir, magick_path, institution_name=""):
     """Render a temporary bounded film preview without changing send state."""

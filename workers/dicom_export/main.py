@@ -2,6 +2,7 @@
 import argparse
 import json
 import logging
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +13,7 @@ from urllib.parse import parse_qs, urlparse
 import core
 import cr
 import ct
+import print_scu
 
 # Caps concurrent Orthanc calls from the LIST endpoint. Each per-study
 # lookup is ~500ms of mostly Orthanc-side work (confirmed live -- not our
@@ -314,6 +316,23 @@ def make_handler(cfg, orthanc, orthanc_backup):
                         cfg.get("institution", {}).get("name", ""),
                     )
                     self._send_pdf(body)
+                    return
+
+                if data.get("action") == "PRINT_SELECTION":
+                    profile_path = os.path.join(os.path.dirname(__file__), "config", "dicom_printer_drypix.json")
+                    with open(profile_path, encoding="utf-8") as handle:
+                        profile = json.load(handle)
+                    if not profile.get("enabled") or not profile.get("allow_print"):
+                        self._send_json({"error": "DRYPIX printing is disabled; no association attempted"}, 409)
+                        return
+                    study_id = data.get("studyId")
+                    selected = data.get("selectedInstanceIds")
+                    if not study_id or not isinstance(selected, list):
+                        self._send_json({"error": "studyId and selectedInstanceIds[] are required"}, 400)
+                        return
+                    client, _ = pick_orthanc_client(orthanc, orthanc_backup, data.get("source"))
+                    raster = ct.build_composer_raster(client, client.get_study(study_id), selected, data.get("layout", "6x4"), cfg["worker"]["tmp_dir"], cfg["worker"]["magick_path"], cfg.get("institution", {}).get("name", ""))
+                    self._send_json(print_scu.print_composed_raster(raster, profile))
                     return
 
                 if data.get("action") == "SAVE_SELECTION":
