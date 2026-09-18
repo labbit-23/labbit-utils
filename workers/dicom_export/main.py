@@ -191,10 +191,17 @@ def get_study_instances_payload(orthanc, study_id):
     for series_id in study.get("Series", []):
         series = orthanc.get_series(series_id)
         tags = series.get("MainDicomTags") or {}
-        instances = []
-        for instance_id in series.get("Instances", []):
+        def instance_payload(instance_id):
             order = ct._selected_order(orthanc, instance_id)
-            instances.append({"instanceId": instance_id, "selectedOrder": order})
+            try:
+                detail = orthanc.get_json(f"/instances/{instance_id}?requestedTags=InstanceNumber")
+                number = (detail.get("RequestedTags") or {}).get("InstanceNumber", "")
+            except Exception:
+                number = ""
+            return {"instanceId": instance_id, "instanceNumber": str(number), "selectedOrder": order}
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            instances = list(pool.map(instance_payload, series.get("Instances", [])))
         series_out.append(
             {
                 "seriesId": series_id,
@@ -243,6 +250,14 @@ def make_handler(cfg, orthanc, orthanc_backup):
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_pdf(self, body):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Disposition", "inline; filename=ct-film-preview.pdf")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_POST(self):
             if self.path != "/api/dicom":
                 self._send_json({"error": "not found"}, 404)
@@ -283,6 +298,22 @@ def make_handler(cfg, orthanc, orthanc_backup):
                     # thumbnail request for it, not re-derive from date.
                     payload["source"] = resolved_source
                     self._send_json(payload)
+                    return
+
+                if data.get("action") == "PREVIEW_SELECTION":
+                    study_id = data.get("studyId")
+                    selected = data.get("selectedInstanceIds")
+                    if not study_id or not isinstance(selected, list):
+                        self._send_json({"error": "studyId and selectedInstanceIds[] are required"}, 400)
+                        return
+                    client, _ = pick_orthanc_client(orthanc, orthanc_backup, data.get("source"))
+                    study = client.get_study(study_id)
+                    body = ct.build_composer_preview(
+                        client, study, selected, data.get("layout", "6x4"),
+                        cfg["worker"]["tmp_dir"], cfg["worker"]["magick_path"],
+                        cfg.get("institution", {}).get("name", ""),
+                    )
+                    self._send_pdf(body)
                     return
 
                 if data.get("action") == "SAVE_SELECTION":

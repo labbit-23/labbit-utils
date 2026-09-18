@@ -27,6 +27,7 @@ import logging
 import os
 import subprocess
 import time
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -39,6 +40,64 @@ log = logging.getLogger("dicom_export")
 # up waiting and send everything, matching today's Mirth behavior instead
 # of leaving it stuck forever. Pavan's own spec: "3-4 hour fallback."
 SELECTION_FALLBACK_HOURS = 3.5
+
+FILM_LAYOUTS = {
+    "4x4": (4, 4), "5x5": (5, 5), "5x6": (5, 6),
+    "6x4": (6, 4), "6x6": (6, 6), "7x5": (7, 5),
+}
+
+
+def validate_film_layout(layout):
+    """Return (rows, cols) for a supported composer layout."""
+    try:
+        rows, cols = FILM_LAYOUTS[str(layout)]
+    except (KeyError, TypeError):
+        raise ValueError("unsupported film layout")
+    return rows, cols
+
+
+
+def build_composer_preview(orthanc, study, selected_instance_ids, layout,
+                           tmp_dir, magick_path, institution_name=""):
+    """Render a temporary bounded film preview without changing send state."""
+    rows, cols = validate_film_layout(layout)
+    selected = list(dict.fromkeys(selected_instance_ids or []))
+    if not selected:
+        raise ValueError("at least one image must be selected")
+    if len(selected) > rows * cols * 20:
+        raise ValueError("selection is too large for one preview request")
+
+    known = {iid for sid in study.get("Series", [])
+             for iid in orthanc.get_series(sid).get("Instances", [])}
+    if any(iid not in known for iid in selected):
+        raise ValueError("selection contains an instance outside this study")
+
+    import shutil
+    preview_dir = os.path.join(os.path.abspath(tmp_dir), "composer-preview", uuid.uuid4().hex)
+    os.makedirs(preview_dir, exist_ok=True)
+    try:
+        annotated = []
+        for instance_id in selected:
+            tags = orthanc.get_simplified_tags(instance_id)
+            annotated.append(cr.download_and_annotate(
+                orthanc, instance_id, tags, preview_dir, magick_path, institution_name))
+        page_path = os.path.join(preview_dir, "film.jpg")
+        montage = magick_path.replace("magick", "montage") if "magick" in magick_path else "montage"
+        cmd = [montage, *annotated, "-tile", f"{cols}x{rows}",
+               "-geometry", "1200x900+8+8", "-background", "black", page_path]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            subprocess.run([magick_path, "montage", *annotated, "-tile", f"{cols}x{rows}",
+                            "-geometry", "1200x900+8+8", "-background", "black", page_path],
+                           check=True, capture_output=True)
+        pdf_path = os.path.join(preview_dir, "film-preview.pdf")
+        subprocess.run([magick_path, "-density", "150", page_path, pdf_path],
+                       check=True, capture_output=True)
+        with open(pdf_path, "rb") as handle:
+            return handle.read()
+    finally:
+        shutil.rmtree(preview_dir, ignore_errors=True)
 
 
 def find_todays_ct_studies(orthanc):
