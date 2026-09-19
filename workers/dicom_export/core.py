@@ -11,6 +11,7 @@ import logging.handlers
 import os
 import re
 import sys
+import time
 
 import requests
 
@@ -120,7 +121,18 @@ class OrthancClient:
             log.warning("get_all_metadata(%s/%s) failed: %s", resource_type, resource_id, exc)
             return {}
 
-    def put_metadata(self, resource_id, key, value, dry_run=True, resource_type="studies"):
+    def put_metadata(self, resource_id, key, value, dry_run=True, resource_type="studies", retries=3):
+        """Retries on network-level failure (timeout, connection reset) --
+        PUT is idempotent here (same key/value every attempt), so retrying
+        is always safe. Found live on 2026-09-19: mark_group_sent's PUT of
+        WhatsappStatus=SENT hit a single ~20s connect timeout to the
+        primary Orthanc right after a real WhatsApp send had already gone
+        out. With no retry, that left the study at WhatsappStatus=ERROR --
+        a value group_status() doesn't special-case, so it read exactly
+        like "never attempted" and the next poll cycle genuinely resent
+        the same message to a real patient/unit phone. A few retries here
+        closes that window without changing behavior for the (far more
+        common) case where the first attempt just works."""
         if dry_run:
             log.info(
                 "[DRY_RUN] would PUT metadata %s/%s/metadata/%s = %r",
@@ -130,13 +142,26 @@ class OrthancClient:
                 value,
             )
             return
-        resp = self.session.put(
-            f"{self.base_url}/{resource_type}/{resource_id}/metadata/{key}",
-            auth=self.auth,
-            data=str(value),
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
+        last_exc = None
+        for attempt in range(1, retries + 1):
+            try:
+                resp = self.session.put(
+                    f"{self.base_url}/{resource_type}/{resource_id}/metadata/{key}",
+                    auth=self.auth,
+                    data=str(value),
+                    timeout=self.timeout,
+                )
+                resp.raise_for_status()
+                return
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+                if attempt < retries:
+                    log.warning(
+                        "put_metadata %s/%s/metadata/%s failed (attempt %d/%d), retrying: %s",
+                        resource_type, resource_id, key, attempt, retries, exc,
+                    )
+                    time.sleep(2)
+        raise last_exc
 
     def delete_metadata(self, resource_id, key, dry_run=True, resource_type="studies"):
         if dry_run:
