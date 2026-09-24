@@ -1309,9 +1309,37 @@ class EnqueueWorker:
                 rows = rows.get(seg) if isinstance(rows, dict) else None
             if not isinstance(rows, list):
                 rows = data if isinstance(data, list) else []
+            # One-time backlog cutover: job.skip_first_n leading rows of the
+            # source list are skipped, but ONLY on job.skip_first_n_date --
+            # gated by date, not just list length, so a leftover config value
+            # can't silently swallow a future day's short row list once it's
+            # no longer relevant (rows[:N] on a shorter list is [], not a
+            # no-op). Used once on 2026-09-24 to avoid retroactively
+            # bulk-sending the ~40 requisitions stranded by the starvation
+            # bug below (rows[:cap] fix) to patients hours after the fact --
+            # safe to delete both fields from config after that date.
+            skip_first_n = int(job.get("skip_first_n", 0) or 0)
+            skip_first_n_date = norm(job.get("skip_first_n_date"))
+            if skip_first_n > 0 and skip_first_n_date and skip_first_n_date == today:
+                rows = rows[skip_first_n:]
+            # max_per_cycle caps real work (sent+failed attempts), same as the
+            # main report-enqueue loop: it walks every fetched row each cycle
+            # and lets each row self-determine skip vs. act, rather than
+            # pre-slicing the row list. A pre-slice here (rows[:cap]) used to
+            # mean the same first `cap` rows of the day were re-checked every
+            # cycle forever once they'd already sent -- any row past position
+            # `cap` on a day with more than `cap` requisitions was never even
+            # attempted (queued forever, live incident 2026-09-13 11:36
+            # onward: rows grew past 60, sent stayed 0 every cycle after).
+            # already_sent skips are a single indexed lookup (cheap, same
+            # cost as the main loop's latest_job() per row) so they don't
+            # count against the cap; only genuine send/failed attempts do.
             cap = int(job.get("max_per_cycle", 100))
             sent = skipped = failed = 0
-            for row in rows[:cap]:
+            attempts = 0
+            for row in rows:
+                if attempts >= cap:
+                    break
                 if self.dry_run:
                     self.log.info("[dry-run] pmj %s row=%s", key, norm(row.get("reqno") or row.get("reqid")))
                     continue
@@ -1322,15 +1350,19 @@ class EnqueueWorker:
                         j = r.json() if r.text else {}
                         if j.get("sent"):
                             sent += 1
+                            attempts += 1
                         elif j.get("skipped"):
                             skipped += 1
                         else:
                             failed += 1
+                            attempts += 1
                     else:
                         failed += 1
+                        attempts += 1
                         self.log.warning("pmj %s send -> %s %s", key, r.status_code, r.text[:200])
                 except Exception as exc:
                     failed += 1
+                    attempts += 1
                     self.log.warning("pmj %s send failed: %s", key, exc)
             self.log.info("pmj %s: rows=%s sent=%s skipped=%s failed=%s", key, len(rows), sent, skipped, failed)
 
