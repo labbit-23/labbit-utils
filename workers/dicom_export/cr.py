@@ -1,10 +1,10 @@
 """
 CR (X-ray) film consolidation.
 
-Groups today's CR studies by (PatientID, StudyDate), builds one PDF per
-group with one page per distinct AccessionNumber (multiple instances on
-an accession are gridded onto that one page via ImageMagick montage),
-uploads it via FTP, and sends one WhatsApp document message per group.
+Groups today's studies by AccessionNumber only. PatientID and StudyDate
+are display/metadata fields, never grouping keys. CR builds one PDF per
+accession; CT builds one PDF per StudyInstanceUID within the accession,
+uploads it via FTP, and sends WhatsApp document messages.
 
 State lives entirely in Orthanc study metadata (WhatsappStatus /
 WhatsappAttempts / WhatsappTimestamp), written to every study in a group
