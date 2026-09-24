@@ -173,42 +173,30 @@ def build_composer_raster(orthanc, study, selected_instance_ids, layout,
         shutil.rmtree(render_dir, ignore_errors=True)
 
 
+def _ct_logo_path():
+    path = os.path.join(os.path.dirname(__file__), "assets", "sdrc-logo.png")
+    return path if os.path.exists(path) else None
+
+
 def build_composer_preview(orthanc, study, selected_instance_ids, layout,
                            tmp_dir, magick_path, institution_name=""):
-    """Render fixed portrait 14x17 CT preview pages without changing send state."""
-    rows, cols = validate_film_layout(layout)
+    """Render the live CT preview with vector labels and branded header."""
     selected = list(dict.fromkeys(selected_instance_ids or []))
     if not selected:
         raise ValueError("at least one image must be selected")
-    if len(selected) > rows * cols * 20:
-        raise ValueError("selection is too large for one preview request")
-
-    known = {iid for sid in study.get("Series", [])
-             for iid in orthanc.get_series(sid).get("Instances", [])}
-    if any(iid not in known for iid in selected):
-        raise ValueError("selection contains an instance outside this study")
-
-    import shutil
     preview_dir = os.path.join(os.path.abspath(tmp_dir), "composer-preview", uuid.uuid4().hex)
     os.makedirs(preview_dir, exist_ok=True)
     try:
-        with ThreadPoolExecutor(max_workers=RENDER_WORKERS) as pool:
-            annotated = list(pool.map(
-                lambda iid: _annotate_one(orthanc, iid, preview_dir, magick_path, institution_name),
-                selected,
-            ))
-        page_paths = _render_ct_pages(annotated, preview_dir, magick_path,
-                                      "SDRC Diagnostics | sdrc.in", rows, cols, "film")
         pdf_path = os.path.join(preview_dir, "film-preview.pdf")
-        subprocess.run([magick_path, "-density", "150", *page_paths, pdf_path],
-                       check=True, capture_output=True)
+        build_vector_preview_pdf(
+            orthanc, study, selected, layout, pdf_path, _ct_logo_path()
+        )
         with open(pdf_path, "rb") as handle:
             return handle.read()
     finally:
         shutil.rmtree(preview_dir, ignore_errors=True)
 
-
-def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, output_path, logo_path=None):
+def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, output_path, logo_path=None, page_groups=None):
     """Render a trial CT PDF with raster images and selectable vector labels.
 
     This intentionally remains separate from the live ImageMagick path until
@@ -223,6 +211,13 @@ def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, outp
     selected = list(dict.fromkeys(selected_instance_ids or []))
     if not selected:
         raise ValueError("at least one image must be selected")
+    if page_groups is None:
+        page_groups = [selected]
+    else:
+        page_groups = [list(dict.fromkeys(group)) for group in page_groups if group]
+    flat_group_ids = [iid for group in page_groups for iid in group]
+    if set(flat_group_ids) != set(selected):
+        raise ValueError("page groups must contain exactly the selected instances")
     page_width, page_height = 14 * 72, 17 * 72
     render_dpi = 150
     margin, gap, header = 18, 6, 52
@@ -239,11 +234,17 @@ def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, outp
     with ThreadPoolExecutor(max_workers=RENDER_WORKERS) as pool:
         fetched = list(pool.map(fetch, selected))
 
+    fetched_by_id = {iid: (iid, tags, png_bytes) for iid, tags, png_bytes in fetched}
+    page_chunks = []
+    for group in page_groups:
+        for page_start in range(0, len(group), rows * cols):
+            page_chunks.append([fetched_by_id[iid] for iid in group[page_start:page_start + rows * cols]])
+
     pdf = canvas.Canvas(output_path, pagesize=(page_width, page_height), pageCompression=1)
-    for page_start in range(0, len(fetched), rows * cols):
+    for page_items in page_chunks:
         pdf.setFillColorRGB(0, 0, 0)
         pdf.rect(0, 0, page_width, page_height, stroke=0, fill=1)
-        for pos, (_iid, tags, png_bytes) in enumerate(fetched[page_start:page_start + rows * cols]):
+        for pos, (_iid, tags, png_bytes) in enumerate(page_items):
             row, col = divmod(pos, cols)
             x = margin + col * (cell_width + gap)
             y = page_height - margin - header - (row + 1) * cell_height - row * gap
@@ -286,6 +287,15 @@ def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, outp
                           width=82, height=30, preserveAspectRatio=True, mask="auto")
         pdf.setFont("Helvetica-Bold", 16)
         pdf.drawString(margin + 96, page_height - margin - 19, "SDRC Diagnostics")
+        pdf.setFont("Helvetica", 9)
+        website = "www.sdrc.in"
+        website_y = page_height - margin - 17
+        pdf.drawRightString(page_width - margin, website_y, website)
+        website_width = pdf.stringWidth(website, "Helvetica", 9)
+        pdf.linkURL("https://www.sdrc.in", (
+            page_width - margin - website_width, website_y - 3,
+            page_width - margin, website_y + 9,
+        ), relative=0)
         pdf.showPage()
     pdf.save()
     return output_path
@@ -435,59 +445,41 @@ def _split_series_pdf(annotated, series_id, base_path, max_bytes, magick_path, f
 
 
 def build_group_pdfs(orthanc, group, tmp_dir, magick_path, institution_name="", footer_text="SDRC Diagnostics | sdrc.in"):
-    """Build a CT PDF, splitting by series and then by image chunks if needed.
-
-    The relay bridge limit is 15 MB; keep a 14.8 MB safety cap per PDF.
-    """
+    """Build one vector-text CT PDF per study, preserving one page per series."""
     max_bytes = int(14.8 * 1024 * 1024)
-    page_paths = []
-    series_images = []
-    for member in sorted(group, key=lambda m: m["accession"]):
-        study = member["study"]
-        selected_by_series = get_selected_instances_by_series(orthanc, study)
-        for series_id, instance_ids in selected_by_series.items():
-            series = orthanc.get_series(series_id)
-            # Scout/localizer/topogram has a different aspect ratio and is a
-            # planning image. Keep it as its own page, in series order, so it
-            # is always page 1 when the scanner sends it first.
-            series_images.append((series_id, list(instance_ids)))
-
-    for series_index, (series_id, instance_ids) in enumerate(series_images, start=1):
-        annotated = []
-        for instance_id in instance_ids:
-            tags = orthanc.get_simplified_tags(instance_id)
-            annotated.append(cr.download_and_annotate_ct(
-                orthanc, instance_id, tags, tmp_dir, magick_path, institution_name
-            ))
-        if annotated:
-            for page_no, offset in enumerate(range(0, len(annotated), CT_GRID_ROWS * CT_GRID_COLS), start=1):
-                page_annotated = annotated[offset:offset + CT_GRID_ROWS * CT_GRID_COLS]
-                page_path = os.path.join(tmp_dir, f"ct_series_{series_index:02d}_{page_no:02d}_{series_id}.jpg")
-                page_paths.append((series_id, page_path, page_annotated))
-
-    if not page_paths:
+    member = group[0]
+    study = member["study"]
+    page_groups = []
+    for _series_id, instance_ids in get_selected_instances_by_series(orthanc, study).items():
+        for offset in range(0, len(instance_ids), CT_GRID_ROWS * CT_GRID_COLS):
+            page_groups.append(instance_ids[offset:offset + CT_GRID_ROWS * CT_GRID_COLS])
+    selected = [iid for page in page_groups for iid in page]
+    if not selected:
         return []
 
-    accession = group[0]["accession"]
-    study = group[0]["study"]
-    study_desc = cr._filename_safe((study.get("MainDicomTags") or {}).get("StudyDescription", "STUDY"))
-    study_token = cr._filename_safe(group[0]["study_id"], max_len=16)
+    accession = member["accession"]
+    study_desc = cr._filename_safe(member.get("study_description") or (study.get("MainDicomTags") or {}).get("StudyDescription", "STUDY"))
+    study_token = cr._filename_safe(member["study_id"], max_len=16)
     study_date = (study.get("MainDicomTags") or {}).get("StudyDate", "")
-    # One CT PDF is built per StudyInstanceUID. Accession is the outer
-    # transaction boundary; PatientID is never used as a grouping key.
     full_path = os.path.join(tmp_dir, f"CT_{accession}_{study_desc}_{study_token}_{study_date}.pdf")
-    for _, page_path, annotated in page_paths:
-        build_ct_page(annotated, page_path, magick_path, footer_text)
-    full_size = _write_pdf(magick_path, [p for _, p, _ in page_paths], full_path)
+    build_vector_preview_pdf(
+        orthanc, study, selected, "6x4", full_path, _ct_logo_path(), page_groups=page_groups
+    )
+    full_size = os.path.getsize(full_path)
     if full_size <= max_bytes:
-        log.info("CT PDF is %.2f MB; sending as one document.", full_size / (1024 * 1024))
+        log.info("CT vector PDF is %.2f MB; sending as one document.", full_size / (1024 * 1024))
         return [full_path]
 
-    log.warning("CT PDF is %.2f MB; splitting into series/chunk documents.", full_size / (1024 * 1024))
+    log.warning("CT vector PDF is %.2f MB; splitting by series/page to stay under the relay limit.", full_size / (1024 * 1024))
     split_paths = []
-    for part, (series_id, page_path, annotated) in enumerate(page_paths, start=1):
-        base = os.path.join(tmp_dir, f"CT_{accession}_{study_desc}_{study_token}_{study_date}_series_{part:02d}")
-        split_paths.extend(_split_series_pdf(annotated, series_id, base, max_bytes, magick_path, footer_text))
+    for part, page_group in enumerate(page_groups, start=1):
+        base = os.path.join(tmp_dir, f"CT_{accession}_{study_desc}_{study_token}_{study_date}_page_{part:02d}.pdf")
+        build_vector_preview_pdf(
+            orthanc, study, page_group, "6x4", base, _ct_logo_path(), page_groups=[page_group]
+        )
+        if os.path.getsize(base) > max_bytes:
+            raise RuntimeError(f"CT page {part} remains over the 14.8 MB relay safety cap")
+        split_paths.append(base)
     return split_paths
 
 def process_once(cfg, orthanc):
