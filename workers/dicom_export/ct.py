@@ -24,6 +24,7 @@ here would just be drift risk. CT delivery status is handled per study
 so one StudyInstanceUID cannot suppress another within the accession.
 """
 
+import io
 import logging
 import os
 import subprocess
@@ -205,6 +206,80 @@ def build_composer_preview(orthanc, study, selected_instance_ids, layout,
             return handle.read()
     finally:
         shutil.rmtree(preview_dir, ignore_errors=True)
+
+
+def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, output_path):
+    """Render a trial CT PDF with raster images and selectable vector labels.
+
+    This intentionally remains separate from the live ImageMagick path until
+    the output is approved. Images are JPEG-compressed in memory for size;
+    patient/series/instance labels are drawn as real PDF text by ReportLab.
+    """
+    from PIL import Image
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    rows, cols = validate_film_layout(layout)
+    selected = list(dict.fromkeys(selected_instance_ids or []))
+    if not selected:
+        raise ValueError("at least one image must be selected")
+    page_width, page_height = 14 * 72, 17 * 72
+    margin, gap, footer = 18, 6, 34
+    cell_width = (page_width - 2 * margin - (cols - 1) * gap) / cols
+    cell_height = (page_height - 2 * margin - footer - (rows - 1) * gap) / rows
+
+    def fetch(iid):
+        tags = orthanc.get_simplified_tags(iid)
+        return iid, tags, orthanc.get_rendered_png(iid)
+
+    fetched = []
+    with ThreadPoolExecutor(max_workers=RENDER_WORKERS) as pool:
+        fetched = list(pool.map(fetch, selected))
+
+    pdf = canvas.Canvas(output_path, pagesize=(page_width, page_height), pageCompression=1)
+    for page_start in range(0, len(fetched), rows * cols):
+        pdf.setFillColorRGB(0, 0, 0)
+        pdf.rect(0, 0, page_width, page_height, stroke=0, fill=1)
+        for pos, (_iid, tags, png_bytes) in enumerate(fetched[page_start:page_start + rows * cols]):
+            row, col = divmod(pos, cols)
+            x = margin + col * (cell_width + gap)
+            y = page_height - margin - footer - (row + 1) * cell_height - row * gap
+            with Image.open(io.BytesIO(png_bytes)) as image:
+                image = image.convert("RGB")
+                source_w, source_h = image.size
+                image.thumbnail((int(cell_width), int(cell_height)), Image.Resampling.LANCZOS)
+                image_buffer = io.BytesIO()
+                image.save(image_buffer, format="JPEG", quality=90, optimize=True)
+                image_buffer.seek(0)
+                draw_w, draw_h = image.size
+            draw_x = x + (cell_width - draw_w) / 2
+            draw_y = y + (cell_height - draw_h) / 2
+            pdf.drawImage(ImageReader(image_buffer), draw_x, draw_y, draw_w, draw_h, mask="auto")
+
+            patient_name = (tags.get("PatientName") or "").replace("^", " ").strip()
+            patient_id = tags.get("PatientID") or ""
+            accession = tags.get("AccessionNumber") or ""
+            timestamp = f"{tags.get('StudyDate', '')} {tags.get('StudyTime', '')}".strip()
+            sex = tags.get("PatientSex") or "—"
+            series_no = tags.get("SeriesNumber") or "—"
+            instance_no = tags.get("InstanceNumber") or "—"
+            pdf.setFillColorRGB(1, 1, 1)
+            pdf.setFont("Helvetica", 8.5)
+            pdf.drawString(x + 5, y + cell_height - 12, patient_name[:32])
+            pdf.drawString(x + 5, y + cell_height - 22, f"Patient ID: {patient_id}"[:32])
+            pdf.drawString(x + 5, y + cell_height - 32, f"Acc: {accession}"[:32])
+            pdf.drawRightString(x + cell_width - 5, y + cell_height - 12, timestamp[:24])
+            pdf.drawRightString(x + cell_width - 5, y + cell_height - 22, f"Sex: {sex}")
+            pdf.drawRightString(x + cell_width - 5, y + cell_height - 32, f"Series {series_no}")
+            pdf.setFont("Helvetica", 8)
+            pdf.drawString(x + 5, y + 6, f"Instance {instance_no}")
+
+        pdf.setFillColorRGB(1, 1, 1)
+        pdf.setFont("Helvetica", 9)
+        pdf.drawCentredString(page_width / 2, 12, "SDRC Diagnostics | sdrc.in")
+        pdf.showPage()
+    pdf.save()
+    return output_path
 
 def find_todays_ct_studies(orthanc):
     today = datetime.now().strftime("%Y%m%d")
