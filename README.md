@@ -1,54 +1,27 @@
-# py_utils
+# labbit-utils
 
-Shared home for operational Python workers that are not tightly coupled to one app repo.
+Operational Python workers used by the SDRC/Labit integration layer. This repository contains code and safe example configuration; live secrets, generated runtime state, and PHI outputs remain on the machine and are not part of git.
+
+## Start here
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — current live topology and process map.
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — deployment, validation, and recovery notes.
+- [workers/dicom_export/README.md](workers/dicom_export/README.md) — CR/CT export worker.
+- [workers/radiology_mwl/README.md](workers/radiology_mwl/README.md) — MWL worker.
+- [workers/report_sender/README.md](workers/report_sender/README.md) — report sender workers.
 
 ## Structure
 
-Each utility must live in its own folder with:
+Each utility lives in its own folder with its own README, requirements, example configuration, and entry scripts. This allows independent testing and deployment per worker. The live PM2 process map is documented separately because PM2 state is machine-level runtime state, not source-controlled application configuration.
 
-- its own `README.md`
-- its own `requirements.txt`
-- its own `config/*.example.json`
-- its own entry script(s)
+## Workers
 
-Example:
+- `workers/radiology_mwl` — creates DICOM MWL files from Labit worklist rows and uploads them to the Orthanc MWL bridge.
+- `workers/dicom_export` — serves the local DICOM dashboard API and renders/sends CR and CT studies.
+- `workers/report_sender` — report dispatch and requisition enqueue workers.
 
-```text
-py_utils/
-  workers/
-    radiology_mwl/
-      README.md
-      requirements.txt
-      radiology_mwl_worker.py
-      config/
-        mwl_worker.example.json
-```
+## Configuration rule
 
-This allows independent deploy/runtime per worker.
+Use `config/*.example.json` as the committed template. Machine-specific `config/*.json` files are ignored because they contain credentials and endpoints. Do not add live passwords, API keys, Basic-auth headers, patient data, rendered images, PDFs, SQLite state, or logs to git.
 
-## Workers (current)
-
-- `workers/radiology_mwl`  
-  Polls Supabase for `performed = 0` and creates Radiology MWL records via configured endpoint.
-
-## Planned here
-
-- Mirth-facing workers
-- report sender workers
-- additional automation pollers
-
-## VPS deploy helper
-
-For report sender worker updates on VPS:
-
-```bash
-cd /opt/py_utils
-./scripts/deploy-vps-report-sender.sh
-```
-
-With PM2 restart:
-
-```bash
-cd /opt/py_utils
-./scripts/deploy-vps-report-sender.sh --restart-pm2
-```
+The current repository still has several runtime JSON files on the production PC. They are the effective configuration today, but they are not yet generated from one canonical machine manifest. That central deployment layer is a follow-up task; until it exists, changes must be made against the worker's live config and recorded in deployment notes.
