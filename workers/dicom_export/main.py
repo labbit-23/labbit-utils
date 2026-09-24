@@ -178,6 +178,7 @@ def _fetch_study_row(orthanc, study_id):
     return {
         "studyId": study_id,
         "accession": main_tags.get("AccessionNumber", ""),
+        "studyDescription": main_tags.get("StudyDescription", ""),
         "patientName": (patient_tags.get("PatientName") or "").replace("^", " ").strip(),
         "phone": meta.get("WhatsappPhone", ""),
         "status": meta.get("WhatsappStatus", ""),

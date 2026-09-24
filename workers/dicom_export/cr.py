@@ -57,20 +57,11 @@ def group_by_accession(orthanc, study_ids):
             log.info("[StudyId=%s] No accession. Skipping.", study_id)
             continue
 
-        # PatientID is often blank in real data here (seen directly on real
-        # studies -- RIS jams age into PatientName instead, e.g.
-        # "KAMALESH^KUMAR^66Y" with PatientID=""). .get(key, default) only
-        # falls back when the key is MISSING, not when it's present-but-
-        # empty, so this used to silently group every blank-PatientID
-        # patient together under one shared key. Orthanc's own
-        # ParentPatient is NOT a safe fallback either -- confirmed on real
-        # data that Orthanc's patient-matching also merges genuinely
-        # different patients under one Patient resource when PatientID is
-        # blank (found 4 distinct real patients sharing one ParentPatient).
-        # Never risk combining two different patients' images into one
-        # PDF/message: when PatientID is blank, treat this study as its own
-        # unmerged group using the study's own unique ID as the key.
+        # Patient fields are display/file-name metadata only. AccessionNumber
+        # is the sole outer grouping key; PatientID must never merge or split
+        # studies because scanners/RIS can send blank or incorrect IDs.
         patient_id = patient_tags.get("PatientID") or f"NOID-{study_id}"
+        study_description = main_tags.get("StudyDescription", "")
 
         groups[accession].append(
             {
@@ -78,6 +69,7 @@ def group_by_accession(orthanc, study_ids):
                 "accession": accession,
                 "patient_id": patient_id,
                 "patient_name": (patient_tags.get("PatientName") or "").replace("^", " ").strip(),
+                "study_description": study_description,
                 "study": study,
             }
         )

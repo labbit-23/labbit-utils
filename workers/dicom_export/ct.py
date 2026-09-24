@@ -17,10 +17,11 @@ series+instance order -- falling back to today's send-everything
 behavior rather than leaving a study stuck forever.
 
 Reuses cr.py's generic helpers directly (group_by_accession,
-lock_group, mark_group_sent, mark_group_error, group_status,
-download_and_annotate, build_accession_page, _filename_safe,
-MAX_ATTEMPTS) since none of that logic is actually CR-specific despite
-living in cr.py -- duplicating it here would just be drift risk.
+lock_group, mark_group_sent, mark_group_error, download_and_annotate,
+build_accession_page, _filename_safe, MAX_ATTEMPTS) since none of that
+logic is actually CR-specific despite living in cr.py -- duplicating it
+here would just be drift risk. CT delivery status is handled per study
+so one StudyInstanceUID cannot suppress another within the accession.
 """
 
 import logging
@@ -327,10 +328,14 @@ def build_group_pdfs(orthanc, group, tmp_dir, magick_path, institution_name="", 
     if not page_paths:
         return []
 
-    patient_id = group[0]["patient_id"]
-    patient_name_safe = cr._filename_safe(group[0]["patient_name"])
-    study_date = group[0]["study"].get("MainDicomTags", {}).get("StudyDate", "")
-    full_path = os.path.join(tmp_dir, f"CT_{patient_name_safe}_{patient_id}_{study_date}.pdf")
+    accession = group[0]["accession"]
+    study = group[0]["study"]
+    study_desc = cr._filename_safe((study.get("MainDicomTags") or {}).get("StudyDescription", "STUDY"))
+    study_token = cr._filename_safe(group[0]["study_id"], max_len=16)
+    study_date = (study.get("MainDicomTags") or {}).get("StudyDate", "")
+    # One CT PDF is built per StudyInstanceUID. Accession is the outer
+    # transaction boundary; PatientID is never used as a grouping key.
+    full_path = os.path.join(tmp_dir, f"CT_{accession}_{study_desc}_{study_token}_{study_date}.pdf")
     for _, page_path, annotated in page_paths:
         cr.build_accession_page(annotated, page_path, magick_path, footer_text)
     full_size = _write_pdf(magick_path, [p for _, p, _ in page_paths], full_path)
@@ -341,7 +346,7 @@ def build_group_pdfs(orthanc, group, tmp_dir, magick_path, institution_name="", 
     log.warning("CT PDF is %.2f MB; splitting into series/chunk documents.", full_size / (1024 * 1024))
     split_paths = []
     for part, (series_id, page_path, annotated) in enumerate(page_paths, start=1):
-        base = os.path.join(tmp_dir, f"CT_{patient_name_safe}_{patient_id}_{study_date}_series_{part:02d}")
+        base = os.path.join(tmp_dir, f"CT_{accession}_{study_desc}_{study_token}_{study_date}_series_{part:02d}")
         split_paths.extend(_split_series_pdf(annotated, series_id, base, max_bytes, magick_path))
     return split_paths
 
@@ -394,68 +399,92 @@ def process_once(cfg, orthanc):
     for accession, group in groups.items():
         log_prefix = f"[CT Accession={accession}] "
 
-        status, attempts = cr.group_status(orthanc, group)
-        if status == "SENT":
-            log.info(log_prefix + "Already SENT. Skipping.")
-            continue
-        if status == "PROCESSING":
-            log.info(log_prefix + "Currently PROCESSING. Skipping.")
-            continue
-        if attempts >= cr.MAX_ATTEMPTS:
-            log.info(log_prefix + "Max attempts reached. Skipping.")
-            continue
-
-        not_ready = [m for m in group if not has_any_selection(orthanc, m["study"])]
-        if not_ready:
-            log.info(log_prefix + f"Waiting on operator selection for {len(not_ready)} study(s). Skipping for now.")
-            continue
-
-        accessions = sorted({m["accession"] for m in group})
-        log.info(log_prefix + f"Locking for processing. Accessions={accessions}")
-        cr.lock_group(orthanc, group, attempts, dry_run)
-
-        try:
-            pdf_paths = build_group_pdfs(orthanc, group, tmp_dir, magick_path, institution_name, cfg.get("institution", {}).get("footer_text", "SDRC Diagnostics | sdrc.in"))
-            if not pdf_paths:
-                raise RuntimeError("No pages generated for this group (no selected instances found).")
-
-            reqno = group[0]["accession"]
-            phone = core.fetch_phone_from_labit(
-                reqno, cfg["labit"]["base_url"], cfg["labit"]["dispatch_user"], cfg["labit"]["dispatch_password"]
+        # Accession remains the only outer boundary. Each StudyInstanceUID
+        # inside that accession has its own status and PDF, so one completed
+        # study can never suppress a sibling study.
+        pending = []
+        for member in group:
+            status = orthanc.get_metadata(
+                member["study_id"], "WhatsappStatus", "", raise_on_error=True
             )
-            if not phone:
-                phone = cfg["whatsapp"]["default_phone"]
-                log.warning(log_prefix + f"No phone from Labit, using default: {phone}")
+            attempts_raw = orthanc.get_metadata(
+                member["study_id"], "WhatsappAttempts", "0", raise_on_error=True
+            )
+            try:
+                attempts = int(attempts_raw or 0)
+            except (TypeError, ValueError):
+                attempts = 0
+            member["delivery_status"] = status
+            member["delivery_attempts"] = attempts
+            if status == "SENT":
+                log.info(
+                    "%sStudy=%s already SENT. Skipping.",
+                    log_prefix, member["study_id"],
+                )
+            elif status == "PROCESSING":
+                log.info(
+                    "%sStudy=%s currently PROCESSING. Skipping.",
+                    log_prefix, member["study_id"],
+                )
+            elif attempts >= cr.MAX_ATTEMPTS:
+                log.info(
+                    "%sStudy=%s max attempts reached. Skipping.",
+                    log_prefix, member["study_id"],
+                )
+            else:
+                pending.append(member)
 
-            remote_folder = group[0]["study_id"]
-            public_urls = []
-            for pdf_path in pdf_paths:
-                public_urls.append(core.upload_file_to_ftp(pdf_path, remote_folder, cfg["ftp"], dry_run=dry_run))
+        if not pending:
+            continue
 
-            for reqno_for_link in accessions:
+        pending = [m for m in pending if has_any_selection(orthanc, m["study"])]
+        if not pending:
+            log.info(log_prefix + "Waiting on operator selection for pending study(s). Skipping for now.")
+            continue
+
+        for member in pending:
+            study_desc = member.get("study_description") or (member["study"].get("MainDicomTags") or {}).get("StudyDescription", "")
+            study_prefix = f"{log_prefix}[Study={study_desc or member['study_id']}] "
+            cr.lock_group(orthanc, [member], member["delivery_attempts"], dry_run)
+            try:
+                pdf_paths = build_group_pdfs(
+                    orthanc, [member], tmp_dir, magick_path, institution_name,
+                    cfg.get("institution", {}).get("footer_text", "SDRC Diagnostics | sdrc.in"),
+                )
+                if not pdf_paths:
+                    raise RuntimeError("No pages generated for this study (no selected instances found).")
+
+                reqno = member["accession"]
+                phone = core.fetch_phone_from_labit(
+                    reqno, cfg["labit"]["base_url"], cfg["labit"]["dispatch_user"], cfg["labit"]["dispatch_password"]
+                )
+                if not phone:
+                    phone = cfg["whatsapp"]["default_phone"]
+                    log.warning(study_prefix + f"No phone from Labit, using default: {phone}")
+
+                public_urls = [
+                    core.upload_file_to_ftp(pdf_path, member["study_id"], cfg["ftp"], dry_run=dry_run)
+                    for pdf_path in pdf_paths
+                ]
                 try:
                     core.push_report_link_to_labit(
-                        reqno_for_link, public_urls, cfg["labit"]["base_url"], cfg["labit"]["internal_token"],
-                        dry_run=dry_run,
+                        reqno, public_urls, cfg["labit"]["base_url"], cfg["labit"]["internal_token"], dry_run=dry_run,
                     )
                 except Exception as exc:
-                    log.warning(log_prefix + f"push_report_link_to_labit failed for reqno={reqno_for_link}: {exc}")
+                    log.warning(study_prefix + f"push_report_link_to_labit failed: {exc}")
 
-            patient_name = group[0]["patient_name"] or "Patient"
-            for pdf_path, public_url in zip(pdf_paths, public_urls):
-                core.send_whatsapp_document(
-                    phone, patient_name, public_url, os.path.basename(pdf_path), cfg["whatsapp"], dry_run=dry_run
-                )
+                patient_name = member["patient_name"] or "Patient"
+                for pdf_path, public_url in zip(pdf_paths, public_urls):
+                    core.send_whatsapp_document(
+                        phone, patient_name, public_url, os.path.basename(pdf_path), cfg["whatsapp"], dry_run=dry_run
+                    )
 
-            # WhatsappPdfUrl is a single legacy dashboard field; retain the first
-            # link there while Core receives every split document above.
-            cr.mark_group_sent(orthanc, group, dry_run, public_urls, phone)
-            log.info(log_prefix + f"Sent {len(pdf_paths)} CT document(s). First PDF={pdf_paths[0]}")
-            sent_count += 1
-            time.sleep(1)
-
-        except Exception as exc:
-            log.exception(log_prefix + f"Failed: {exc}")
-            cr.mark_group_error(orthanc, group, dry_run)
+                cr.mark_group_sent(orthanc, [member], dry_run, public_urls, phone)
+                log.info(study_prefix + f"Sent {len(pdf_paths)} CT document(s). First PDF={pdf_paths[0]}")
+                sent_count += 1
+                time.sleep(1)
+            except Exception as exc:
+                log.exception(study_prefix + f"Failed: {exc}")
+                cr.mark_group_error(orthanc, [member], dry_run)
 
     return sent_count
