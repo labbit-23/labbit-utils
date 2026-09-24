@@ -210,13 +210,13 @@ def download_and_annotate_ct(orthanc, instance_id, tags, tmp_dir, magick_path, i
     cmd = [
         magick_path, raw_path,
         "-resize", "1600x1600>",
-        "-fill", "white", "-stroke", "none", "-pointsize", "20", "-interline-spacing", "2",
-        "-gravity", "NorthWest", "-annotate", "+18+18",
+        "-fill", "white", "-stroke", "none", "-pointsize", "14", "-interline-spacing", "1",
+        "-gravity", "NorthWest", "-annotate", "+10+10",
         f"{patient_name}\nPatient ID: {patient_id}\nAcc: {accession}",
-        "-gravity", "NorthEast", "-annotate", "+18+18",
+        "-gravity", "NorthEast", "-annotate", "+10+10",
         f"{timestamp}\nSex: {sex}\nSeries {series_no}",
-        "-pointsize", "18",
-        "-gravity", "SouthWest", "-annotate", "+18+18", f"Instance {instance_no}",
+        "-pointsize", "12",
+        "-gravity", "SouthWest", "-annotate", "+10+10", f"Instance {instance_no}",
         "-quality", "82", annotated_path,
     ]
     subprocess.run(cmd, check=True, capture_output=True)

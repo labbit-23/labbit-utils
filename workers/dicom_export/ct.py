@@ -53,6 +53,16 @@ FILM_LAYOUTS = {
 # per selected image. executor.map preserves the operator's image order.
 RENDER_WORKERS = 4
 
+# Portrait A4 at 150 DPI. CT film pages use the existing 6x4 convention:
+# six rows by four columns, with a fixed canvas regardless of image count or
+# source aspect ratio. Geometry preserves aspect ratio and centers each tile.
+CT_PAGE_WIDTH = 1240
+CT_PAGE_HEIGHT = 1754
+CT_GRID_ROWS = 6
+CT_GRID_COLS = 4
+CT_GRID_GAP = 8
+CT_FOOTER_RESERVE = 72
+
 
 def _annotate_one(orthanc, instance_id, tmp_dir, magick_path, institution_name):
     tags = orthanc.get_simplified_tags(instance_id)
@@ -71,9 +81,65 @@ def validate_film_layout(layout):
 
 
 
+def _ct_tile_geometry(rows, cols):
+    usable_width = CT_PAGE_WIDTH - 40 - (cols - 1) * CT_GRID_GAP
+    usable_height = CT_PAGE_HEIGHT - CT_FOOTER_RESERVE - 40 - (rows - 1) * CT_GRID_GAP
+    return f"{max(1, usable_width // cols)}x{max(1, usable_height // rows)}+{CT_GRID_GAP}+{CT_GRID_GAP}"
+
+
+def build_ct_page(annotated_paths, out_path, magick_path, footer_text="SDRC Diagnostics | sdrc.in",
+                  rows=CT_GRID_ROWS, cols=CT_GRID_COLS):
+    """Place CT images on a fixed portrait-A4 page using the selected grid.
+
+    This is CT-only. CR continues to use cr.build_accession_page and its
+    existing variable-size montage behavior. ImageMagick geometry fits each
+    image inside its tile without stretching or cropping.
+    """
+    if not annotated_paths:
+        raise ValueError("at least one CT image is required")
+    tile_geometry = _ct_tile_geometry(rows, cols)
+    montage = magick_path.replace("magick", "montage") if "magick" in magick_path else "montage"
+    montage_path = out_path + ".montage.jpg"
+    cmd = [montage, *annotated_paths, "-tile", f"{cols}x{rows}",
+           "-geometry", tile_geometry, "-background", "black", montage_path]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        subprocess.run([magick_path, "montage", *annotated_paths,
+                        "-tile", f"{cols}x{rows}", "-geometry", tile_geometry,
+                        "-background", "black", montage_path],
+                       check=True, capture_output=True)
+    # montage does not reliably honor a final canvas extent on all
+    # ImageMagick builds, so normalize it in a second step.
+    subprocess.run([magick_path, montage_path, "-background", "black", "-gravity", "center",
+                    "-extent", f"{CT_PAGE_WIDTH}x{CT_PAGE_HEIGHT}", out_path],
+                   check=True, capture_output=True)
+    try:
+        os.unlink(montage_path)
+    except FileNotFoundError:
+        pass
+    if footer_text:
+        subprocess.run([magick_path, out_path, "-gravity", "South", "-fill", "white",
+                        "-pointsize", "18", "-annotate", "+0+16", footer_text, out_path],
+                       check=True, capture_output=True)
+    return out_path
+
+
+def _render_ct_pages(annotated, output_dir, magick_path, footer_text, rows, cols, prefix):
+    page_paths = []
+    page_size = rows * cols
+    for index in range(0, len(annotated), page_size):
+        page_no = index // page_size + 1
+        page_path = os.path.join(output_dir, f"{prefix}_{page_no:02d}.jpg")
+        build_ct_page(annotated[index:index + page_size], page_path, magick_path,
+                      footer_text, rows, cols)
+        page_paths.append(page_path)
+    return page_paths
+
+
 def build_composer_raster(orthanc, study, selected_instance_ids, layout,
                           tmp_dir, magick_path, institution_name=""):
-    """Render the selected page as PNG bytes for PDF or gated DICOM Print."""
+    """Render the first fixed portrait-A4 CT film page as PNG bytes."""
     rows, cols = validate_film_layout(layout)
     selected = list(dict.fromkeys(selected_instance_ids or []))
     if not selected:
@@ -92,12 +158,8 @@ def build_composer_raster(orthanc, study, selected_instance_ids, layout,
                 selected,
             ))
         output = os.path.join(render_dir, "film.png")
-        montage = magick_path.replace("magick", "montage") if "magick" in magick_path else "montage"
-        cmd = [montage, *annotated, "-tile", f"{cols}x{rows}", "-geometry", "1200x900+8+8", "-background", "black", output]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            subprocess.run([magick_path, "montage", *annotated, "-tile", f"{cols}x{rows}", "-geometry", "1200x900+8+8", "-background", "black", output], check=True, capture_output=True)
+        build_ct_page(annotated[:rows * cols], output, magick_path,
+                      "SDRC Diagnostics | sdrc.in", rows, cols)
         with open(output, "rb") as handle:
             return handle.read()
     finally:
@@ -106,7 +168,7 @@ def build_composer_raster(orthanc, study, selected_instance_ids, layout,
 
 def build_composer_preview(orthanc, study, selected_instance_ids, layout,
                            tmp_dir, magick_path, institution_name=""):
-    """Render a temporary bounded film preview without changing send state."""
+    """Render fixed portrait-A4 CT preview pages without changing send state."""
     rows, cols = validate_film_layout(layout)
     selected = list(dict.fromkeys(selected_instance_ids or []))
     if not selected:
@@ -128,24 +190,15 @@ def build_composer_preview(orthanc, study, selected_instance_ids, layout,
                 lambda iid: _annotate_one(orthanc, iid, preview_dir, magick_path, institution_name),
                 selected,
             ))
-        page_path = os.path.join(preview_dir, "film.jpg")
-        montage = magick_path.replace("magick", "montage") if "magick" in magick_path else "montage"
-        cmd = [montage, *annotated, "-tile", f"{cols}x{rows}",
-               "-geometry", "1200x900+8+8", "-background", "black", page_path]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            subprocess.run([magick_path, "montage", *annotated, "-tile", f"{cols}x{rows}",
-                            "-geometry", "1200x900+8+8", "-background", "black", page_path],
-                           check=True, capture_output=True)
+        page_paths = _render_ct_pages(annotated, preview_dir, magick_path,
+                                      "SDRC Diagnostics | sdrc.in", rows, cols, "film")
         pdf_path = os.path.join(preview_dir, "film-preview.pdf")
-        subprocess.run([magick_path, "-density", "150", page_path, pdf_path],
+        subprocess.run([magick_path, "-density", "150", *page_paths, pdf_path],
                        check=True, capture_output=True)
         with open(pdf_path, "rb") as handle:
             return handle.read()
     finally:
         shutil.rmtree(preview_dir, ignore_errors=True)
-
 
 def find_todays_ct_studies(orthanc):
     today = datetime.now().strftime("%Y%m%d")
@@ -270,19 +323,14 @@ def _write_pdf(magick_path, image_paths, pdf_path):
     return os.path.getsize(pdf_path)
 
 
-def _split_series_pdf(annotated, series_id, base_path, max_bytes, magick_path):
+def _split_series_pdf(annotated, series_id, base_path, max_bytes, magick_path, footer_text="SDRC Diagnostics | sdrc.in"):
     """Return ordered PDFs for one series, subdividing only if necessary."""
     if not annotated:
         return []
     candidate = base_path + ".pdf"
     page = base_path + ".jpg"
-    # build_accession_page renames a single image into place; copy it here
-    # because the original annotated path may also be used by the first-pass
-    # full-study composition.
-    if len(annotated) == 1:
-        shutil.copy2(annotated[0], page)
-    else:
-        cr.build_accession_page(annotated, page, magick_path, footer_text)
+    # Keep the same fixed portrait-A4 CT page in the oversized-PDF fallback.
+    build_ct_page(annotated, page, magick_path, footer_text)
     size = _write_pdf(magick_path, [page], candidate)
     if size <= max_bytes:
         return [candidate]
@@ -291,8 +339,8 @@ def _split_series_pdf(annotated, series_id, base_path, max_bytes, magick_path):
             f"CT image in series {series_id} remains {size / (1024 * 1024):.2f} MB; refusing oversized WhatsApp document"
         )
     midpoint = len(annotated) // 2
-    left = _split_series_pdf(annotated[:midpoint], series_id, base_path + "_a", max_bytes, magick_path)
-    right = _split_series_pdf(annotated[midpoint:], series_id, base_path + "_b", max_bytes, magick_path)
+    left = _split_series_pdf(annotated[:midpoint], series_id, base_path + "_a", max_bytes, magick_path, footer_text)
+    right = _split_series_pdf(annotated[midpoint:], series_id, base_path + "_b", max_bytes, magick_path, footer_text)
     return left + right
 
 
@@ -322,8 +370,10 @@ def build_group_pdfs(orthanc, group, tmp_dir, magick_path, institution_name="", 
                 orthanc, instance_id, tags, tmp_dir, magick_path, institution_name
             ))
         if annotated:
-            page_path = os.path.join(tmp_dir, f"ct_series_{series_index:02d}_{series_id}.jpg")
-            page_paths.append((series_id, page_path, annotated))
+            for page_no, offset in enumerate(range(0, len(annotated), CT_GRID_ROWS * CT_GRID_COLS), start=1):
+                page_annotated = annotated[offset:offset + CT_GRID_ROWS * CT_GRID_COLS]
+                page_path = os.path.join(tmp_dir, f"ct_series_{series_index:02d}_{page_no:02d}_{series_id}.jpg")
+                page_paths.append((series_id, page_path, page_annotated))
 
     if not page_paths:
         return []
@@ -337,7 +387,7 @@ def build_group_pdfs(orthanc, group, tmp_dir, magick_path, institution_name="", 
     # transaction boundary; PatientID is never used as a grouping key.
     full_path = os.path.join(tmp_dir, f"CT_{accession}_{study_desc}_{study_token}_{study_date}.pdf")
     for _, page_path, annotated in page_paths:
-        cr.build_accession_page(annotated, page_path, magick_path, footer_text)
+        build_ct_page(annotated, page_path, magick_path, footer_text)
     full_size = _write_pdf(magick_path, [p for _, p, _ in page_paths], full_path)
     if full_size <= max_bytes:
         log.info("CT PDF is %.2f MB; sending as one document.", full_size / (1024 * 1024))
@@ -347,13 +397,13 @@ def build_group_pdfs(orthanc, group, tmp_dir, magick_path, institution_name="", 
     split_paths = []
     for part, (series_id, page_path, annotated) in enumerate(page_paths, start=1):
         base = os.path.join(tmp_dir, f"CT_{accession}_{study_desc}_{study_token}_{study_date}_series_{part:02d}")
-        split_paths.extend(_split_series_pdf(annotated, series_id, base, max_bytes, magick_path))
+        split_paths.extend(_split_series_pdf(annotated, series_id, base, max_bytes, magick_path, footer_text))
     return split_paths
 
 def process_once(cfg, orthanc):
     """
-    Mirrors cr.process_once()'s overall shape (group by patient-day, lock,
-    build, send, mark) with one key gating difference: a CT group is only
+    Mirrors cr.process_once()'s overall shape (group by accession, lock,
+    build, send, mark) with one key gating difference: a CT study is only
     eligible for processing once EVERY member study in it either (a) has
     at least one SelectedForReport value, or (b) has been auto-selected by
     the stale-study fallback above.
