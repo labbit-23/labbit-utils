@@ -16,7 +16,7 @@ settling (see auto_select_all_if_stale's docstring for exactly what
 series+instance order -- falling back to today's send-everything
 behavior rather than leaving a study stuck forever.
 
-Reuses cr.py's generic helpers directly (group_by_patient_and_date,
+Reuses cr.py's generic helpers directly (group_by_accession,
 lock_group, mark_group_sent, mark_group_error, group_status,
 download_and_annotate, build_accession_page, _filename_safe,
 MAX_ATTEMPTS) since none of that logic is actually CR-specific despite
@@ -26,9 +26,11 @@ living in cr.py -- duplicating it here would just be drift risk.
 import logging
 import os
 import subprocess
+import shutil
 import time
 import uuid
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 import core
@@ -45,6 +47,17 @@ FILM_LAYOUTS = {
     "4x4": (4, 4), "5x5": (5, 5), "5x6": (5, 6),
     "6x4": (6, 4), "6x6": (6, 6), "7x5": (7, 5),
 }
+
+# Keep remote CT rendering bounded while avoiding one serial Orthanc round-trip
+# per selected image. executor.map preserves the operator's image order.
+RENDER_WORKERS = 4
+
+
+def _annotate_one(orthanc, instance_id, tmp_dir, magick_path, institution_name):
+    tags = orthanc.get_simplified_tags(instance_id)
+    return cr.download_and_annotate_ct(
+        orthanc, instance_id, tags, tmp_dir, magick_path, institution_name
+    )
 
 
 def validate_film_layout(layout):
@@ -72,10 +85,11 @@ def build_composer_raster(orthanc, study, selected_instance_ids, layout,
     render_dir = os.path.join(os.path.abspath(tmp_dir), "composer-raster", uuid.uuid4().hex)
     os.makedirs(render_dir, exist_ok=True)
     try:
-        annotated = []
-        for instance_id in selected:
-            tags = orthanc.get_simplified_tags(instance_id)
-            annotated.append(cr.download_and_annotate(orthanc, instance_id, tags, render_dir, magick_path, institution_name))
+        with ThreadPoolExecutor(max_workers=RENDER_WORKERS) as pool:
+            annotated = list(pool.map(
+                lambda iid: _annotate_one(orthanc, iid, render_dir, magick_path, institution_name),
+                selected,
+            ))
         output = os.path.join(render_dir, "film.png")
         montage = magick_path.replace("magick", "montage") if "magick" in magick_path else "montage"
         cmd = [montage, *annotated, "-tile", f"{cols}x{rows}", "-geometry", "1200x900+8+8", "-background", "black", output]
@@ -108,11 +122,11 @@ def build_composer_preview(orthanc, study, selected_instance_ids, layout,
     preview_dir = os.path.join(os.path.abspath(tmp_dir), "composer-preview", uuid.uuid4().hex)
     os.makedirs(preview_dir, exist_ok=True)
     try:
-        annotated = []
-        for instance_id in selected:
-            tags = orthanc.get_simplified_tags(instance_id)
-            annotated.append(cr.download_and_annotate(
-                orthanc, instance_id, tags, preview_dir, magick_path, institution_name))
+        with ThreadPoolExecutor(max_workers=RENDER_WORKERS) as pool:
+            annotated = list(pool.map(
+                lambda iid: _annotate_one(orthanc, iid, preview_dir, magick_path, institution_name),
+                selected,
+            ))
         page_path = os.path.join(preview_dir, "film.jpg")
         montage = magick_path.replace("magick", "montage") if "magick" in magick_path else "montage"
         cmd = [montage, *annotated, "-tile", f"{cols}x{rows}",
@@ -138,18 +152,35 @@ def find_todays_ct_studies(orthanc):
     return study_ids or []
 
 
+def _dicom_int(value, default=10**9):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 def _study_series_instances(orthanc, study):
-    """Returns {series_id: [instance_id, ...]} for every CT series in a
-    study, instances in Orthanc's own (acquisition) order."""
-    result = {}
+    """Return CT series in SeriesNumber order and instances in InstanceNumber order."""
+    series_rows = []
     for series_id in study.get("Series", []):
         series = orthanc.get_series(series_id)
-        if (series.get("MainDicomTags") or {}).get("Modality") != "CT":
+        tags = series.get("MainDicomTags") or {}
+        if tags.get("Modality") != "CT":
             continue
-        result[series_id] = series.get("Instances", [])
-    return result
+        instance_rows = []
+        for instance_id in series.get("Instances", []):
+            instance_tags = orthanc.get_simplified_tags(instance_id)
+            instance_rows.append((
+                _dicom_int(instance_tags.get("InstanceNumber")), instance_id
+            ))
+        instance_rows.sort(key=lambda pair: (pair[0], pair[1]))
+        series_rows.append((
+            _dicom_int(tags.get("SeriesNumber")), series_id,
+            [instance_id for _, instance_id in instance_rows]
+        ))
+    series_rows.sort(key=lambda row: (row[0], row[1]))
+    return {series_id: instance_ids for _, series_id, instance_ids in series_rows}
 
-# --- selected an instance --------------------------------------------------
 def _selected_order(orthanc, instance_id):
     """Returns the operator-assigned order (int, >=1) for one instance, or
     0 if not selected. SelectedForReport is a plain string metadata value;
@@ -174,16 +205,11 @@ def has_any_selection(orthanc, study):
 
 
 def get_selected_instances_by_series(orthanc, study):
-    """Returns {series_id: [instance_id, ...]} containing only the SELECTED
-    instances of each series, ordered by their SelectedForReport value.
-    Series with zero selected instances are omitted entirely."""
+    """Return selected images in SeriesNumber/InstanceNumber ascending order.
+    SelectedForReport controls inclusion; DICOM numbering controls output order."""
     result = {}
     for series_id, instance_ids in _study_series_instances(orthanc, study).items():
-        ordered = sorted(
-            ((_selected_order(orthanc, iid), iid) for iid in instance_ids),
-            key=lambda pair: pair[0],
-        )
-        selected = [iid for order, iid in ordered if order > 0]
+        selected = [iid for iid in instance_ids if _selected_order(orthanc, iid) > 0]
         if selected:
             result[series_id] = selected
     return result
@@ -232,41 +258,92 @@ def auto_select_all_if_stale(orthanc, study, study_id, dry_run):
 
 
 # --- PDF building ------------------------------------------------------------
-def build_group_pdf(orthanc, group, tmp_dir, magick_path, institution_name=""):
-    """One PDF, one page per SERIES that has at least one selected
-    instance in this patient-day group (not one page per accession, since
-    a single CT study's selected images across all its series make up the
-    report here -- pagination is a presentation choice per series, not
-    per order). Images placed within a page in the operator's chosen
-    order."""
+def _is_scout_series(series):
+    tags = series.get("MainDicomTags") or {}
+    text = " ".join(str(tags.get(key) or "") for key in ("SeriesDescription", "ProtocolName", "SequenceName")).upper()
+    return any(token in text for token in ("SCOUT", "LOCALIZER", "TOPOGRAM"))
+
+
+def _write_pdf(magick_path, image_paths, pdf_path):
+    subprocess.run([magick_path, "-density", "150", *image_paths, pdf_path], check=True, capture_output=True)
+    return os.path.getsize(pdf_path)
+
+
+def _split_series_pdf(annotated, series_id, base_path, max_bytes, magick_path):
+    """Return ordered PDFs for one series, subdividing only if necessary."""
+    if not annotated:
+        return []
+    candidate = base_path + ".pdf"
+    page = base_path + ".jpg"
+    # build_accession_page renames a single image into place; copy it here
+    # because the original annotated path may also be used by the first-pass
+    # full-study composition.
+    if len(annotated) == 1:
+        shutil.copy2(annotated[0], page)
+    else:
+        cr.build_accession_page(annotated, page, magick_path, footer_text)
+    size = _write_pdf(magick_path, [page], candidate)
+    if size <= max_bytes:
+        return [candidate]
+    if len(annotated) == 1:
+        raise RuntimeError(
+            f"CT image in series {series_id} remains {size / (1024 * 1024):.2f} MB; refusing oversized WhatsApp document"
+        )
+    midpoint = len(annotated) // 2
+    left = _split_series_pdf(annotated[:midpoint], series_id, base_path + "_a", max_bytes, magick_path)
+    right = _split_series_pdf(annotated[midpoint:], series_id, base_path + "_b", max_bytes, magick_path)
+    return left + right
+
+
+def build_group_pdfs(orthanc, group, tmp_dir, magick_path, institution_name="", footer_text="SDRC Diagnostics | sdrc.in"):
+    """Build a CT PDF, splitting by series and then by image chunks if needed.
+
+    The relay bridge limit is 15 MB; keep a 14.8 MB safety cap per PDF.
+    """
+    max_bytes = int(14.8 * 1024 * 1024)
     page_paths = []
-    # Sort studies then series so page order is stable across runs.
+    series_images = []
     for member in sorted(group, key=lambda m: m["accession"]):
         study = member["study"]
         selected_by_series = get_selected_instances_by_series(orthanc, study)
-        for series_id, instance_ids in sorted(selected_by_series.items()):
-            annotated = []
-            for instance_id in instance_ids:
-                tags = orthanc.get_simplified_tags(instance_id)
-                annotated.append(
-                    cr.download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path, institution_name)
-                )
-            if not annotated:
-                continue
-            page_path = os.path.join(tmp_dir, f"page_{series_id}.jpg")
-            page_paths.append(cr.build_accession_page(annotated, page_path, magick_path))
+        for series_id, instance_ids in selected_by_series.items():
+            series = orthanc.get_series(series_id)
+            # Scout/localizer/topogram has a different aspect ratio and is a
+            # planning image. Keep it as its own page, in series order, so it
+            # is always page 1 when the scanner sends it first.
+            series_images.append((series_id, list(instance_ids)))
+
+    for series_index, (series_id, instance_ids) in enumerate(series_images, start=1):
+        annotated = []
+        for instance_id in instance_ids:
+            tags = orthanc.get_simplified_tags(instance_id)
+            annotated.append(cr.download_and_annotate_ct(
+                orthanc, instance_id, tags, tmp_dir, magick_path, institution_name
+            ))
+        if annotated:
+            page_path = os.path.join(tmp_dir, f"ct_series_{series_index:02d}_{series_id}.jpg")
+            page_paths.append((series_id, page_path, annotated))
 
     if not page_paths:
-        return None
+        return []
 
     patient_id = group[0]["patient_id"]
     patient_name_safe = cr._filename_safe(group[0]["patient_name"])
     study_date = group[0]["study"].get("MainDicomTags", {}).get("StudyDate", "")
-    pdf_path = os.path.join(tmp_dir, f"CT_{patient_name_safe}_{patient_id}_{study_date}.pdf")
-    cmd = [magick_path, "-density", "150", *page_paths, pdf_path]
-    subprocess.run(cmd, check=True, capture_output=True)
-    return pdf_path
+    full_path = os.path.join(tmp_dir, f"CT_{patient_name_safe}_{patient_id}_{study_date}.pdf")
+    for _, page_path, annotated in page_paths:
+        cr.build_accession_page(annotated, page_path, magick_path, footer_text)
+    full_size = _write_pdf(magick_path, [p for _, p, _ in page_paths], full_path)
+    if full_size <= max_bytes:
+        log.info("CT PDF is %.2f MB; sending as one document.", full_size / (1024 * 1024))
+        return [full_path]
 
+    log.warning("CT PDF is %.2f MB; splitting into series/chunk documents.", full_size / (1024 * 1024))
+    split_paths = []
+    for part, (series_id, page_path, annotated) in enumerate(page_paths, start=1):
+        base = os.path.join(tmp_dir, f"CT_{patient_name_safe}_{patient_id}_{study_date}_series_{part:02d}")
+        split_paths.extend(_split_series_pdf(annotated, series_id, base, max_bytes, magick_path))
+    return split_paths
 
 def process_once(cfg, orthanc):
     """
@@ -310,13 +387,12 @@ def process_once(cfg, orthanc):
             continue
         auto_select_all_if_stale(orthanc, study, study_id, dry_run)
 
-    groups = cr.group_by_patient_and_date(orthanc, study_ids)
-    log.info("Found %d CT studies in %d patient-day groups.", len(study_ids), len(groups))
+    groups = cr.group_by_accession(orthanc, study_ids)
+    log.info("Found %d CT studies in %d accession groups.", len(study_ids), len(groups))
 
     sent_count = 0
-    for key, group in groups.items():
-        patient_id, study_date = key
-        log_prefix = f"[CT Patient={patient_id} | Date={study_date}] "
+    for accession, group in groups.items():
+        log_prefix = f"[CT Accession={accession}] "
 
         status, attempts = cr.group_status(orthanc, group)
         if status == "SENT":
@@ -339,8 +415,8 @@ def process_once(cfg, orthanc):
         cr.lock_group(orthanc, group, attempts, dry_run)
 
         try:
-            pdf_path = build_group_pdf(orthanc, group, tmp_dir, magick_path, institution_name)
-            if not pdf_path:
+            pdf_paths = build_group_pdfs(orthanc, group, tmp_dir, magick_path, institution_name, cfg.get("institution", {}).get("footer_text", "SDRC Diagnostics | sdrc.in"))
+            if not pdf_paths:
                 raise RuntimeError("No pages generated for this group (no selected instances found).")
 
             reqno = group[0]["accession"]
@@ -352,24 +428,29 @@ def process_once(cfg, orthanc):
                 log.warning(log_prefix + f"No phone from Labit, using default: {phone}")
 
             remote_folder = group[0]["study_id"]
-            public_url = core.upload_file_to_ftp(pdf_path, remote_folder, cfg["ftp"], dry_run=dry_run)
+            public_urls = []
+            for pdf_path in pdf_paths:
+                public_urls.append(core.upload_file_to_ftp(pdf_path, remote_folder, cfg["ftp"], dry_run=dry_run))
 
             for reqno_for_link in accessions:
                 try:
                     core.push_report_link_to_labit(
-                        reqno_for_link, [public_url], cfg["labit"]["base_url"], cfg["labit"]["internal_token"],
+                        reqno_for_link, public_urls, cfg["labit"]["base_url"], cfg["labit"]["internal_token"],
                         dry_run=dry_run,
                     )
                 except Exception as exc:
                     log.warning(log_prefix + f"push_report_link_to_labit failed for reqno={reqno_for_link}: {exc}")
 
             patient_name = group[0]["patient_name"] or "Patient"
-            core.send_whatsapp_document(
-                phone, patient_name, public_url, os.path.basename(pdf_path), cfg["whatsapp"], dry_run=dry_run
-            )
+            for pdf_path, public_url in zip(pdf_paths, public_urls):
+                core.send_whatsapp_document(
+                    phone, patient_name, public_url, os.path.basename(pdf_path), cfg["whatsapp"], dry_run=dry_run
+                )
 
-            cr.mark_group_sent(orthanc, group, dry_run, public_url)
-            log.info(log_prefix + f"Sent. PDF={pdf_path} URL={public_url}")
+            # WhatsappPdfUrl is a single legacy dashboard field; retain the first
+            # link there while Core receives every split document above.
+            cr.mark_group_sent(orthanc, group, dry_run, public_urls, phone)
+            log.info(log_prefix + f"Sent {len(pdf_paths)} CT document(s). First PDF={pdf_paths[0]}")
             sent_count += 1
             time.sleep(1)
 

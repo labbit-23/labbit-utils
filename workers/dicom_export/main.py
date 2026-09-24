@@ -78,6 +78,20 @@ def _today_str():
     return datetime.now().strftime("%Y%m%d")
 
 
+def _poll_interval_seconds(cfg):
+    """Return 60s daytime polling and 30m overnight polling."""
+    worker = cfg.get("worker", {})
+    now = datetime.now().time()
+    overnight_start = datetime.strptime(
+        worker.get("overnight_start", "21:30"), "%H:%M"
+    ).time()
+    overnight_end = datetime.strptime(
+        worker.get("overnight_end", "07:00"), "%H:%M"
+    ).time()
+    overnight = now >= overnight_start or now < overnight_end
+    return int(worker.get("overnight_poll_seconds", 1800)) if overnight else int(worker["poll_seconds"])
+
+
 def _is_recent_date(date_str):
     """Matches the live dashboard's Mirth routing exactly: today OR
     yesterday always goes to the primary Orthanc, never the backup."""
@@ -121,6 +135,19 @@ def pick_orthanc_client(orthanc, orthanc_backup, source):
     return orthanc, "primary"
 
 
+def _metadata_pdf_urls(meta):
+    raw = meta.get("WhatsappPdfUrls") or meta.get("WhatsappPdfUrl", "")
+    try:
+        urls = json.loads(raw) if raw else []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        urls = []
+    if not isinstance(urls, list):
+        urls = []
+    urls = [str(url).strip() for url in urls if str(url).strip()]
+    if not urls and meta.get("WhatsappPdfUrl"):
+        urls = [str(meta["WhatsappPdfUrl"]).strip()]
+    return urls
+
 def _fetch_study_row(orthanc, study_id):
     """One study's worth of work for list_studies_for_date, split out so
     it can run in a thread pool -- each call is mostly Orthanc-side wait
@@ -147,6 +174,7 @@ def _fetch_study_row(orthanc, study_id):
     # One call for all 5 keys instead of 5 separate calls -- see
     # get_all_metadata's docstring.
     meta = orthanc.get_all_metadata(study_id)
+    pdf_urls = _metadata_pdf_urls(meta)
     return {
         "studyId": study_id,
         "accession": main_tags.get("AccessionNumber", ""),
@@ -155,7 +183,8 @@ def _fetch_study_row(orthanc, study_id):
         "status": meta.get("WhatsappStatus", ""),
         "attempts": meta.get("WhatsappAttempts", "0"),
         "timestamp": meta.get("WhatsappTimestamp", ""),
-        "pdfUrl": meta.get("WhatsappPdfUrl", ""),
+        "pdfUrl": pdf_urls[0] if pdf_urls else "",
+        "pdfUrls": _metadata_pdf_urls(meta),
         "modality": modality,
     }
 
@@ -180,19 +209,25 @@ def list_studies_for_date(orthanc, orthanc_backup, date_str):
     with ThreadPoolExecutor(max_workers=LIST_CONCURRENCY) as pool:
         results = list(pool.map(lambda sid: _fetch_study_row(client, sid), study_ids))
     rows = [row for row in results if row is not None]
+    rows.sort(key=lambda row: str(row.get("accession") or ""), reverse=True)
     for row in rows:
         row["source"] = source
     return rows
 
 
 def get_study_instances_payload(orthanc, study_id):
-    """CT selection UI's data source: every series/instance in a study,
-    each instance's current SelectedForReport order (0 = unselected)."""
+    """Return the CT picker payload in DICOM display order.
+
+    Orthanc does not guarantee that its arrays are ordered by DICOM
+    numbering, so the UI must receive SeriesNumber ASC and InstanceNumber
+    ASC explicitly.
+    """
     study = orthanc.get_study(study_id)
-    series_out = []
+    series_rows = []
     for series_id in study.get("Series", []):
         series = orthanc.get_series(series_id)
         tags = series.get("MainDicomTags") or {}
+
         def instance_payload(instance_id):
             order = ct._selected_order(orthanc, instance_id)
             try:
@@ -204,17 +239,21 @@ def get_study_instances_payload(orthanc, study_id):
 
         with ThreadPoolExecutor(max_workers=6) as pool:
             instances = list(pool.map(instance_payload, series.get("Instances", [])))
-        series_out.append(
+        instances.sort(key=lambda item: (ct._dicom_int(item["instanceNumber"]), item["instanceId"]))
+        series_rows.append((
+            ct._dicom_int(tags.get("SeriesNumber")),
+            series_id,
             {
                 "seriesId": series_id,
                 "seriesNumber": tags.get("SeriesNumber", ""),
                 "seriesDescription": tags.get("SeriesDescription", ""),
                 "modality": tags.get("Modality", ""),
                 "instances": instances,
-            }
-        )
-    return {"studyId": study_id, "series": series_out}
+            },
+        ))
 
+    series_rows.sort(key=lambda row: (row[0], row[1]))
+    return {"studyId": study_id, "series": [row[2] for row in series_rows]}
 
 def save_selection(orthanc, cfg, study_id, selected_instance_ids):
     """Writes SelectedForReport = 1-based position for every instance in
@@ -275,6 +314,9 @@ def make_handler(cfg, orthanc, orthanc_backup):
                 if data.get("action") == "LIST":
                     date_str = data.get("date") or datetime.now().strftime("%Y%m%d")
                     rows = list_studies_for_date(orthanc, orthanc_backup, date_str)
+                    requested_modality = str(data.get("modality") or "").strip().upper()
+                    if requested_modality:
+                        rows = [row for row in rows if str(row.get("modality") or "").upper() == requested_modality]
                     self._send_json(rows)
                     return
 
@@ -294,6 +336,9 @@ def make_handler(cfg, orthanc, orthanc_backup):
                         self._send_json({"error": "studyId is required"}, 400)
                         return
                     client, resolved_source = pick_orthanc_client(orthanc, orthanc_backup, data.get("source"))
+                    # A large CT study can legitimately take a while to read.
+                    # Do not convert a valid slow read into a browser fetch failure.
+                    client.timeout = None
                     payload = get_study_instances_payload(client, study_id)
                     # Echo back whichever source actually served this study --
                     # the frontend must pass this exact value on to every
@@ -309,6 +354,7 @@ def make_handler(cfg, orthanc, orthanc_backup):
                         self._send_json({"error": "studyId and selectedInstanceIds[] are required"}, 400)
                         return
                     client, _ = pick_orthanc_client(orthanc, orthanc_backup, data.get("source"))
+                    client.timeout = None
                     study = client.get_study(study_id)
                     body = ct.build_composer_preview(
                         client, study, selected, data.get("layout", "6x4"),
@@ -342,6 +388,7 @@ def make_handler(cfg, orthanc, orthanc_backup):
                         self._send_json({"error": "studyId and selectedInstanceIds[] are required"}, 400)
                         return
                     client, _ = pick_orthanc_client(orthanc, orthanc_backup, data.get("source"))
+                    client.timeout = None
                     self._send_json(save_selection(client, cfg, study_id, selected))
                     return
 
@@ -406,7 +453,7 @@ def run_http_server(cfg, orthanc, orthanc_backup):
 
 
 def run_poll_loop(cfg, orthanc):
-    poll_seconds = cfg["worker"]["poll_seconds"]
+    poll_seconds = _poll_interval_seconds(cfg)
     # CT has its OWN activation flag (cfg["ct"]["enabled"], default False),
     # deliberately separate from cfg["dry_run"]. Found live on 2026-09-17:
     # ct.process_once() was committed and wired into this loop unconditionally,
@@ -452,7 +499,9 @@ def run_poll_loop(cfg, orthanc):
             _worker_state["last_poll_ok"] = cycle_ok
             _worker_state["last_poll_error"] = cycle_error
 
-        time.sleep(poll_seconds)
+        next_poll_seconds = _poll_interval_seconds(cfg)
+        log.info("Next Orthanc poll in %ss.", next_poll_seconds)
+        time.sleep(next_poll_seconds)
 
 
 if __name__ == "__main__":
