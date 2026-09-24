@@ -31,7 +31,8 @@ def main():
     if m.get("enabled"):
         cwd = repo / "workers" / "radiology_mwl"
         flattened = []
-        for config in m.get("configs") or []:
+        for item in m.get("configs") or []:
+            config = item.get("config") if isinstance(item, dict) else item
             flattened.extend(["--config", str(repo / config)])
         apps.append(app(m.get("pm2_name", "mwl-all"), cwd, repo / m["entry"], flattened))
     r = manifest.get("services", {}).get("report_sender", {})

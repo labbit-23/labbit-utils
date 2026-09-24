@@ -1,0 +1,52 @@
+{
+  "dry_run": false,
+  "ct": {
+    "enabled": true
+  },
+  "institution": {
+    "name": "SDRC Diagnostics"
+  },
+  "orthanc": {
+    "base_url": "http://100.84.172.71:8042",
+    "user": "${LABBIT_ORTHANC_USER}",
+    "password": "${LABBIT_ORTHANC_PASSWORD}"
+  },
+  "orthanc_backup": {
+    "base_url": "http://100.100.21.90:8042",
+    "user": "${LABBIT_ORTHANC_BACKUP_USER}",
+    "password": "${LABBIT_ORTHANC_BACKUP_PASSWORD}"
+  },
+  "labit": {
+    "base_url": "https://labit.sdrc.in",
+    "dispatch_user": "${LABBIT_DISPATCH_USER}",
+    "dispatch_password": "${LABBIT_DISPATCH_PASSWORD}",
+    "internal_token": "${LABBIT_CORE_INTERNAL_TOKEN}"
+  },
+  "ftp": {
+    "host": "82.112.229.231",
+    "port": 21,
+    "user": "${LABBIT_FTP_USER}",
+    "password": "${LABBIT_FTP_PASSWORD}",
+    "base_dir": "domains/sdrc.in/public_html/dicom_exports",
+    "public_base_url": "https://files.sdrc.in"
+  },
+  "whatsapp": {
+    "api_url": "https://messaginghub.solutions/relaybridge/api/v1/meta/6943ce50a4ceedfb72e30519/messages",
+    "api_key": "${LABBIT_WHATSAPP_API_KEY}",
+    "template_pdf": "dicom_pdf",
+    "default_phone": "9849025601"
+  },
+  "http": {
+    "port": 8086
+  },
+  "worker": {
+    "poll_seconds": 60,
+    "log_level": "INFO",
+    "log_dir": "./logs",
+    "magick_path": "/usr/local/bin/magick",
+    "tmp_dir": "./tmp",
+    "overnight_poll_seconds": 1800,
+    "overnight_start": "21:30",
+    "overnight_end": "07:00"
+  }
+}

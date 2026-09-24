@@ -44,12 +44,17 @@ def main():
         check(errors, cfg.get("entry"), name + ".entry")
         if name != "mwl":
             check(errors, cfg.get("config"), name + ".config")
+            check(errors, cfg.get("template"), name + ".template")
         else:
             configs = cfg.get("configs") or []
             if not configs:
                 errors.append("mwl.configs: must contain at least one config")
-            for i, config in enumerate(configs):
-                check(errors, config, "mwl.configs[" + str(i) + "]")
+            for i, item in enumerate(configs):
+                if isinstance(item, dict):
+                    check(errors, item.get("config"), "mwl.configs[" + str(i) + "].config")
+                    check(errors, item.get("template"), "mwl.configs[" + str(i) + "].template")
+                else:
+                    check(errors, item, "mwl.configs[" + str(i) + "]")
     state = manifest.get("state", {})
     if state.get("backup_required") and not state.get("paths"):
         errors.append("state.paths must be listed when backup_required is true")

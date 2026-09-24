@@ -57,6 +57,8 @@ if [[ "$INSTALL_DEPS" == true ]]; then
 fi
 
 if [[ "$RENDER" == true || "$APPLY_PM2" == true ]]; then
+  [[ -n "$SECRETS" ]] || { echo "--render/--apply-pm2 requires --secrets" >&2; exit 3; }
+  python3 "$ROOT/deploy/render_configs.py" --manifest "$MANIFEST" --secrets "$SECRETS"
   python3 "$ROOT/deploy/render_pm2.py" --manifest "$MANIFEST" --output "$PM2_OUTPUT"
   echo "[recover] PM2 ecosystem: $PM2_OUTPUT"
 fi

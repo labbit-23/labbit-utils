@@ -1,0 +1,57 @@
+{
+  "source": {
+    "poll_url": "https://labit.sdrc.in/machine-api/mwl?department_name=cardiology",
+    "poll_method": "GET",
+    "poll_headers": {
+      "X-Api-Key-Id": "${LABBIT_CORE_API_KEY_ID}",
+      "X-Api-Secret": "${LABBIT_CORE_API_SECRET}"
+    },
+    "poll_timeout_seconds": 20,
+    "items_path": "items",
+    "performed_field": "performed",
+    "pending_value": false,
+    "id_field": "reqid",
+    "scheduled_date_field": "reqdt",
+    "scheduled_time_field": "reqtm",
+    "test_code_allowlist": [
+      "2DE",
+      "2DEC"
+    ]
+  },
+  "destination": {
+    "aet": "ESAOTE",
+    "host": "100.84.172.71",
+    "port": 4242
+  },
+  "mwl": {
+    "create_url": "http://100.84.172.71:8042/mwl-bridge/upload",
+    "create_method": "POST",
+    "create_headers": {
+      "Authorization": "${LABBIT_MWL_BRIDGE_AUTH}"
+    },
+    "timeout_seconds": 20,
+    "transport": "json_base64",
+    "outbox_dir": "./outbox",
+    "payload_fields": {
+      "accession_number": "accession_no",
+      "patient_id": "mrn",
+      "patient_name": "patient_name",
+      "patient_sex": "patient_sex",
+      "patient_dob": "patient_dob",
+      "modality": "modality",
+      "requested_procedure_description": "procedure_name"
+    },
+    "defaults": {
+      "modality": "US",
+      "institution_name": "SDRC",
+      "requested_procedure_description": "CARDIOLOGY",
+      "scheduled_step_description": "CARDIOLOGY"
+    }
+  },
+  "worker": {
+    "poll_seconds": 15,
+    "batch_size": 50,
+    "log_level": "INFO",
+    "state_db_path": "./state/radiology_cardiology_state.sqlite3"
+  }
+}

@@ -10,6 +10,9 @@
 
     sudo install -d -m 750 /etc/labbit-utils
     sudo install -m 600 /secure-backup/labbit.env /etc/labbit-utils/labbit.env
+    scp /secure-backup/labbit.env new-host:/tmp/labbit.env
+
+The exact file to preserve separately is `/etc/labbit-utils/labbit.env`. It is not committed. The existing encrypted backup stream now includes this path. Keep a copy in the encrypted recovery archive and transfer it separately when rebuilding.
 
 Use the variables listed in deploy/secrets.env.example. Never put passwords in git.
 

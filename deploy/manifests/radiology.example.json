@@ -9,7 +9,8 @@
       "config": "workers/dicom_export/config/dicom_export.json",
       "pm2_name": "dicom-export-cr",
       "entry": "workers/dicom_export/main.py",
-      "requirements": "workers/dicom_export/requirements.txt"
+      "requirements": "workers/dicom_export/requirements.txt",
+      "template": "deploy/templates/dicom_export.json.template"
     },
     "mwl": {
       "enabled": true,
@@ -17,15 +18,25 @@
       "entry": "workers/radiology_mwl/mwl_supervisor.py",
       "requirements": "workers/radiology_mwl/requirements.txt",
       "configs": [
-        "workers/radiology_mwl/config/mwl_worker_xray.json",
-        "workers/radiology_mwl/config/mwl_worker_usg.json",
-        "workers/radiology_mwl/config/mwl_worker_cardiology.json"
+        {
+          "template": "deploy/templates/mwl_worker_xray.json.template",
+          "config": "workers/radiology_mwl/config/mwl_worker_xray.json"
+        },
+        {
+          "template": "deploy/templates/mwl_worker_usg.json.template",
+          "config": "workers/radiology_mwl/config/mwl_worker_usg.json"
+        },
+        {
+          "template": "deploy/templates/mwl_worker_cardiology.json.template",
+          "config": "workers/radiology_mwl/config/mwl_worker_cardiology.json"
+        }
       ]
     },
     "report_sender": {
       "enabled": false,
       "config": "workers/report_sender/config/report_sender.json",
-      "requirements": "workers/report_sender/requirements.txt"
+      "requirements": "workers/report_sender/requirements.txt",
+      "template": "deploy/templates/report_sender.json.template"
     }
   },
   "state": {

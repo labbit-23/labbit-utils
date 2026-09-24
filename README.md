@@ -25,4 +25,4 @@ Each utility lives in its own folder with its own README, requirements, example 
 
 Use `config/*.example.json` as the committed template. Machine-specific `config/*.json` files are ignored because they contain credentials and endpoints. Do not add live passwords, API keys, Basic-auth headers, patient data, rendered images, PDFs, SQLite state, or logs to git.
 
-The current repository still has several runtime JSON files on the production PC. They are the effective configuration today, but they are not yet generated from one canonical machine manifest. That central deployment layer is a follow-up task; until it exists, changes must be made against the worker's live config and recorded in deployment notes.
+The committed `deploy/templates/*.json.template` files now contain `${VAR}` placeholders. `deploy/render_configs.py` reads `/etc/labbit-utils/labbit.env` (outside git) and writes the ignored live JSON files. The generated JSON is what the workers read.

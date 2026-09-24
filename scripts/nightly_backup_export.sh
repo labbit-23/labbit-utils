@@ -29,4 +29,5 @@ tar --ignore-failed-read -czf - \
   labbit-py/services.vps.ini \
   integrations/mirth/labit/.mirth.env \
   integrations/mirth/LABIT_DISPATCH_CREDENTIALS.env \
+  /etc/labbit-utils/labbit.env \
   2>/dev/null
