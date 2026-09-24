@@ -225,9 +225,9 @@ def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, outp
         raise ValueError("at least one image must be selected")
     page_width, page_height = 14 * 72, 17 * 72
     render_dpi = 150
-    margin, gap, footer = 18, 6, 48
+    margin, gap, header = 18, 6, 52
     cell_width = (page_width - 2 * margin - (cols - 1) * gap) / cols
-    cell_height = (page_height - 2 * margin - footer - (rows - 1) * gap) / rows
+    cell_height = (page_height - 2 * margin - header - (rows - 1) * gap) / rows
     cell_pixel_width = int(cell_width * render_dpi / 72)
     cell_pixel_height = int(cell_height * render_dpi / 72)
 
@@ -246,7 +246,7 @@ def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, outp
         for pos, (_iid, tags, png_bytes) in enumerate(fetched[page_start:page_start + rows * cols]):
             row, col = divmod(pos, cols)
             x = margin + col * (cell_width + gap)
-            y = page_height - margin - footer - (row + 1) * cell_height - row * gap
+            y = page_height - margin - header - (row + 1) * cell_height - row * gap
             with Image.open(io.BytesIO(png_bytes)) as image:
                 image = image.convert("RGB")
                 source_w, source_h = image.size
@@ -267,7 +267,9 @@ def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, outp
             sex = tags.get("PatientSex") or "—"
             series_no = tags.get("SeriesNumber") or "—"
             instance_no = tags.get("InstanceNumber") or "—"
-            pdf.setFillColorRGB(1, 1, 1)
+            # Metadata is deliberately lighter than the SDRC header so it
+            # stays readable without visually competing with the anatomy.
+            pdf.setFillColorRGB(0.78, 0.78, 0.78)
             pdf.setFont("Helvetica", 7.2)
             pdf.drawString(x + 5, y + cell_height - 12, patient_name[:32])
             pdf.drawString(x + 5, y + cell_height - 22, f"Patient ID: {patient_id}"[:32])
@@ -279,10 +281,11 @@ def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, outp
             pdf.drawString(x + 5, y + 6, f"Instance {instance_no}")
 
         pdf.setFillColorRGB(1, 1, 1)
-        pdf.setFont("Helvetica", 13)
-        pdf.drawCentredString(page_width / 2, 17, "SDRC Diagnostics | sdrc.in")
         if logo_path and os.path.exists(logo_path):
-            pdf.drawImage(logo_path, margin, 8, width=78, height=28.5, preserveAspectRatio=True, mask="auto")
+            pdf.drawImage(logo_path, margin, page_height - margin - 30,
+                          width=82, height=30, preserveAspectRatio=True, mask="auto")
+        pdf.setFont("Helvetica-Bold", 16)
+        pdf.drawString(margin + 96, page_height - margin - 19, "SDRC Diagnostics")
         pdf.showPage()
     pdf.save()
     return output_path
