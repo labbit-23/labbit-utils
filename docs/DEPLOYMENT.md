@@ -14,7 +14,7 @@ Confirm the target process and config path before editing. Do not restart Mirth 
 
 ## Current PM2 model
 
-The DICOM export service is one PM2 process for CR and CT. MWL is being moved from three PM2 entries to one supervisor process:
+The DICOM export service is one PM2 process for CR and CT. MWL now runs as one supervisor process:
 
 ```bash
 cd /opt/labbit-utils/workers/radiology_mwl
@@ -26,15 +26,12 @@ cd /opt/labbit-utils/workers/radiology_mwl
 
 Each config remains independent and keeps its own state database, outbox, source filter, destination AET, and routing overrides. One process does not merge the worklists; it only reduces process-management overhead.
 
-Before the live cutover, inspect the current entries:
+The cutover is complete. Verify the single entry with:
 
 ```bash
-pm2 describe mwl-xray
-pm2 describe mwl-usg
-pm2 describe mwl-cardiology
+pm2 describe mwl-all
+pm2 logs mwl-all --lines 80
 ```
-
-The cutover should be controlled: stop the three old entries, start the one supervisor, confirm all three loop-start messages and successful bridge activity, then save the PM2 state. Keep the old PM2 definitions available for rollback until the supervisor has been observed through a normal polling interval.
 
 ## Validation checklist
 

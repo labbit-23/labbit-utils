@@ -24,9 +24,7 @@ Verified on this PC:
 | PM2 name | Role | Code/config | Status |
 |---|---|---|---|
 | `dicom-export-cr` | DICOM dashboard API, CR/X-ray and CT rendering/delivery | `workers/dicom_export/main.py` | online |
-| `mwl-xray` | Radiography MWL poller/uploader | `radiology_mwl_worker.py` + `mwl_worker_xray.json` | online |
-| `mwl-usg` | Sonology/US MWL poller/uploader and station overrides | same worker + `mwl_worker_usg.json` | online |
-| `mwl-cardiology` | Cardiology MWL poller/uploader | same worker + `mwl_worker_cardiology.json` | online |
+| `mwl-all` | One supervisor process running the X-ray, USG, and cardiology MWL loops | `mwl_supervisor.py` + the three modality JSON files | online |
 
 Other PM2 applications on the PC are outside this repository, including `sdrc-dexa-app`, `sysmex-bridge`, `sdrc-collector-api`, `labbit-monitoring-local`, `erpnext`, and `zk-panel`.
 
@@ -63,7 +61,7 @@ The main operational risk is that upstream credentials and routing facts are rep
 | CR/X-ray export | Orthanc studies | PDF/file relay and WhatsApp path | shared `dicom-export-cr` |
 | CT export | Orthanc studies | PDF/file relay and WhatsApp path | shared `dicom-export-cr` |
 
-The MWL loops are being consolidated under one supervisor process; each keeps its own JSON config and SQLite state. The CT MWL configuration is disabled/not part of the current live map.
+The MWL loops now run under one supervisor process; each keeps its own JSON config and SQLite state. The CT MWL configuration is disabled/not part of the current live map.
 
 ## Security and data handling
 
