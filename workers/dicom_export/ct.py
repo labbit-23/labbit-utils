@@ -208,7 +208,7 @@ def build_composer_preview(orthanc, study, selected_instance_ids, layout,
         shutil.rmtree(preview_dir, ignore_errors=True)
 
 
-def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, output_path):
+def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, output_path, logo_path=None):
     """Render a trial CT PDF with raster images and selectable vector labels.
 
     This intentionally remains separate from the live ImageMagick path until
@@ -224,9 +224,12 @@ def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, outp
     if not selected:
         raise ValueError("at least one image must be selected")
     page_width, page_height = 14 * 72, 17 * 72
-    margin, gap, footer = 18, 6, 34
+    render_dpi = 150
+    margin, gap, footer = 18, 6, 48
     cell_width = (page_width - 2 * margin - (cols - 1) * gap) / cols
     cell_height = (page_height - 2 * margin - footer - (rows - 1) * gap) / rows
+    cell_pixel_width = int(cell_width * render_dpi / 72)
+    cell_pixel_height = int(cell_height * render_dpi / 72)
 
     def fetch(iid):
         tags = orthanc.get_simplified_tags(iid)
@@ -247,11 +250,12 @@ def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, outp
             with Image.open(io.BytesIO(png_bytes)) as image:
                 image = image.convert("RGB")
                 source_w, source_h = image.size
-                image.thumbnail((int(cell_width), int(cell_height)), Image.Resampling.LANCZOS)
+                image.thumbnail((cell_pixel_width, cell_pixel_height), Image.Resampling.LANCZOS)
                 image_buffer = io.BytesIO()
-                image.save(image_buffer, format="JPEG", quality=90, optimize=True)
+                image.save(image_buffer, format="JPEG", quality=95, optimize=True, subsampling=0)
                 image_buffer.seek(0)
-                draw_w, draw_h = image.size
+                draw_w = image.width * 72 / render_dpi
+                draw_h = image.height * 72 / render_dpi
             draw_x = x + (cell_width - draw_w) / 2
             draw_y = y + (cell_height - draw_h) / 2
             pdf.drawImage(ImageReader(image_buffer), draw_x, draw_y, draw_w, draw_h, mask="auto")
@@ -264,19 +268,21 @@ def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, outp
             series_no = tags.get("SeriesNumber") or "—"
             instance_no = tags.get("InstanceNumber") or "—"
             pdf.setFillColorRGB(1, 1, 1)
-            pdf.setFont("Helvetica", 8.5)
+            pdf.setFont("Helvetica", 7.2)
             pdf.drawString(x + 5, y + cell_height - 12, patient_name[:32])
             pdf.drawString(x + 5, y + cell_height - 22, f"Patient ID: {patient_id}"[:32])
             pdf.drawString(x + 5, y + cell_height - 32, f"Acc: {accession}"[:32])
             pdf.drawRightString(x + cell_width - 5, y + cell_height - 12, timestamp[:24])
             pdf.drawRightString(x + cell_width - 5, y + cell_height - 22, f"Sex: {sex}")
             pdf.drawRightString(x + cell_width - 5, y + cell_height - 32, f"Series {series_no}")
-            pdf.setFont("Helvetica", 8)
+            pdf.setFont("Helvetica", 6.8)
             pdf.drawString(x + 5, y + 6, f"Instance {instance_no}")
 
         pdf.setFillColorRGB(1, 1, 1)
-        pdf.setFont("Helvetica", 9)
-        pdf.drawCentredString(page_width / 2, 12, "SDRC Diagnostics | sdrc.in")
+        pdf.setFont("Helvetica", 13)
+        pdf.drawCentredString(page_width / 2, 17, "SDRC Diagnostics | sdrc.in")
+        if logo_path and os.path.exists(logo_path):
+            pdf.drawImage(logo_path, margin, 8, width=78, height=28.5, preserveAspectRatio=True, mask="auto")
         pdf.showPage()
     pdf.save()
     return output_path
