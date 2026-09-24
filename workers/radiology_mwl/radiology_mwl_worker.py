@@ -261,11 +261,26 @@ class MWLWorker:
         performed_field = source.get("performed_field", "performed")
         pending_value = source.get("pending_value", 0)
         batch_size = int(self.cfg.get("worker", {}).get("batch_size", 50))
+        # Optional allow-list: when set, only rows whose test_code is in this
+        # list are pushed to MWL at all -- everything else from this source
+        # is skipped entirely (not routed elsewhere, just not an imaging
+        # study a DICOM worklist should carry). Useful for a department that
+        # mixes imaging and non-imaging test types, e.g. cardiology (2DE /
+        # 2DEC need MWL; a plain ECG or standalone TMT does not).
+        allowlist = source.get("test_code_allowlist")
+        allowlist_upper = (
+            {str(c).strip().upper() for c in allowlist} if allowlist else None
+        )
 
         pending = []
         for row in rows:
-            if get_path(row, performed_field) == pending_value:
-                pending.append(row)
+            if get_path(row, performed_field) != pending_value:
+                continue
+            if allowlist_upper is not None:
+                row_test_code = str(row.get("test_code") or "").strip().upper()
+                if row_test_code not in allowlist_upper:
+                    continue
+            pending.append(row)
             if len(pending) >= batch_size:
                 break
         return pending
@@ -324,11 +339,18 @@ class MWLWorker:
         type rather than by a fixed one-instance-per-machine assignment --
         e.g. sonology: general dopplers/sonology can be performed on any
         registered US machine, but cardiology dopplers always go to one
-        fixed machine. Configure via mwl.station_overrides:
-        [{"keyword": "CARDIOLOGY", "aet": "ESAOTE"}]. No match (or no
-        overrides configured) -> blank ScheduledStationAETitle, so any
-        machine that queries can pick up the study, matching the
-        destination.aet default behavior for single-machine departments.
+        fixed machine. Configure via mwl.station_overrides, matching on
+        either (or both):
+        - "test_code": exact, case-insensitive match against the source
+          row's own test_code (precise -- use this when you know the real
+          code, e.g. [{"test_code": "2DE", "aet": "ESAOTE"}] for 2-D Echo).
+        - "keyword": case-insensitive substring match against the resolved
+          procedure description (looser, useful when there's no stable
+          code to key off, e.g. [{"keyword": "CARDIOLOGY", "aet": "ESAOTE"}]).
+        First matching override wins. No match (or no overrides configured)
+        -> blank ScheduledStationAETitle, so any machine that queries can
+        pick up the study, matching the destination.aet default behavior
+        for single-machine departments.
         """
         overrides = self.cfg.get("mwl", {}).get("station_overrides", []) or []
         procedure_text = str(
@@ -336,7 +358,12 @@ class MWLWorker:
             or payload.get("scheduled_step_description")
             or ""
         ).upper()
+        raw_row = payload.get("raw") or {}
+        test_code = str(raw_row.get("test_code") or "").strip().upper()
         for override in overrides:
+            override_code = str(override.get("test_code", "")).strip().upper()
+            if override_code and test_code and override_code == test_code:
+                return str(override.get("aet", "")).strip()
             keyword = str(override.get("keyword", "")).upper()
             if keyword and keyword in procedure_text:
                 return str(override.get("aet", "")).strip()
