@@ -206,7 +206,7 @@ def download_and_annotate_ct(orthanc, instance_id, tags, tmp_dir, magick_path, i
     series_no = tags.get("SeriesNumber", "") or "—"
     instance_no = tags.get("InstanceNumber", "") or "—"
 
-    annotated_path = os.path.join(tmp_dir, f"{instance_id}_annotated.jpg")
+    annotated_path = os.path.join(tmp_dir, f"{instance_id}_annotated.png")
     cmd = [
         magick_path, raw_path,
         "-resize", "1600x1600>",
@@ -217,7 +217,7 @@ def download_and_annotate_ct(orthanc, instance_id, tags, tmp_dir, magick_path, i
         f"{timestamp}\nSex: {sex}\nSeries {series_no}",
         "-pointsize", "12",
         "-gravity", "SouthWest", "-annotate", "+10+10", f"Instance {instance_no}",
-        "-quality", "82", annotated_path,
+        annotated_path,
     ]
     subprocess.run(cmd, check=True, capture_output=True)
     return annotated_path

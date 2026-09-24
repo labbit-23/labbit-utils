@@ -99,7 +99,7 @@ def build_ct_page(annotated_paths, out_path, magick_path, footer_text="SDRC Diag
         raise ValueError("at least one CT image is required")
     tile_geometry = _ct_tile_geometry(rows, cols)
     montage = magick_path.replace("magick", "montage") if "magick" in magick_path else "montage"
-    montage_path = out_path + ".montage.jpg"
+    montage_path = out_path + ".montage.png"
     cmd = [montage, *annotated_paths, "-tile", f"{cols}x{rows}",
            "-geometry", tile_geometry, "-background", "black", montage_path]
     try:
@@ -111,9 +111,14 @@ def build_ct_page(annotated_paths, out_path, magick_path, footer_text="SDRC Diag
                        check=True, capture_output=True)
     # montage does not reliably honor a final canvas extent on all
     # ImageMagick builds, so normalize it in a second step.
-    subprocess.run([magick_path, montage_path, "-background", "black", "-gravity", "center",
-                    "-extent", f"{CT_PAGE_WIDTH}x{CT_PAGE_HEIGHT}", out_path],
-                   check=True, capture_output=True)
+    final_cmd = [magick_path, montage_path, "-background", "black", "-gravity", "center",
+                 "-extent", f"{CT_PAGE_WIDTH}x{CT_PAGE_HEIGHT}"]
+    # Keep the final page compact, but only compress once after all fitting
+    # and annotation work is complete. Composer PNG output remains lossless.
+    if out_path.lower().endswith((".jpg", ".jpeg")):
+        final_cmd.extend(["-quality", "94"])
+    final_cmd.append(out_path)
+    subprocess.run(final_cmd, check=True, capture_output=True)
     try:
         os.unlink(montage_path)
     except FileNotFoundError:
