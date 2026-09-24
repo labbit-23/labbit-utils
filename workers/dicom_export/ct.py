@@ -53,11 +53,12 @@ FILM_LAYOUTS = {
 # per selected image. executor.map preserves the operator's image order.
 RENDER_WORKERS = 4
 
-# Portrait A4 at 150 DPI. CT film pages use the existing 6x4 convention:
-# six rows by four columns, with a fixed canvas regardless of image count or
-# source aspect ratio. Geometry preserves aspect ratio and centers each tile.
-CT_PAGE_WIDTH = 1240
-CT_PAGE_HEIGHT = 1754
+# Portrait 14x17 film at 150 DPI. CT pages use the existing 6x4
+# convention: six rows by four columns, with a fixed canvas regardless of
+# image count or source aspect ratio. Geometry preserves aspect ratio and
+# centers each tile.
+CT_PAGE_WIDTH = 2100
+CT_PAGE_HEIGHT = 2550
 CT_GRID_ROWS = 6
 CT_GRID_COLS = 4
 CT_GRID_GAP = 8
@@ -89,7 +90,7 @@ def _ct_tile_geometry(rows, cols):
 
 def build_ct_page(annotated_paths, out_path, magick_path, footer_text="SDRC Diagnostics | sdrc.in",
                   rows=CT_GRID_ROWS, cols=CT_GRID_COLS):
-    """Place CT images on a fixed portrait-A4 page using the selected grid.
+    """Place CT images on a fixed portrait 14x17 page using the selected grid.
 
     This is CT-only. CR continues to use cr.build_accession_page and its
     existing variable-size montage behavior. ImageMagick geometry fits each
@@ -144,7 +145,7 @@ def _render_ct_pages(annotated, output_dir, magick_path, footer_text, rows, cols
 
 def build_composer_raster(orthanc, study, selected_instance_ids, layout,
                           tmp_dir, magick_path, institution_name=""):
-    """Render the first fixed portrait-A4 CT film page as PNG bytes."""
+    """Render the first fixed portrait 14x17 CT film page as PNG bytes."""
     rows, cols = validate_film_layout(layout)
     selected = list(dict.fromkeys(selected_instance_ids or []))
     if not selected:
@@ -173,7 +174,7 @@ def build_composer_raster(orthanc, study, selected_instance_ids, layout,
 
 def build_composer_preview(orthanc, study, selected_instance_ids, layout,
                            tmp_dir, magick_path, institution_name=""):
-    """Render fixed portrait-A4 CT preview pages without changing send state."""
+    """Render fixed portrait 14x17 CT preview pages without changing send state."""
     rows, cols = validate_film_layout(layout)
     selected = list(dict.fromkeys(selected_instance_ids or []))
     if not selected:
@@ -334,7 +335,7 @@ def _split_series_pdf(annotated, series_id, base_path, max_bytes, magick_path, f
         return []
     candidate = base_path + ".pdf"
     page = base_path + ".jpg"
-    # Keep the same fixed portrait-A4 CT page in the oversized-PDF fallback.
+    # Keep the same fixed portrait 14x17 CT page in the oversized-PDF fallback.
     build_ct_page(annotated, page, magick_path, footer_text)
     size = _write_pdf(magick_path, [page], candidate)
     if size <= max_bytes:
