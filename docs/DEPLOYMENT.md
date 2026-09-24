@@ -50,6 +50,6 @@ Commit source, tests, documentation, safe example templates, and non-secret depl
 
 ## Known deployment limitation
 
-Configuration is not yet centralized. A new machine currently requires manually placing each worker's local JSON, creating virtual environments, and creating PM2 entries with the correct working directory and config argument. The next deployment task should add a non-secret machine manifest, a root-owned secret/env file outside git, config rendering and validation, a PM2 ecosystem definition, a dry-run doctor command, and targeted restart/rollback behavior.
+Configuration is not yet centralized. A new machine currently requires manually placing each worker's local JSON, creating virtual environments, and creating PM2 entries with the correct working directory and config argument. The selectable manifest and read-only doctor now exist under `deploy/`. The next deployment task is config rendering, secrets injection, PM2 installation, state restore, and targeted restart/rollback behavior.
 
 Until that exists, document each live config change in the commit message or handoff and preserve the previous local config before restarting.

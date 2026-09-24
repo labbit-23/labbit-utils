@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "lab_id": "replace-me",
+  "repo_dir": "/opt/labbit-utils",
+  "profile": "minimal",
+  "services": {
+    "dicom_export": { "enabled": false },
+    "mwl": { "enabled": false },
+    "report_sender": { "enabled": false }
+  },
+  "state": { "backup_required": false, "paths": [] }
+}

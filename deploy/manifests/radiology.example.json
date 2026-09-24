@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "lab_id": "replace-me",
+  "repo_dir": "/opt/labbit-utils",
+  "profile": "radiology",
+  "services": {
+    "dicom_export": {
+      "enabled": true,
+      "config": "workers/dicom_export/config/dicom_export.json",
+      "pm2_name": "dicom-export-cr",
+      "entry": "workers/dicom_export/main.py",
+      "requirements": "workers/dicom_export/requirements.txt"
+    },
+    "mwl": {
+      "enabled": true,
+      "pm2_name": "mwl-all",
+      "entry": "workers/radiology_mwl/mwl_supervisor.py",
+      "requirements": "workers/radiology_mwl/requirements.txt",
+      "configs": [
+        "workers/radiology_mwl/config/mwl_worker_xray.json",
+        "workers/radiology_mwl/config/mwl_worker_usg.json",
+        "workers/radiology_mwl/config/mwl_worker_cardiology.json"
+      ]
+    },
+    "report_sender": {
+      "enabled": false,
+      "config": "workers/report_sender/config/report_sender.json",
+      "requirements": "workers/report_sender/requirements.txt"
+    }
+  },
+  "state": {
+    "backup_required": true,
+    "paths": [
+      "workers/radiology_mwl/state",
+      "workers/radiology_mwl/outbox"
+    ]
+  }
+}

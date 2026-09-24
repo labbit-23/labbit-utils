@@ -6,6 +6,7 @@ Operational Python workers used by the SDRC/Labit integration layer. This reposi
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — current live topology and process map.
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — deployment, validation, and recovery notes.
+- [deploy/README.md](deploy/README.md) — selectable lab profiles and recovery tooling.
 - [workers/dicom_export/README.md](workers/dicom_export/README.md) — CR/CT export worker.
 - [workers/radiology_mwl/README.md](workers/radiology_mwl/README.md) — MWL worker.
 - [workers/report_sender/README.md](workers/report_sender/README.md) — report sender workers.
