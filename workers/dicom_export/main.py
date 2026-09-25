@@ -148,6 +148,32 @@ def _metadata_pdf_urls(meta):
         urls = [str(meta["WhatsappPdfUrl"]).strip()]
     return urls
 
+def _study_description_for_row(orthanc, study, main_tags):
+    """Return the best human-readable exam name for the dashboard row.
+
+    CR feeds often leave StudyDescription blank while putting the exam name
+    on the first series. Patient identity is not involved in this fallback.
+    """
+    candidates = [
+        main_tags.get("StudyDescription"),
+        main_tags.get("ProtocolName"),
+        main_tags.get("BodyPartExamined"),
+    ]
+    for value in candidates:
+        if str(value or "").strip():
+            return str(value).strip()
+    for series_id in study.get("Series", []):
+        try:
+            tags = orthanc.get_series(series_id).get("MainDicomTags") or {}
+        except Exception as exc:
+            log.debug("LIST: could not read series %s for study name: %s", series_id, exc)
+            continue
+        for key in ("SeriesDescription", "ProtocolName", "BodyPartExamined", "AcquisitionDeviceProcessingDescription"):
+            value = str(tags.get(key) or "").replace("^", " ").strip()
+            if value:
+                return value
+    return ""
+
 def _fetch_study_row(orthanc, study_id):
     """One study's worth of work for list_studies_for_date, split out so
     it can run in a thread pool -- each call is mostly Orthanc-side wait
@@ -178,7 +204,7 @@ def _fetch_study_row(orthanc, study_id):
     return {
         "studyId": study_id,
         "accession": main_tags.get("AccessionNumber", ""),
-        "studyDescription": main_tags.get("StudyDescription", ""),
+        "studyDescription": _study_description_for_row(orthanc, study, main_tags),
         "patientName": (patient_tags.get("PatientName") or "").replace("^", " ").strip(),
         "phone": meta.get("WhatsappPhone", ""),
         "status": meta.get("WhatsappStatus", ""),
@@ -463,6 +489,7 @@ def run_poll_loop(cfg, orthanc):
     # silently activated real CT sends too, with no explicit approval step of
     # its own. CT must never again be able to piggyback on CR's dry_run state.
     ct_enabled = cfg.get("ct", {}).get("enabled", False)
+    morning_recovery_date = None
     log.info(
         "Starting export poll loop. poll_seconds=%s dry_run=%s ct_enabled=%s",
         poll_seconds, cfg["dry_run"], ct_enabled,
@@ -483,6 +510,27 @@ def run_poll_loop(cfg, orthanc):
             log.exception("CR poll loop error: %s", exc)
             cycle_ok = False
             cycle_error = f"CR: {exc}"
+        # Once per calendar day, after the first successful daytime CR
+        # Orthanc poll, recover yesterday's unsent CR studies. This avoids
+        # loading yesterday on every 60-second cycle while still catching
+        # orders created before an overnight Orthanc/network interruption.
+        now = datetime.now()
+        today_key = now.strftime("%Y%m%d")
+        morning_start = datetime.strptime("07:00", "%H:%M").time()
+        if cycle_ok and now.time() >= morning_start and morning_recovery_date != today_key:
+            yesterday_key = (now - timedelta(days=1)).strftime("%Y%m%d")
+            try:
+                sent = cr.process_once(cfg, orthanc, study_date=yesterday_key)
+                log.info("Completed once-daily yesterday CR recovery for %s; sent=%d.", yesterday_key, sent)
+                morning_recovery_date = today_key
+                if sent:
+                    with _state_lock:
+                        _worker_state["cr_sent_total"] += sent
+            except Exception as exc:
+                log.exception("Yesterday CR recovery failed: %s", exc)
+                cycle_ok = False
+                cycle_error = (cycle_error + " | " if cycle_error else "") + f"CR yesterday: {exc}"
+
         if ct_enabled:
             try:
                 sent = ct.process_once(cfg, orthanc)

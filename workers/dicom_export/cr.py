@@ -34,10 +34,13 @@ def _filename_safe(text, max_len=40):
 MAX_ATTEMPTS = 3
 
 
-def find_todays_cr_studies(orthanc):
-    today = datetime.now().strftime("%Y%m%d")
-    study_ids = orthanc.find_studies({"StudyDate": today, "ModalitiesInStudy": "CR"})
+def find_cr_studies(orthanc, study_date):
+    study_ids = orthanc.find_studies({"StudyDate": study_date, "ModalitiesInStudy": "CR"})
     return study_ids or []
+
+
+def find_todays_cr_studies(orthanc):
+    return find_cr_studies(orthanc, datetime.now().strftime("%Y%m%d"))
 
 
 def group_by_accession(orthanc, study_ids):
@@ -363,16 +366,17 @@ def build_group_pdf(orthanc, group, tmp_dir, magick_path, institution_name=""):
     return pdf_path
 
 
-def process_once(cfg, orthanc):
+def process_once(cfg, orthanc, study_date=None):
     dry_run = cfg["dry_run"]
     tmp_dir = os.path.abspath(cfg["worker"]["tmp_dir"])
     os.makedirs(tmp_dir, exist_ok=True)
     magick_path = cfg["worker"]["magick_path"]
     institution_name = cfg.get("institution", {}).get("name", "")
 
-    study_ids = find_todays_cr_studies(orthanc)
+    study_date = study_date or datetime.now().strftime("%Y%m%d")
+    study_ids = find_cr_studies(orthanc, study_date)
     if not study_ids:
-        log.info("No CR studies found today.")
+        log.info("No CR studies found for %s.", study_date)
         return 0
 
     groups = group_by_accession(orthanc, study_ids)
