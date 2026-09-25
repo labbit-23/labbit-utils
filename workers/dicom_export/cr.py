@@ -516,22 +516,39 @@ def manual_send(cfg, orthanc, accession, phone):
 
     log.info(log_prefix + f"StudyId={study_id} Phone={phone} (manual override, bypassing status/attempts gate)")
 
-    annotated = build_accession_annotated_images(orthanc, study, tmp_dir, magick_path, institution_name)
-    if not annotated:
-        raise RuntimeError(f"No CR instances found for accession={accession}")
-
-    page_path = os.path.join(tmp_dir, f"page_{accession}.jpg")
-    build_accession_page(annotated, page_path, magick_path)
-
-    patient_name_safe = _filename_safe(patient_name)
-    pdf_path = os.path.join(tmp_dir, f"CR_MANUAL_{patient_name_safe}_{accession}.pdf")
-    subprocess.run([magick_path, "-density", "150", page_path, pdf_path], check=True, capture_output=True)
+    group_member = {
+        "study_id": study_id,
+        "accession": accession,
+        "patient_id": (patient_tags.get("PatientID") or ""),
+        "patient_name": patient_name,
+        "study": study,
+    }
+    group = [group_member]
+    single_image_path = build_single_image(
+        orthanc, group, tmp_dir, magick_path, institution_name
+    )
+    if single_image_path:
+        media_path = single_image_path
+    else:
+        annotated = build_accession_annotated_images(
+            orthanc, study, tmp_dir, magick_path, institution_name
+        )
+        if not annotated:
+            raise RuntimeError(f"No CR instances found for accession={accession}")
+        page_path = os.path.join(tmp_dir, f"page_{accession}.jpg")
+        build_accession_page(annotated, page_path, magick_path)
+        patient_name_safe = _filename_safe(patient_name)
+        media_path = os.path.join(tmp_dir, f"CR_MANUAL_{patient_name_safe}_{accession}.pdf")
+        subprocess.run(
+            [magick_path, "-density", "150", page_path, media_path],
+            check=True, capture_output=True
+        )
 
     effective_phone = phone or core.fetch_phone_from_labit(
         accession, cfg["labit"]["base_url"], cfg["labit"]["dispatch_user"], cfg["labit"]["dispatch_password"]
     ) or cfg["whatsapp"]["default_phone"]
 
-    public_url = core.upload_file_to_ftp(pdf_path, study_id, cfg["ftp"], dry_run=dry_run)
+    public_url = core.upload_file_to_ftp(media_path, study_id, cfg["ftp"], dry_run=dry_run)
 
     try:
         core.push_report_link_to_labit(
@@ -540,9 +557,17 @@ def manual_send(cfg, orthanc, accession, phone):
     except Exception as exc:
         log.warning(log_prefix + f"push_report_link_to_labit failed: {exc}")
 
-    core.send_whatsapp_document(
-        effective_phone, patient_name, public_url, os.path.basename(pdf_path), cfg["whatsapp"], dry_run=dry_run
-    )
+    if single_image_path:
+        core.send_whatsapp_image(
+            effective_phone, patient_name, public_url, cfg["whatsapp"], dry_run=dry_run
+        )
+        media_label = "Image"
+    else:
+        core.send_whatsapp_document(
+            effective_phone, patient_name, public_url, os.path.basename(media_path),
+            cfg["whatsapp"], dry_run=dry_run
+        )
+        media_label = "PDF"
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     orthanc.put_metadata(study_id, "WhatsappStatus", "SENT", dry_run=dry_run)
@@ -550,5 +575,5 @@ def manual_send(cfg, orthanc, accession, phone):
     if public_url:
         orthanc.put_metadata(study_id, "WhatsappPdfUrl", public_url, dry_run=dry_run)
 
-    log.info(log_prefix + f"Manual send complete. PDF={pdf_path} URL={public_url}")
+    log.info(log_prefix + f"Manual send complete. {media_label}={media_path} URL={public_url}")
     return {"ok": True, "studyId": study_id, "publicUrl": public_url, "phone": effective_phone}
