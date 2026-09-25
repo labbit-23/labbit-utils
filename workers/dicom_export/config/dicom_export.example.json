@@ -34,6 +34,7 @@
     "api_url": "CHANGEME",
     "api_key": "CHANGEME",
     "template_pdf": "dicom_pdf",
+    "template_image": "dicom_images",
     "default_phone": "CHANGEME"
   },
   "http": {

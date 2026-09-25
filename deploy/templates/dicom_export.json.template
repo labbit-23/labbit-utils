@@ -34,6 +34,7 @@
     "api_url": "https://messaginghub.solutions/relaybridge/api/v1/meta/6943ce50a4ceedfb72e30519/messages",
     "api_key": "${LABBIT_WHATSAPP_API_KEY}",
     "template_pdf": "dicom_pdf",
+    "template_image": "dicom_images",
     "default_phone": "9849025601"
   },
   "http": {

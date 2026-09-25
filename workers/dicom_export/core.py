@@ -384,3 +384,45 @@ def send_whatsapp_document(phone, patient_name, public_url, filename, wa_cfg, dr
     if not messages or not messages[0].get("id"):
         raise RuntimeError(f"WhatsApp send failed: {body}")
     return messages[0]["id"]
+
+
+def send_whatsapp_image(phone, patient_name, public_url, wa_cfg, dry_run=True):
+    """Send one rendered CR image through the image-header template."""
+    template_name = wa_cfg.get("template_image", "dicom_images")
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": phone,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": "en"},
+            "components": [
+                {
+                    "type": "header",
+                    "parameters": [{"type": "image", "image": {"link": public_url}}],
+                },
+                {"type": "body", "parameters": [{"type": "text", "text": patient_name}]},
+            ],
+        },
+    }
+
+    if dry_run:
+        log.info("[DRY_RUN] would send WhatsApp image to %s: %s", phone, payload)
+        return "DRY_RUN_MESSAGE_ID"
+
+    resp = requests.post(
+        wa_cfg["api_url"],
+        headers={"Content-Type": "application/json", "X-API-KEY": wa_cfg["api_key"]},
+        json=payload,
+        timeout=30,
+    )
+    body = resp.text
+    log.info("WHATSAPP_SENT | Phone=%s | Template=%s | Media=image | Response=%s",
+             phone, template_name, body)
+    resp.raise_for_status()
+    data = resp.json()
+    messages = data.get("messages") or []
+    if not messages or not messages[0].get("id"):
+        raise RuntimeError(f"WhatsApp image send failed: {body}")
+    return messages[0]["id"]

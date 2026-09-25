@@ -366,6 +366,28 @@ def build_group_pdf(orthanc, group, tmp_dir, magick_path, institution_name=""):
     return pdf_path
 
 
+def build_single_image(orthanc, group, tmp_dir, magick_path, institution_name=""):
+    """Return the annotated JPG only when the accession contains one CR image."""
+    image_instance = None
+    image_tags = None
+    for member in group:
+        for series_id in member["study"].get("Series", []):
+            series = orthanc.get_series(series_id)
+            if (series.get("MainDicomTags") or {}).get("Modality") != "CR":
+                continue
+            instance_ids = series.get("Instances", [])
+            if len(instance_ids) != 1 or image_instance is not None:
+                return None
+            image_instance = instance_ids[0]
+            image_tags = orthanc.get_simplified_tags(image_instance)
+
+    if not image_instance:
+        return None
+    return download_and_annotate(
+        orthanc, image_instance, image_tags, tmp_dir, magick_path, institution_name
+    )
+
+
 def process_once(cfg, orthanc, study_date=None):
     dry_run = cfg["dry_run"]
     tmp_dir = os.path.abspath(cfg["worker"]["tmp_dir"])
@@ -410,8 +432,13 @@ def process_once(cfg, orthanc, study_date=None):
         lock_group(orthanc, group, attempts, dry_run)
 
         try:
-            pdf_path = build_group_pdf(orthanc, group, tmp_dir, magick_path, institution_name)
-            if not pdf_path:
+            single_image_path = build_single_image(
+                orthanc, group, tmp_dir, magick_path, institution_name
+            )
+            media_path = single_image_path or build_group_pdf(
+                orthanc, group, tmp_dir, magick_path, institution_name
+            )
+            if not media_path:
                 raise RuntimeError("No pages generated for this group.")
 
             reqno = group[0]["accession"]  # phone lookup keyed off any one accession in the visit
@@ -423,7 +450,7 @@ def process_once(cfg, orthanc, study_date=None):
                 log.warning(log_prefix + f"No phone from Labit, using default: {phone}")
 
             remote_folder = group[0]["study_id"]  # matches Mirth's studyId-as-folder convention
-            public_url = core.upload_file_to_ftp(pdf_path, remote_folder, cfg["ftp"], dry_run=dry_run)
+            public_url = core.upload_file_to_ftp(media_path, remote_folder, cfg["ftp"], dry_run=dry_run)
 
             # Link-only push to Labit Core -- one PDF can cover multiple
             # accessions in this group (same patient/day), so push the
@@ -440,12 +467,20 @@ def process_once(cfg, orthanc, study_date=None):
                     log.warning(log_prefix + f"push_report_link_to_labit failed for reqno={reqno_for_link}: {exc}")
 
             patient_name = group[0]["patient_name"] or "Patient"
-            core.send_whatsapp_document(
-                phone, patient_name, public_url, os.path.basename(pdf_path), cfg["whatsapp"], dry_run=dry_run
-            )
+            if single_image_path:
+                core.send_whatsapp_image(
+                    phone, patient_name, public_url, cfg["whatsapp"], dry_run=dry_run
+                )
+                media_label = "Image"
+            else:
+                core.send_whatsapp_document(
+                    phone, patient_name, public_url, os.path.basename(media_path),
+                    cfg["whatsapp"], dry_run=dry_run
+                )
+                media_label = "PDF"
 
             mark_group_sent(orthanc, group, dry_run, public_url, phone)
-            log.info(log_prefix + f"Sent. PDF={pdf_path} URL={public_url}")
+            log.info(log_prefix + f"Sent. {media_label}={media_path} URL={public_url}")
             sent_count += 1
             time.sleep(1)
 
