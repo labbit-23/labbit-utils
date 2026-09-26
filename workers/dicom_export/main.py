@@ -100,6 +100,13 @@ def _is_recent_date(date_str):
     return date_str in (today.strftime("%Y%m%d"), yesterday.strftime("%Y%m%d"))
 
 
+_LIST_REQUESTED_TAGS = [
+    "ModalitiesInStudy",
+    "NumberOfStudyRelatedInstances",
+    "NumberOfStudyRelatedSeries",
+]
+
+
 def _resolve_studies_for_date(orthanc, orthanc_backup, date_str):
     """Picks which Orthanc serves a given date's LIST query, and returns the
     studyIds from that call in the same pass (avoids querying twice, same
@@ -114,15 +121,24 @@ def _resolve_studies_for_date(orthanc, orthanc_backup, date_str):
     not re-derive it from the date, since an old date can still resolve to
     primary when the backup comes up empty."""
     if _is_recent_date(date_str) or orthanc_backup is None:
-        return orthanc, "primary", (orthanc.find_studies({"StudyDate": date_str}) or [])
+        return orthanc, "primary", (orthanc.find_studies(
+            {"StudyDate": date_str}, expand=True,
+            requested_tags=_LIST_REQUESTED_TAGS,
+        ) or [])
     try:
-        backup_ids = orthanc_backup.find_studies({"StudyDate": date_str}) or []
+        backup_ids = orthanc_backup.find_studies(
+            {"StudyDate": date_str}, expand=True,
+            requested_tags=_LIST_REQUESTED_TAGS,
+        ) or []
     except Exception as exc:
         log.warning("Backup Orthanc unreachable for date=%s, using primary: %s", date_str, exc)
         backup_ids = []
     if backup_ids:
         return orthanc_backup, "backup", backup_ids
-    return orthanc, "primary", (orthanc.find_studies({"StudyDate": date_str}) or [])
+    return orthanc, "primary", (orthanc.find_studies(
+        {"StudyDate": date_str}, expand=True,
+        requested_tags=_LIST_REQUESTED_TAGS,
+    ) or [])
 
 
 def pick_orthanc_client(orthanc, orthanc_backup, source):
@@ -174,20 +190,23 @@ def _study_description_for_row(orthanc, study, main_tags):
                 return value
     return ""
 
-def _fetch_study_row(orthanc, study_id):
+def _fetch_study_row(orthanc, study_or_id):
     """One study's worth of work for list_studies_for_date, split out so
     it can run in a thread pool -- each call is mostly Orthanc-side wait
     time (I/O), not CPU work here, so threads (not async) are a fine fit.
     Returns None if the study couldn't be fetched (logged, skipped)."""
-    try:
-        # requestedTags=ModalitiesInStudy gets modality in this same call
-        # -- replaces a per-series lookup loop that was the single
-        # biggest cost per study (confirmed live: ~600ms for a 2-series
-        # study, since /series/{id} returns each series' full Instances
-        # array just to read one Modality field).
-        study = orthanc.get_study(study_id, requested_tags=["ModalitiesInStudy"])
-    except Exception as exc:
-        log.warning("LIST: could not fetch study %s: %s", study_id, exc)
+    if isinstance(study_or_id, dict):
+        study = study_or_id
+        study_id = study.get("ID", "")
+    else:
+        study_id = study_or_id
+        try:
+            study = orthanc.get_study(study_id, requested_tags=["ModalitiesInStudy"])
+        except Exception as exc:
+            log.warning("LIST: could not fetch study %s: %s", study_id, exc)
+            return None
+    if not study_id:
+        log.warning("LIST: expanded Orthanc row had no study ID: %r", study)
         return None
     main_tags = study.get("MainDicomTags") or {}
     patient_tags = study.get("PatientMainDicomTags") or {}
@@ -230,11 +249,11 @@ def list_studies_for_date(orthanc, orthanc_backup, date_str):
     OrthancClient) is documented thread-safe for concurrent calls, so one
     shared client across the pool is the correct/standard approach here,
     not a separate client per thread."""
-    client, source, study_ids = _resolve_studies_for_date(orthanc, orthanc_backup, date_str)
-    if not study_ids:
+    client, source, study_rows = _resolve_studies_for_date(orthanc, orthanc_backup, date_str)
+    if not study_rows:
         return []
     with ThreadPoolExecutor(max_workers=LIST_CONCURRENCY) as pool:
-        results = list(pool.map(lambda sid: _fetch_study_row(client, sid), study_ids))
+        results = list(pool.map(lambda row: _fetch_study_row(client, row), study_rows))
     rows = [row for row in results if row is not None]
     rows.sort(key=lambda row: str(row.get("accession") or ""), reverse=True)
     for row in rows:

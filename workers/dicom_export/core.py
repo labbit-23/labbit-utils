@@ -189,8 +189,14 @@ class OrthancClient:
     def get_simplified_tags(self, instance_id):
         return self.get_json(f"/instances/{instance_id}/simplified-tags")
 
-    def find_studies(self, query):
-        return self.post_json("/tools/find", {"Level": "Study", "Query": query})
+    def find_studies(self, query, expand=False, requested_tags=None):
+        """Find studies, optionally returning expanded study rows."""
+        body = {"Level": "Study", "Query": query}
+        if expand:
+            body["Expand"] = True
+        if requested_tags:
+            body["RequestedTags"] = list(requested_tags)
+        return self.post_json("/tools/find", body)
 
     def get_study(self, study_id, requested_tags=None):
         """requested_tags (e.g. ["ModalitiesInStudy"]) asks Orthanc to
