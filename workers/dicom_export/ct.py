@@ -264,8 +264,9 @@ def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, outp
             patient_name = (tags.get("PatientName") or "").replace("^", " ").strip()
             patient_id = tags.get("PatientID") or ""
             accession = tags.get("AccessionNumber") or ""
-            timestamp = f"{tags.get('StudyDate', '')} {tags.get('StudyTime', '')}".strip()
+            timestamp = cr._dicom_timestamp(tags.get('StudyDate'), tags.get('StudyTime'))
             sex = tags.get("PatientSex") or "—"
+            age = cr._dicom_age(tags.get('PatientBirthDate'), tags.get('StudyDate'))
             series_no = tags.get("SeriesNumber") or "—"
             instance_no = tags.get("InstanceNumber") or "—"
             # Metadata is deliberately lighter than the SDRC header so it
@@ -276,7 +277,7 @@ def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, outp
             pdf.drawString(x + 5, y + cell_height - 22, f"Patient ID: {patient_id}"[:32])
             pdf.drawString(x + 5, y + cell_height - 32, f"Acc: {accession}"[:32])
             pdf.drawRightString(x + cell_width - 5, y + cell_height - 12, timestamp[:24])
-            pdf.drawRightString(x + cell_width - 5, y + cell_height - 22, f"Sex: {sex}")
+            pdf.drawRightString(x + cell_width - 5, y + cell_height - 22, f"Sex: {sex} | Age: {age}")
             pdf.drawRightString(x + cell_width - 5, y + cell_height - 32, f"Series {series_no}")
             pdf.setFont("Helvetica", 6.8)
             pdf.drawString(x + 5, y + 6, f"Instance {instance_no}")

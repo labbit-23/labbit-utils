@@ -34,6 +34,36 @@ def _filename_safe(text, max_len=40):
 MAX_ATTEMPTS = 3
 
 
+def _dicom_age(birth_date, study_date):
+    """Return age in years at the study date; never expose the DOB itself."""
+    try:
+        birth = datetime.strptime(str(birth_date)[:8], "%Y%m%d").date()
+        studied = datetime.strptime(str(study_date)[:8], "%Y%m%d").date()
+    except (TypeError, ValueError):
+        return "—"
+    years = studied.year - birth.year - ((studied.month, studied.day) < (birth.month, birth.day))
+    return f"{max(0, years)}Y"
+
+
+def _dicom_timestamp(study_date, study_time):
+    """Format DICOM DA/TM as a readable date/time, retaining milliseconds."""
+    date = str(study_date or "")
+    tm = str(study_time or "")
+    if len(tm) < 6:
+        return f"{date} {tm}".strip()
+    clock = f"{tm[:2]}:{tm[2:4]}:{tm[4:6]}"
+    if len(tm) > 7 and tm[6] == ".":
+        clock += "." + tm[7:]
+    return f"{date} {clock}".strip()
+
+# Orthanc can expose a study as soon as its first series is indexed. Keep the
+# first unsent observation in memory for one complete poll cycle, then fetch
+# the study again before locking/sending. This prevents a multi-series CR
+# accession from being sent through the single-image shortcut while the
+# remaining series is still being indexed.
+_pending_settle = set()
+
+
 def find_cr_studies(orthanc, study_date):
     study_ids = orthanc.find_studies({"StudyDate": study_date, "ModalitiesInStudy": "CR"})
     return study_ids or []
@@ -147,7 +177,7 @@ def download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path, inst
         f.write(png_bytes)
 
     patient_name = (tags.get("PatientName") or "").replace("^", " ")
-    age_sex = f"{tags.get('PatientBirthDate', '')} | {tags.get('PatientSex', '')}"
+    age_sex = f"Age: {_dicom_age(tags.get('PatientBirthDate'), tags.get('StudyDate'))} | {tags.get('PatientSex', '')}"
     patient_id = tags.get("PatientID", "")
     accession = tags.get("AccessionNumber", "")
     study_date = tags.get("StudyDate", "")
@@ -179,7 +209,7 @@ def download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path, inst
         "-splice", "0x60",
         "-fill", "white",
         "-pointsize", "22",
-        "-annotate", "+0+8", f"{patient_name}  |  ID: {patient_id}  |  {age_sex}  |  Acc: {accession}  |  {study_date} {study_time}  |  {study_desc}",
+        "-annotate", "+0+8", f"{patient_name}  |  ID: {patient_id}  |  {age_sex}  |  Acc: {accession}  |  {_dicom_timestamp(study_date, study_time)}  |  {study_desc}",
         "-gravity", "South",
         "-background", "black",
         "-splice", "0x50",
@@ -205,7 +235,8 @@ def download_and_annotate_ct(orthanc, instance_id, tags, tmp_dir, magick_path, i
     patient_id = tags.get("PatientID", "")
     accession = tags.get("AccessionNumber", "")
     sex = tags.get("PatientSex", "") or "—"
-    timestamp = f"{tags.get('StudyDate', '')} {tags.get('StudyTime', '')}".strip()
+    timestamp = _dicom_timestamp(tags.get('StudyDate'), tags.get('StudyTime'))
+    age = _dicom_age(tags.get('PatientBirthDate'), tags.get('StudyDate'))
     series_no = tags.get("SeriesNumber", "") or "—"
     instance_no = tags.get("InstanceNumber", "") or "—"
 
@@ -217,7 +248,7 @@ def download_and_annotate_ct(orthanc, instance_id, tags, tmp_dir, magick_path, i
         "-gravity", "NorthWest", "-annotate", "+10+10",
         f"{patient_name}\nPatient ID: {patient_id}\nAcc: {accession}",
         "-gravity", "NorthEast", "-annotate", "+10+10",
-        f"{timestamp}\nSex: {sex}\nSeries {series_no}",
+        f"{timestamp}\nSex: {sex} | Age: {age}\nSeries {series_no}",
         "-pointsize", "12",
         "-gravity", "SouthWest", "-annotate", "+10+10", f"Instance {instance_no}",
         annotated_path,
@@ -426,6 +457,40 @@ def process_once(cfg, orthanc, study_date=None):
         if attempts >= MAX_ATTEMPTS:
             log.info(log_prefix + "Max attempts reached. Skipping.")
             continue
+
+        # Defer the first unsent observation by one poll. The next call to
+        # group_by_accession() re-reads the study/series tree from Orthanc,
+        # which is important because the initial study discovery is not a
+        # completion signal for all incoming CR series.
+        settle_key = (study_date, accession)
+        if settle_key not in _pending_settle:
+            _pending_settle.add(settle_key)
+            series_count = sum(len(member["study"].get("Series", [])) for member in group)
+            instance_count = sum(
+                len(series.get("Instances", []))
+                for member in group
+                for series_id in member["study"].get("Series", [])
+                for series in [orthanc.get_series(series_id)]
+            )
+            log.info(
+                log_prefix
+                + "First unsent observation; deferring one poll for study settle "
+                + f"(series={series_count}, instances={instance_count})."
+            )
+            continue
+        _pending_settle.discard(settle_key)
+        series_count = sum(len(member["study"].get("Series", [])) for member in group)
+        instance_count = sum(
+            len(series.get("Instances", []))
+            for member in group
+            for series_id in member["study"].get("Series", [])
+            for series in [orthanc.get_series(series_id)]
+        )
+        log.info(
+            log_prefix
+            + "Study settle cycle complete; sending current Orthanc contents "
+            + f"(series={series_count}, instances={instance_count})."
+        )
 
         accessions = sorted({m["accession"] for m in group})
         log.info(log_prefix + f"Locking for processing. Accessions={accessions}")
