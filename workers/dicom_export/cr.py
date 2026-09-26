@@ -46,12 +46,14 @@ def _dicom_age(birth_date, study_date):
 
 
 def _dicom_timestamp(study_date, study_time):
-    """Format DICOM DA/TM for film display as date plus HH:MM."""
+    """Format DICOM DA/TM for film display as date plus hh:mm AM/PM."""
     date = str(study_date or "")
     tm = str(study_time or "")
     if len(tm) < 6:
         return f"{date} {tm}".strip()
-    clock = f"{tm[:2]}:{tm[2:4]}"
+    hour = int(tm[:2])
+    suffix = "AM" if hour < 12 else "PM"
+    clock = f"{(hour % 12) or 12:02d}:{tm[2:4]} {suffix}"
     return f"{date} {clock}".strip()
 
 # Orthanc can expose a study as soon as its first series is indexed. Keep the
