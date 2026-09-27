@@ -299,6 +299,21 @@ class SupabaseRest:
 
 
 class EnqueueWorker:
+    # Director, 2026-09-27: "we dont do attachment qr logic anymore, Its
+    # either attached or transcribed." Confirmed live in labit-py's
+    # app/outsourced_report_fetcher.py: fetch_outsourced_report() (the
+    # function actually backing the /outsourced-report/meta endpoint this
+    # file calls) has an unconditional early return -- "Intentional policy:
+    # use existing attached PDF directly for dispatch. Keep QR decode/fetch
+    # code in-place for possible future reuse, but bypass it now." -- before
+    # any of its QR-decode code (which would produce "attached_qr") ever
+    # runs. That mode is dead/unreachable from this call path; only
+    # "attached_base", "transcribed", or "unavailable" can come back today.
+    # ("attached_pending_resolution" is a real mode too, but only from the
+    # OTHER, lightweight classify_outsourced_report() function -- a
+    # different endpoint this file doesn't call.)
+    ATTACHED_OUTSOURCED_MODES = {"attached_base"}
+
     def __init__(self, cfg: Dict[str, Any], dry_run: bool = False) -> None:
         self.cfg = cfg
         self.dry_run = dry_run
@@ -446,9 +461,9 @@ class EnqueueWorker:
             # bare TESTID this only ever checked -- so this returned an
             # empty list for EVERY current (labit-core-backed) requisition,
             # silently disabling the entire outsourced attached-PDF
-            # split-job path (a genuine attached_base/attached_qr outsourced
-            # result rode along inside the regular consolidated-report job
-            # instead of getting its own separate send). report_sender_
+            # split-job path (a genuine attached_base outsourced result rode
+            # along inside the regular consolidated-report job instead of
+            # getting its own separate send). report_sender_
             # worker.py's own ready_reportable_testids already defends
             # against exactly this field-naming drift; matched here too.
             testid = norm(
@@ -476,15 +491,14 @@ class EnqueueWorker:
     def _outsourced_tests_need_split_job(self, status: Dict[str, Any], reqid: str) -> bool:
         """True if at least one outsourced-ready test on this requisition will
         actually get its own attached-PDF split job from _reconcile_outsourced_jobs
-        (mode attached_base/attached_qr). False for transcribed-only results,
-        which are typed into the consolidated report and must go through the
-        normal follow-up job instead -- otherwise the split-job path silently
-        never creates anything for them and the regular path shouldn't skip either."""
-        attached_modes = {"attached_base", "attached_qr"}
+        (mode attached_base). False for transcribed-only results, which are
+        typed into the consolidated report and must go through the normal
+        follow-up job instead -- otherwise the split-job path silently never
+        creates anything for them and the regular path shouldn't skip either."""
         for testid in self._extract_outsourced_ready_testids(status):
             meta = self._fetch_outsourced_meta(reqid=reqid, testid=testid)
             mode = norm(meta.get("outsourced_mode") or meta.get("mode")).lower()
-            if mode in attached_modes:
+            if mode in self.ATTACHED_OUTSOURCED_MODES:
                 return True
         return False
 
@@ -881,7 +895,6 @@ class EnqueueWorker:
             self.cfg.get("worker", {}).get("outsourced_max_attempts")
             or self.cfg.get("worker", {}).get("max_attempts", 5)
         )
-        attached_modes = {"attached_base", "attached_qr"}
         added = 0
         seen_reqnos: set = set()
 
@@ -934,7 +947,7 @@ class EnqueueWorker:
                 # Confirm PDF is available — fail-closed: skip if unavailable or endpoint unreachable.
                 meta_resp = self._fetch_outsourced_meta(reqid=reqid, testid=testid)
                 mode = norm(meta_resp.get("outsourced_mode") or meta_resp.get("mode")).lower()
-                if not mode or mode not in attached_modes:
+                if not mode or mode not in self.ATTACHED_OUTSOURCED_MODES:
                     self.log.info(
                         "reconcile-outsourced skip reqno=%s testid=%s mode=%s reason=pdf_not_available",
                         reqno, testid, mode or "unknown",
@@ -1015,7 +1028,7 @@ class EnqueueWorker:
 
                 meta_resp = self._fetch_outsourced_meta(reqid=reqid, testid=testid)
                 mode = norm(meta_resp.get("outsourced_mode") or meta_resp.get("mode")).lower()
-                if not mode or mode not in attached_modes:
+                if not mode or mode not in self.ATTACHED_OUTSOURCED_MODES:
                     self.log.info(
                         "reconcile-outsourced-failed skip reqno=%s testid=%s mode=%s reason=pdf_not_available",
                         reqno, testid, mode or "unknown",
@@ -1202,7 +1215,6 @@ class EnqueueWorker:
 
             # Split outsourced attached-PDF tests into separate jobs (works for mixed and outsourced-only requisitions).
             outsourced_testids = self._extract_outsourced_ready_testids(live)
-            attached_modes = {"attached_base", "attached_qr"}
             outsourced_enqueued = 0
             for testid in outsourced_testids:
                 # Dedupe by reqno+testid for active/sent outsourced jobs.
@@ -1219,7 +1231,7 @@ class EnqueueWorker:
                 # If mode resolver is unavailable, fail-open to split-job enqueue so
                 # outsourced ready tests are not silently dropped.
                 # Transcribed rows remain on regular requisition flow.
-                if mode and mode not in attached_modes:
+                if mode and mode not in self.ATTACHED_OUTSOURCED_MODES:
                     continue
                 normalized_mode = mode or "unavailable"
                 job = {
