@@ -9,6 +9,14 @@ import time
 
 import requests
 
+# Director, 2026-09-27: "This should also come from Config btw" -- reuse the
+# SAME config-driven marker set report_sender_worker.py already resolves
+# for "special report" labelling (env SPECIAL_TEST_DEPARTMENT_MARKERS, or
+# cfg["enqueue"]["special_test_department_markers"], default {"DPT00033",
+# "SPECIAL TESTS"}) instead of a second, independently-hardcoded department
+# id living in this file too.
+from report_sender_worker import special_test_department_markers
+
 
 def now_ist() -> datetime:
     # Host is expected to run in IST.
@@ -300,6 +308,7 @@ class EnqueueWorker:
         timeout = int(cfg.get("enqueue", {}).get("request_timeout_seconds", 20))
         self.sb = SupabaseRest(cfg["supabase"]["url"], cfg["supabase"]["service_role_key"], timeout=timeout)
         self.http = requests.Session()
+        self.outsourced_department_markers = special_test_department_markers(cfg)
 
     def _fetch_status(self, reqno: str, reqid: str) -> Dict[str, Any]:
         base = norm(self.cfg.get("labbit_py", {}).get("base_url")).rstrip("/")
@@ -378,14 +387,52 @@ class EnqueueWorker:
         tests = status.get("tests") if isinstance(status.get("tests"), list) else []
         return any(isinstance(t, dict) and self._is_lab_or_radiology_test(t) for t in tests)
 
+    def _is_outsourced_row(self, row: Dict[str, Any]) -> bool:
+        """Same "is this test outsourced" classifier as labit-py's
+        app/dispatch_context.py (`_base_test_context`) and
+        report_sender_worker.py's `_status_has_special_test`: REPORT_STATUS
+        == OUTSOURCED, or the test's department matches the config-driven
+        special-department marker set. This file used to check
+        REPORT_STATUS alone -- a divergence documented (not fixed)
+        2026-09-09 -- so a SPECIAL TESTS-department test whose REPORT_STATUS
+        field was never actually set to the literal string OUTSOURCED (e.g.
+        resulted in-house despite living in that department) was invisible
+        to _extract_outsourced_ready_testids/_is_outsourced_only_reportable,
+        silently skipping its split-job detection.
+
+        2026-09-27, director: "IS the outsourced department in Labit core
+        too DPT00033? This should also come from Config btw." Verified
+        live against a real /report-status/{reqno} response
+        (R202609030018): the JSON never actually carries a DEPTID field at
+        all, only DEPARTMENT (a display name, e.g. "SPECIAL TESTS") -- so a
+        deptid-only check would have matched nothing in practice despite
+        labit_core.department.code for that department genuinely being
+        'DPT00033' (confirmed live in the DB; the code IS right, the field
+        it needs to be read from was wrong). Matches both, same as
+        _status_has_special_test, and neither is hardcoded here --
+        self.outsourced_department_markers is the same
+        special_test_department_markers(cfg) config/env-driven set
+        report_sender_worker.py resolves for its own "special report"
+        labelling. Fixed 2026-09-27."""
+        if not isinstance(row, dict):
+            return False
+        report_status = norm(row.get("REPORT_STATUS") or row.get("report_status")).upper()
+        if report_status == "OUTSOURCED":
+            return True
+        deptid = norm(row.get("DEPTID") or row.get("deptid")).upper()
+        department = norm(
+            row.get("DEPARTMENT") or row.get("department")
+            or row.get("GROUPNM") or row.get("groupnm")
+        ).upper()
+        return deptid in self.outsourced_department_markers or department in self.outsourced_department_markers
+
     def _is_outsourced_ready_test(self, row: Dict[str, Any]) -> bool:
         if not isinstance(row, dict):
             return False
         if not self._is_lab_or_radiology_test(row):
             return False
-        report_status = norm(row.get("REPORT_STATUS") or row.get("report_status")).upper()
         approved = norm(row.get("APPROVEDFLG") or row.get("approvedflg")) == "1"
-        return report_status == "OUTSOURCED" and approved
+        return self._is_outsourced_row(row) and approved
 
     def _extract_outsourced_ready_testids(self, status: Dict[str, Any]) -> List[str]:
         tests = status.get("tests") if isinstance(status.get("tests"), list) else []
@@ -394,7 +441,20 @@ class EnqueueWorker:
         for row in tests:
             if not self._is_outsourced_ready_test(row):
                 continue
-            testid = norm(row.get("TESTID") or row.get("testid"))
+            # 2026-09-27: a real /report-status/{reqno} response (verified
+            # live, R202609030018) carries the test id as TEST_ID, never the
+            # bare TESTID this only ever checked -- so this returned an
+            # empty list for EVERY current (labit-core-backed) requisition,
+            # silently disabling the entire outsourced attached-PDF
+            # split-job path (a genuine attached_base/attached_qr outsourced
+            # result rode along inside the regular consolidated-report job
+            # instead of getting its own separate send). report_sender_
+            # worker.py's own ready_reportable_testids already defends
+            # against exactly this field-naming drift; matched here too.
+            testid = norm(
+                row.get("TEST_ID") or row.get("TESTID")
+                or row.get("test_id") or row.get("testid")
+            )
             if not testid or testid in seen:
                 continue
             seen.add(testid)
@@ -406,10 +466,10 @@ class EnqueueWorker:
         reportable = [t for t in tests if isinstance(t, dict) and self._is_lab_or_radiology_test(t)]
         if not reportable:
             return False
-        # Consider outsourced-only when every reportable test is OUTSOURCED.
+        # Consider outsourced-only when every reportable test is outsourced
+        # (same classifier as _is_outsourced_ready_test/dispatch_context.py).
         for row in reportable:
-            report_status = norm(row.get("REPORT_STATUS") or row.get("report_status")).upper()
-            if report_status != "OUTSOURCED":
+            if not self._is_outsourced_row(row):
                 return False
         return True
 
