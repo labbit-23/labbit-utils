@@ -164,7 +164,7 @@ def run_once(args, cfg):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--delivery-config", required=True)
-    parser.add_argument("--state-file", default="/var/tmp/orthanc-images/ECG/.python_tricog_state.json")
+    parser.add_argument("--state-file", default="/opt/labbit-utils/workers/ecg_delivery/state/python_tricog_state.json")
     parser.add_argument("--username", default=os.environ.get("TRICOG_USERNAME", ""))
     parser.add_argument("--password", default=os.environ.get("TRICOG_PASSWORD", ""))
     parser.add_argument("--initial-lookback-hours", type=int, default=24)

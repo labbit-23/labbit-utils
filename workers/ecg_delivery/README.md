@@ -7,8 +7,9 @@ cut over.
 ## Modes
 
 - `worker.py` defaults to shadow mode: login, switch through all SDRC branches,
-  discover records, and write a separate state file. It does not download,
-  attach, upload, or send anything.
+  discover records in a bounded 24-hour initial window, and write a separate
+  per-branch state/watermark file. It does not download, attach, upload, or
+  send anything.
 - `--live` enables the existing Python delivery chain: graph-PDF rebuild,
   Core attachment, FTP publication, ledger update, and WhatsApp delivery.
 - `repair.py` is the local operator-selected repair entrypoint used by the
@@ -31,7 +32,9 @@ export TRICOG_PASSWORD='...'
 
 Do not use `--live` while Mirth's ECG channel is `STARTED`. The cutover must
 stop the Mirth ECG poller first, preserve its seen-ID boundary, and then start
-Python with a reviewed state file so a study is not sent twice.
+Python with a reviewed state file so a study is not sent twice. An empty state
+is intentionally limited to the last 24 hours; it must still be reviewed
+before enabling live delivery.
 
 The DEXA API invokes `repair.py` locally over stdin. The API requires the ECG
 admin Basic-auth credentials and WhatsApp is a separate explicit checkbox.
