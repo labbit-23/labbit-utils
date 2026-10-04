@@ -51,7 +51,7 @@ def _merge_graph(original, graph, cfg):
         "(", background, ")",
         "(", "-density", "300", f"{original}[0]", "-resize", "3508x2480>",
         "-fuzz", "5%", "-transparent", "white", ")",
-        "-gravity", "center", "-composite", graph,
+        "-gravity", "center", "-composite", "-units", "PixelsPerInch", "-density", "300", graph,
     ]
     subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
     if not os.path.exists(graph) or os.path.getsize(graph) < 1000:
@@ -182,6 +182,23 @@ def _send_whatsapp(row, public_url, cfg, recipient_override=None):
     return messages[0]["id"]
 
 
+def manual_send_existing(cfg, row, phone):
+    if not row.get("accession_no") or not row.get("tricog_ecg_id"):
+        raise ValueError("ECG row is missing accession_no or tricog_ecg_id")
+    if not row.get("diagnosis") or not str(row["diagnosis"]).strip():
+        raise ValueError("ECG has no diagnosis; delivery remains gated")
+    public_url = row.get("pdf_url") or row.get("pdf_url_plain")
+    if not public_url:
+        raise ValueError("ECG has no generated FTP PDF")
+    message_id = _send_whatsapp(row, public_url, cfg, phone)
+    return {
+        "ok": True,
+        "accession": row["accession_no"],
+        "links": [public_url],
+        "stages": {"whatsapp": {"status": "ok", "detail": message_id}},
+    }
+
+
 def manual_reattach(cfg, row, send_whatsapp=False, test_phone=None):
     """Rebuild and reattach one ECG selected by an operator."""
     if not row.get("accession_no") or not row.get("tricog_ecg_id"):
@@ -265,5 +282,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config = json.loads(Path(args.config).read_text())
     request = json.loads(input())
-    result = manual_reattach(config, request["row"], bool(request.get("send_whatsapp")), request.get("test_phone"))
+    if request.get("mode") == "existing_copy":
+        result = manual_send_existing(config, request["row"], request.get("phone"))
+    else:
+        result = manual_reattach(config, request["row"], bool(request.get("send_whatsapp")), request.get("test_phone"))
     print(json.dumps(result))
