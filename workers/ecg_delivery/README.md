@@ -4,6 +4,12 @@ This package is the Python replacement path for the active Mirth Tricog ECG
 poller. Mirth remains live until this worker has been compared and explicitly
 cut over.
 
+## Branch discovery
+
+At the start of each poll cycle the worker calls Tricog GET /api/users/clinics, which is the source for the portal branch dropdown. It normalizes the returned center/doctor pairs and polls every currently available scope in one process. Branch names are display metadata; the stable scope key is centerId:doctorId.
+
+Watermarks and seen ECG IDs are stored under that scope key. Existing center-only state is reused when first encountered, so this change does not replay the current branches. A newly exposed Tricog scope starts with the bounded initial lookback and must be reviewed before live cutover.
+
 ## Modes
 
 - `worker.py` defaults to shadow mode: login, switch through all SDRC branches,

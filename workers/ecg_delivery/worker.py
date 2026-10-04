@@ -24,13 +24,6 @@ from manual_send import manual_reattach
 log = logging.getLogger("ecg_delivery")
 TRICOG_BASE = "https://customer.tricog.com"
 VCARDIA_BASE = "https://vcardia.tricog.com"
-BRANCHES = [
-    {"centerId": "50506", "doctorId": 127077, "centerName": "SDRC DIAGNOSTIC LLP, Paradise."},
-    {"centerId": "50028", "doctorId": 125103, "centerName": "SDRC DIAGNOSTIC, SD Road."},
-    {"centerId": "52443", "doctorId": 138247, "centerName": "SDRC-YAPRAL"},
-]
-
-
 def _request(method, url, *, headers=None, body=None, timeout=(15, 45)):
     response = requests.request(method, url, headers=headers, json=body, timeout=timeout)
     response.raise_for_status()
@@ -45,6 +38,64 @@ def login(username, password):
 def switch_branch(token, branch):
     result = _request("PUT", f"{TRICOG_BASE}/api/users/clinics/change", headers={"appname": "CUSTOMER_PORTAL", "token": token}, body={"centerId": branch["centerId"], "doctorId": branch["doctorId"]})
     return result.get("newToken") or result.get("token")
+
+def _clinic_items(payload):
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("clinics", "centers", "data", "rows", "items", "result", "list"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = _clinic_items(value)
+            if nested:
+                return nested
+    return []
+
+
+def discover_branches(token):
+    result = _request(
+        "GET",
+        f"{TRICOG_BASE}/api/users/clinics",
+        headers={"appname": "CUSTOMER_PORTAL", "accept": "application/json", "token": token},
+    )
+    branches = []
+    for item in _clinic_items(result):
+        if not isinstance(item, dict):
+            continue
+        center_id = item.get("centerId") or item.get("center_id") or item.get("centerID")
+        doctor_id = item.get("doctorId") or item.get("doctor_id") or item.get("doctorID")
+        if isinstance(item.get("doctor"), dict):
+            doctor_id = doctor_id or item["doctor"].get("id") or item["doctor"].get("doctorId")
+        if isinstance(item.get("center"), dict):
+            center_id = center_id or item["center"].get("id") or item["center"].get("centerId")
+        if center_id is None or doctor_id is None:
+            continue
+        name = (
+            item.get("centerName")
+            or item.get("center_name")
+            or item.get("clinicName")
+            or item.get("clinic_name")
+            or item.get("name")
+            or item.get("title")
+            or str(center_id)
+        )
+        branches.append({
+            "centerId": str(center_id),
+            "doctorId": int(doctor_id),
+            "centerName": str(name),
+        })
+    unique = {(branch["centerId"], branch["doctorId"]): branch for branch in branches}
+    if not unique:
+        raise RuntimeError("Tricog clinic list returned no usable centerId/doctorId pairs")
+    return list(unique.values())
+
+
+
+def _branch_key(branch):
+    return f"{branch['centerId']}:{branch['doctorId']}"
 
 
 def list_recent(token, limit=25):
@@ -86,13 +137,16 @@ def save_state(path, state):
 
 def discover(username, password, state, initial_lookback_hours=24):
     token = login(username, password)
+    branches = discover_branches(token)
     found = []
     now = time.time()
     branches_state = state.setdefault("branches", {})
-    for branch in BRANCHES:
+    for branch in branches:
         token = switch_branch(token, branch)
         records = list_recent(token)
-        branch_state = branches_state.setdefault(branch["centerId"], {})
+        branch_key = _branch_key(branch)
+        legacy_state = branches_state.get(branch["centerId"])
+        branch_state = branches_state.setdefault(branch_key, legacy_state or {})
         seen = set(branch_state.setdefault("seen", []))
         cutoff = branch_state.get("last_synced_at")
         if cutoff:
@@ -117,6 +171,7 @@ def discover(username, password, state, initial_lookback_hours=24):
                 "age": record.get("age"),
                 "sex": record.get("sex"),
                 "branch_center_id": branch["centerId"],
+                "branch_scope_key": branch_key,
                 "branch_center_name": branch["centerName"],
                 "diagnosis": record.get("diagnosis"),
                 "final_classification": record.get("finalclassification"),
@@ -133,8 +188,8 @@ def discover(username, password, state, initial_lookback_hours=24):
             })
         if newest > cutoff:
             branch_state["last_synced_at"] = datetime.fromtimestamp(newest, tz=timezone.utc).isoformat()
-    for branch in BRANCHES:
-        branch_state = branches_state.get(branch["centerId"], {})
+    for branch in branches:
+        branch_state = branches_state.get(_branch_key(branch), {})
         if branch_state.get("last_synced_at") is None:
             branch_state["last_synced_at"] = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
     found.sort(key=lambda row: row.get("acquired_at") or "")
@@ -154,7 +209,7 @@ def run_once(args, cfg):
             except Exception:
                 log.exception("ECG delivery failed accession=%s; leaving it unmarked for retry", row["accession_no"])
                 continue
-        branch_state = state.setdefault("branches", {}).setdefault(row["branch_center_id"], {})
+        branch_state = state.setdefault("branches", {}).setdefault(row.get("branch_scope_key", row["branch_center_id"]), {})
         branch_state.setdefault("seen", []).append(row["tricog_ecg_id"])
         branch_state["seen"] = branch_state["seen"][-300:]
     save_state(args.state_file, state)
