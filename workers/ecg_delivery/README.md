@@ -12,7 +12,7 @@ cut over.
   send anything.
 - `--live` enables the existing Python delivery chain: graph-PDF rebuild,
   Core attachment, FTP publication, ledger update, and WhatsApp delivery.
-- `repair.py` is the local operator-selected repair entrypoint used by the
+- `manual_send.py` is the local operator-selected manual-send entrypoint used by the
   DEXA ECG management page. It receives one ledger row over stdin and never
   opens a network listener.
 
@@ -36,5 +36,5 @@ Python with a reviewed state file so a study is not sent twice. An empty state
 is intentionally limited to the last 24 hours; it must still be reviewed
 before enabling live delivery.
 
-The DEXA API invokes `repair.py` locally over stdin. The API requires the ECG
+The DEXA API invokes `manual_send.py` locally over stdin. The API requires the ECG
 admin Basic-auth credentials and WhatsApp is a separate explicit checkbox.

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import requests
 
-from repair import manual_reattach
+from manual_send import manual_reattach
 
 log = logging.getLogger("ecg_delivery")
 TRICOG_BASE = "https://customer.tricog.com"

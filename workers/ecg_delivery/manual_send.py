@@ -127,7 +127,17 @@ def _supabase_update(row, links, stages, cfg):
     response.raise_for_status()
 
 
-def _phone(row, cfg):
+def _normalize_phone(value):
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if len(digits) == 10:
+        return "91" + digits
+    if len(digits) == 12 and digits.startswith("91"):
+        return digits
+    raise ValueError("WhatsApp recipient must be a 10-digit Indian number")
+
+def _phone(row, cfg, override=None):
+    if override:
+        return _normalize_phone(override)
     labit = cfg["labit"]
     url = f"{labit['base_url'].rstrip('/')}/api/dispatch-phone/{quote(str(row['accession_no']), safe='')}"
     response = requests.get(url, auth=(labit["dispatch_user"], labit["dispatch_password"]), timeout=(10, 30))
@@ -143,12 +153,12 @@ def _phone(row, cfg):
     return str(cfg["whatsapp"]["default_phone"])
 
 
-def _send_whatsapp(row, public_url, cfg):
+def _send_whatsapp(row, public_url, cfg, recipient_override=None):
     wa = cfg["whatsapp"]
     payload = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
-        "to": _phone(row, cfg),
+        "to": _phone(row, cfg, recipient_override),
         "type": "template",
         "template": {
             "name": wa["template_pdf"],
@@ -172,7 +182,7 @@ def _send_whatsapp(row, public_url, cfg):
     return messages[0]["id"]
 
 
-def manual_reattach(cfg, row, send_whatsapp=False):
+def manual_reattach(cfg, row, send_whatsapp=False, test_phone=None):
     """Rebuild and reattach one ECG selected by an operator."""
     if not row.get("accession_no") or not row.get("tricog_ecg_id"):
         raise ValueError("ECG row is missing accession_no or tricog_ecg_id")
@@ -186,7 +196,10 @@ def manual_reattach(cfg, row, send_whatsapp=False):
         raise ValueError("This row has no Tricog report URL/token; it cannot be rebuilt safely")
 
     stages = {}
-    tmp_root = cfg["worker"].get("tmp_dir", "/var/tmp/orthanc-images")
+    tmp_root = Path(cfg["worker"].get("tmp_dir", "/var/tmp/orthanc-images")).expanduser()
+    if not tmp_root.is_absolute():
+        tmp_root = Path(__file__).resolve().parent / tmp_root
+    tmp_root.mkdir(parents=True, exist_ok=True)
     workdir = tempfile.mkdtemp(prefix=f"ecg-repair-{row['accession_no']}-", dir=tmp_root)
     original = os.path.join(workdir, f"{row['accession_no']}.pdf")
     graph = os.path.join(workdir, f"{row['accession_no']}_Graph.pdf")
@@ -213,12 +226,17 @@ def manual_reattach(cfg, row, send_whatsapp=False):
             # The DEXA API owns the Supabase service client.
             _stage(stages, "ledger", "deferred", "DEXA API will update ledger")
 
+        if test_phone and not send_whatsapp:
+            raise ValueError("A custom WhatsApp recipient requires send_whatsapp=true")
         if send_whatsapp:
             quality_flag = row.get("quality_flag") or (row.get("raw_json") or {}).get("qualityFlag")
             if quality_flag:
                 raise ValueError("WhatsApp is blocked for a Tricog quality-flagged ECG")
             message_id = _send_whatsapp(row, links[0], cfg)
             _stage(stages, "whatsapp", "ok", message_id)
+            if test_phone:
+                copy_message_id = _send_whatsapp(row, links[0], cfg, test_phone)
+                _stage(stages, "whatsapp_copy", "ok", copy_message_id)
         else:
             _stage(stages, "whatsapp", "skipped", "operator did not request resend")
 
@@ -247,5 +265,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config = json.loads(Path(args.config).read_text())
     request = json.loads(input())
-    result = manual_reattach(config, request["row"], bool(request.get("send_whatsapp")))
+    result = manual_reattach(config, request["row"], bool(request.get("send_whatsapp")), request.get("test_phone"))
     print(json.dumps(result))
