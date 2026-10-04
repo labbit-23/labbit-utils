@@ -84,16 +84,28 @@ def save_state(path, state):
     tmp.replace(target)
 
 
-def discover(username, password, state):
+def discover(username, password, state, initial_lookback_hours=24):
     token = login(username, password)
     found = []
+    now = time.time()
+    branches_state = state.setdefault("branches", {})
     for branch in BRANCHES:
         token = switch_branch(token, branch)
         records = list_recent(token)
-        seen = set(state.setdefault("seen", {}).setdefault(branch["centerId"], []))
+        branch_state = branches_state.setdefault(branch["centerId"], {})
+        seen = set(branch_state.setdefault("seen", []))
+        cutoff = branch_state.get("last_synced_at")
+        if cutoff:
+            cutoff = datetime.fromisoformat(cutoff.replace("Z", "+00:00")).timestamp()
+        else:
+            cutoff = now - (initial_lookback_hours * 3600)
+        newest = cutoff
         for record in records:
+            record_ts = _timestamp(record)
+            if record_ts:
+                newest = max(newest, record_ts)
             ecg_id = record.get("ecgId") or record.get("ecgid")
-            if not ecg_id or ecg_id in seen:
+            if not ecg_id or ecg_id in seen or (record_ts and record_ts < cutoff):
                 continue
             accession = str(record.get("patientId") or record.get("patientid") or "").strip()
             if not accession:
@@ -119,13 +131,19 @@ def discover(username, password, state):
                     "tricogEcgId": str(ecg_id),
                 },
             })
+        if newest > cutoff:
+            branch_state["last_synced_at"] = datetime.fromtimestamp(newest, tz=timezone.utc).isoformat()
+    for branch in BRANCHES:
+        branch_state = branches_state.get(branch["centerId"], {})
+        if branch_state.get("last_synced_at") is None:
+            branch_state["last_synced_at"] = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
     found.sort(key=lambda row: row.get("acquired_at") or "")
     return found
 
 
 def run_once(args, cfg):
     state = load_state(args.state_file)
-    rows = discover(args.username, args.password, state)
+    rows = discover(args.username, args.password, state, args.initial_lookback_hours)
     log.info("Discovered %d new ECG record(s); mode=%s", len(rows), "live" if args.live else "shadow")
     for row in rows:
         log.info("ECG candidate accession=%s ecg_id=%s diagnosis=%s", row["accession_no"], row["tricog_ecg_id"], bool(row.get("diagnosis")))
@@ -136,8 +154,9 @@ def run_once(args, cfg):
             except Exception:
                 log.exception("ECG delivery failed accession=%s; leaving it unmarked for retry", row["accession_no"])
                 continue
-        state.setdefault("seen", {}).setdefault(row["branch_center_id"], []).append(row["tricog_ecg_id"])
-        state["seen"][row["branch_center_id"]] = state["seen"][row["branch_center_id"]][-300:]
+        branch_state = state.setdefault("branches", {}).setdefault(row["branch_center_id"], {})
+        branch_state.setdefault("seen", []).append(row["tricog_ecg_id"])
+        branch_state["seen"] = branch_state["seen"][-300:]
     save_state(args.state_file, state)
     return len(rows)
 
@@ -148,6 +167,7 @@ def main():
     parser.add_argument("--state-file", default="/var/tmp/orthanc-images/ECG/.python_tricog_state.json")
     parser.add_argument("--username", default=os.environ.get("TRICOG_USERNAME", ""))
     parser.add_argument("--password", default=os.environ.get("TRICOG_PASSWORD", ""))
+    parser.add_argument("--initial-lookback-hours", type=int, default=24)
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
