@@ -1,0 +1,10 @@
+{
+  "poll_seconds": 120,
+  "state_file": "/var/tmp/orthanc-images/ECG/.python_tricog_state.json",
+  "delivery_config": "/opt/labbit-utils/workers/dicom_export/config/dicom_export.json",
+  "tricog": {
+    "base_url": "https://customer.tricog.com",
+    "username_env": "TRICOG_USERNAME",
+    "password_env": "TRICOG_PASSWORD"
+  }
+}
