@@ -222,6 +222,7 @@ def _fetch_study_row(orthanc, study_or_id):
     pdf_urls = _metadata_pdf_urls(meta)
     return {
         "studyId": study_id,
+        "seriesCount": len(study.get("Series") or []),
         "accession": main_tags.get("AccessionNumber", ""),
         "studyDescription": _study_description_for_row(orthanc, study, main_tags),
         "patientName": (patient_tags.get("PatientName") or "").replace("^", " ").strip(),
