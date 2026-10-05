@@ -239,22 +239,38 @@ class MWLWorker:
     def poll_items(self) -> List[Dict[str, Any]]:
         source = self.cfg["source"]
         method = str(source.get("poll_method", "GET")).upper()
-        url = source["poll_url"]
+        configured_urls = source.get("poll_urls") or [source["poll_url"]]
+        if isinstance(configured_urls, str):
+            configured_urls = [url.strip() for url in configured_urls.split(",") if url.strip()]
         headers = source.get("poll_headers", {}) or {}
         timeout = int(source.get("poll_timeout_seconds", 20))
         items_path = source.get("items_path", "items")
 
-        resp = self.session.request(method=method, url=url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        body = resp.json()
+        all_items: List[Dict[str, Any]] = []
+        errors: List[Exception] = []
+        for url in configured_urls:
+            try:
+                resp = self.session.request(method=method, url=url, headers=headers, timeout=timeout)
+                resp.raise_for_status()
+                body = resp.json()
 
-        if isinstance(body, list):
-            return body
+                if isinstance(body, list):
+                    items = body
+                else:
+                    items = get_path(body, items_path, [])
+                    if not isinstance(items, list):
+                        raise ValueError(f"Source response path {items_path!r} is not a list")
+                all_items.extend(items)
+                self.log.info("Polled MWL source url=%s rows=%s", url, len(items))
+            except Exception as exc:
+                errors.append(exc)
+                self.log.exception("MWL source poll failed url=%s: %s", url, exc)
 
-        items = get_path(body, items_path, [])
-        if not isinstance(items, list):
-            raise ValueError(f"Source response path '{items_path}' is not a list")
-        return items
+        if errors and not all_items:
+            raise errors[0]
+        if errors:
+            self.log.warning("MWL poll completed with %s failed source(s); continuing with %s rows", len(errors), len(all_items))
+        return all_items
 
     def pending_items(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         source = self.cfg["source"]
@@ -280,6 +296,9 @@ class MWLWorker:
                 row_test_code = str(row.get("test_code") or "").strip().upper()
                 if row_test_code not in allowlist_upper:
                     continue
+            _row_id, _accession, _modality = self.extract_keys(row)
+            if _accession and self.store.was_sent(_accession, _modality):
+                continue
             pending.append(row)
             if len(pending) >= batch_size:
                 break

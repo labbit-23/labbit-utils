@@ -1,6 +1,9 @@
 {
   "source": {
-    "poll_url": "https://labit.sdrc.in/machine-api/mwl?department_name=sonology",
+    "poll_urls": [
+      "https://labit.sdrc.in/machine-api/mwl?department_name=sonology",
+      "https://labit.sdrc.in/machine-api/mwl?department_name=DOPPLERS"
+    ],
     "poll_method": "GET",
     "poll_headers": {
       "X-Api-Key-Id": "${LABBIT_CORE_API_KEY_ID}",

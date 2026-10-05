@@ -19,7 +19,7 @@ cp config/mwl_worker.example.json config/mwl_worker.json
 
 Required:
 
-- `source.poll_url` — labbit-py department-worklist endpoint (see below)
+- `source.poll_url` or `source.poll_urls` — labbit-py department-worklist endpoint (see below)
 - `destination.aet`, `destination.host`, `destination.port`
 - `mwl.create_url` — HTTP endpoint that writes the `.wl` file to Orthanc's worklist directory
 
@@ -33,7 +33,7 @@ https://api.sdrc.in/py/delivery/department-worklist?department_name=ct_scan
 https://api.sdrc.in/py/delivery/department-worklist?department_name=sonology
 ```
 
-For date-specific polling add `&fromreqdate=YYYY-MM-DD&toreqdate=YYYY-MM-DD`.
+The USG config uses `source.poll_urls` to poll `sonology` and `DOPPLERS` in the same worker loop; the Core endpoint does not accept a comma-separated `department_name`. For date-specific polling add `&fromreqdate=YYYY-MM-DD&toreqdate=YYYY-MM-DD` to each URL.
 
 The endpoint returns `{ items: [...] }` where each item has `reqno`, `patient_id`, `patient_name`, `patient_sex`, `patient_dob`, `reqdt`, `reqtm`, `procedure_name`, `performed`.
 
@@ -45,7 +45,7 @@ Run one worker instance per department+modality. Each instance has its own confi
 |-------------------------|-----------------|-------------------|
 | mwl_worker_xray.json    | radiology       | CR                |
 | mwl_worker_ct.json      | ct_scan         | CT                |
-| mwl_worker_usg.json     | sonology        | US                |
+| mwl_worker_usg.json     | sonology + DOPPLERS | US                |
 
 Set `mwl.defaults.modality` to the DICOM modality code for that department.
 
