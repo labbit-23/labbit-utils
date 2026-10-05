@@ -153,13 +153,17 @@ def discover(username, password, state, initial_lookback_hours=24):
             cutoff = datetime.fromisoformat(cutoff.replace("Z", "+00:00")).timestamp()
         else:
             cutoff = now - (initial_lookback_hours * 3600)
-        newest = cutoff
         for record in records:
             record_ts = _timestamp(record)
-            if record_ts:
-                newest = max(newest, record_ts)
             ecg_id = record.get("ecgId") or record.get("ecgid")
             if not ecg_id or ecg_id in seen or (record_ts and record_ts < cutoff):
+                continue
+            # Match Mirth: do not even queue an ECG until Tricog has a
+            # real diagnosis. It must remain eligible for a later poll.
+            diagnosis = record.get("diagnosis")
+            if diagnosis is None or (isinstance(diagnosis, str) and not diagnosis.strip()):
+                continue
+            if isinstance(diagnosis, (list, dict)) and not diagnosis:
                 continue
             accession = str(record.get("patientId") or record.get("patientid") or "").strip()
             if not accession:
@@ -186,12 +190,9 @@ def discover(username, password, state, initial_lookback_hours=24):
                     "tricogEcgId": str(ecg_id),
                 },
             })
-        if newest > cutoff:
-            branch_state["last_synced_at"] = datetime.fromtimestamp(newest, tz=timezone.utc).isoformat()
-    for branch in branches:
-        branch_state = branches_state.get(_branch_key(branch), {})
-        if branch_state.get("last_synced_at") is None:
-            branch_state["last_synced_at"] = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+        # The watermark is advanced only after a row is successfully handled
+        # in run_once(). This prevents transient delivery failures or missing
+        # Tricog diagnoses from being skipped permanently.
     found.sort(key=lambda row: row.get("acquired_at") or "")
     return found
 
@@ -212,6 +213,12 @@ def run_once(args, cfg):
         branch_state = state.setdefault("branches", {}).setdefault(row.get("branch_scope_key", row["branch_center_id"]), {})
         branch_state.setdefault("seen", []).append(row["tricog_ecg_id"])
         branch_state["seen"] = branch_state["seen"][-300:]
+        record_ts = _timestamp(row.get("raw_json") or {})
+        if record_ts:
+            current = branch_state.get("last_synced_at")
+            current_ts = datetime.fromisoformat(current.replace("Z", "+00:00")).timestamp() if current else 0
+            if record_ts > current_ts:
+                branch_state["last_synced_at"] = datetime.fromtimestamp(record_ts, tz=timezone.utc).isoformat()
     save_state(args.state_file, state)
     return len(rows)
 
@@ -231,6 +238,7 @@ def main():
     cfg = json.loads(Path(args.delivery_config).read_text())
     cfg["supabase_url"] = os.environ.get("SUPABASE_URL", "")
     cfg["supabase_service_key"] = os.environ.get("SUPABASE_SERVICE_KEY", "")
+    cfg["ecg"] = cfg.get("ecg") or {}
     logging.basicConfig(level=cfg.get("worker", {}).get("log_level", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     while True:
         try:

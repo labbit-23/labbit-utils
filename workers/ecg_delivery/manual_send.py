@@ -41,7 +41,7 @@ def _download(url, destination, token=None):
 
 
 def _merge_graph(original, graph, cfg):
-    ecg_cfg = cfg.get("ecg", {})
+    ecg_cfg = cfg.get("ecg") or {}
     background = ecg_cfg.get("background_path", "/var/tmp/orthanc-images/ECG_Graph_Background_v2.png")
     magick = cfg["worker"].get("magick_path", "/usr/local/bin/magick")
     if not os.path.exists(background):
