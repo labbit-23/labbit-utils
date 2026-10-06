@@ -1,6 +1,6 @@
 """Manual Tricog ECG repair/reattach path.
 
-The normal Tricog poller remains in Mirth.  This module is intentionally only
+The normal Tricog poller runs in this Python worker.  This module is intentionally only
 for an operator-selected row from the DEXA ECG console: rebuild the graph PDF,
 reattach the plain report to Core, refresh FTP and ledger links, and optionally
 send WhatsApp when the operator explicitly requests it.
@@ -108,20 +108,32 @@ def _supabase_update(row, links, stages, cfg):
         "stages": stages,
     }
     payload = {
+        "accession_no": row.get("accession_no"),
+        "tricog_ecg_id": row.get("tricog_ecg_id"),
+        "patient_name": row.get("patient_name"),
+        "age": row.get("age"),
+        "sex": row.get("sex"),
+        "branch_center_id": row.get("branch_center_id"),
+        "branch_center_name": row.get("branch_center_name"),
+        "diagnosis": row.get("diagnosis"),
+        "final_classification": row.get("final_classification"),
+        "status": row.get("status"),
+        "acquired_at": row.get("acquired_at"),
         "pdf_url": links[0] if links else row.get("pdf_url"),
         "pdf_url_plain": links[1] if len(links) > 1 else row.get("pdf_url_plain"),
+        "source": "TRICOG",
         "raw_json": raw,
     }
-    url = f"{cfg['supabase_url'].rstrip('/')}/rest/v1/ecg_studies?tricog_ecg_id=eq.{quote(str(row['tricog_ecg_id']), safe='')}"
-    response = requests.patch(
+    url = cfg["supabase_url"].rstrip("/") + "/rest/v1/ecg_studies?on_conflict=tricog_ecg_id"
+    response = requests.post(
         url,
         headers={
             "apikey": cfg["supabase_service_key"],
-            "Authorization": f"Bearer {cfg['supabase_service_key']}",
+            "Authorization": "Bearer " + cfg["supabase_service_key"],
             "Content-Type": "application/json",
-            "Prefer": "return=minimal",
+            "Prefer": "resolution=merge-duplicates,return=minimal",
         },
-        json=payload,
+        json=[payload],
         timeout=(15, 30),
     )
     response.raise_for_status()
