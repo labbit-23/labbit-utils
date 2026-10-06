@@ -86,7 +86,7 @@ class RadiologyIndex:
         if not self.enabled:
             return None
         params = {
-            "select": "orthanc_study_id,accession,patient_name,study_description,modality,series_count,instance_count,phone,delivery_status,delivery_attempts,delivery_timestamp,sent_at,pdf_urls,image_urls,source",
+            "select": "orthanc_study_id,accession,patient_name,study_description,modality,series_count,instance_count,phone,delivery_status,delivery_attempts,delivery_timestamp,sent_at,pdf_urls,image_urls,orthanc_metadata,source",
             "study_date": f"eq.{_date_iso(date_str)}",
             "order": "accession.desc",
             "limit": "1000",
@@ -109,7 +109,7 @@ class RadiologyIndex:
         if not self.enabled:
             return {}
         params = {
-            "select": "orthanc_study_id,series_count,instance_count,delivery_status",
+            "select": "orthanc_study_id,series_count,instance_count,delivery_status,orthanc_metadata",
             "study_date": f"eq.{_date_iso(date_str)}",
             "limit": "1000",
         }
@@ -180,6 +180,7 @@ class RadiologyIndex:
 
     def _api_row(self, row):
         pdf_urls = _json_list(row.get("pdf_urls"))
+        metadata = row.get("orthanc_metadata") or {}
         source = str(row.get("source") or "")
         if source not in ("primary", "backup"):
             source = "primary"
@@ -193,6 +194,7 @@ class RadiologyIndex:
             "accession": row.get("accession") or "",
             "studyDescription": row.get("study_description") or "",
             "patientName": row.get("patient_name") or "",
+            "patientAge": metadata.get("PatientAge") or "",
             "phone": row.get("phone") or "",
             "status": row.get("delivery_status") or "",
             "attempts": str(attempts),

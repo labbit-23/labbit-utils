@@ -212,6 +212,30 @@ def _fetch_study_row(orthanc, study_or_id):
     main_tags = study.get("MainDicomTags") or {}
     patient_tags = study.get("PatientMainDicomTags") or {}
     requested_tags = study.get("RequestedTags") or {}
+    # Orthanc's study-level patient tags often omit PatientAge even when the
+    # scanner sent it. Read one representative instance only when both age
+    # and DOB are absent; this supports legacy CT/CR senders without walking
+    # every image.
+    representative_tags = {}
+    if not patient_tags.get("PatientAge") and not patient_tags.get("PatientBirthDate"):
+        for series_id in study.get("Series") or []:
+            try:
+                series = orthanc.get_series(series_id)
+                instance_ids = series.get("Instances") or []
+                if instance_ids:
+                    representative_tags = orthanc.get_simplified_tags(instance_ids[0]) or {}
+                    break
+            except Exception as exc:
+                log.warning("Could not read representative instance tags for study %s: %s", study.get("ID"), exc)
+    patient_age = patient_tags.get("PatientAge") or representative_tags.get("PatientAge") or ""
+    study_date = main_tags.get("StudyDate", "")
+    display_age = cr._dicom_age(
+        patient_age,
+        patient_tags.get("PatientBirthDate") or representative_tags.get("PatientBirthDate"),
+        study_date,
+    )
+    if display_age == "—":
+        display_age = ""
     try:
         instance_count = int(requested_tags.get("NumberOfStudyRelatedInstances") or 0)
     except (TypeError, ValueError):
@@ -233,12 +257,17 @@ def _fetch_study_row(orthanc, study_or_id):
         "studyDescription": _study_description_for_row(orthanc, study, main_tags),
         "patientName": (patient_tags.get("PatientName") or "").replace("^", " ").strip(),
         "patientId": patient_tags.get("PatientID", ""),
-        "patientSex": patient_tags.get("PatientSex", ""),
-        "studyDate": main_tags.get("StudyDate", ""),
+        "patientSex": patient_tags.get("PatientSex") or representative_tags.get("PatientSex", ""),
+        "patientAge": display_age,
+        "studyDate": study_date,
         "studyTime": main_tags.get("StudyTime", ""),
         "studyInstanceUid": main_tags.get("StudyInstanceUID", ""),
         "instanceCount": instance_count,
-        "orthancMetadata": meta,
+        "orthancMetadata": {
+            **meta,
+            "PatientAge": display_age,
+            "PatientAgeChecked": True,
+        },
         "phone": meta.get("WhatsappPhone", ""),
         "status": meta.get("WhatsappStatus", ""),
         "attempts": meta.get("WhatsappAttempts", "0"),
@@ -310,6 +339,9 @@ def sync_radiology_index(index, orthanc, orthanc_backup, date_str, force=False):
             candidates.append(study)
             continue
         if str(previous.get("delivery_status") or "").upper() in ("", "PROCESSING"):
+            candidates.append(study)
+            continue
+        if not (previous.get("orthanc_metadata") or {}).get("PatientAgeChecked"):
             candidates.append(study)
     if candidates:
         with ThreadPoolExecutor(max_workers=LIST_CONCURRENCY) as pool:

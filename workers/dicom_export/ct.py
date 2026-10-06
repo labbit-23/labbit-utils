@@ -266,7 +266,7 @@ def build_vector_preview_pdf(orthanc, study, selected_instance_ids, layout, outp
             accession = tags.get("AccessionNumber") or ""
             timestamp = cr._dicom_timestamp(tags.get('StudyDate'), tags.get('StudyTime'))
             sex = tags.get("PatientSex") or "—"
-            age = cr._dicom_age(tags.get('PatientBirthDate'), tags.get('StudyDate'))
+            age = cr._dicom_age(tags.get('PatientAge'), tags.get('PatientBirthDate'), tags.get('StudyDate'))
             series_no = tags.get("SeriesNumber") or "—"
             instance_no = tags.get("InstanceNumber") or "—"
             # Metadata is deliberately lighter than the SDRC header so it

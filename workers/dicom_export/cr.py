@@ -34,8 +34,18 @@ def _filename_safe(text, max_len=40):
 MAX_ATTEMPTS = 3
 
 
-def _dicom_age(birth_date, study_date):
-    """Return age in years at the study date; never expose the DOB itself."""
+def _dicom_age(patient_age, birth_date, study_date):
+    """Return the DICOM-supplied age, falling back to DOB calculation.
+
+    PatientAge is the reliable value for older scanners that omit
+    PatientBirthDate. DICOM allows years, months, weeks, and days; preserve
+    that unit for display rather than pretending a paediatric age is whole
+    years. DOB remains the fallback for senders that omit PatientAge.
+    """
+    raw_age = str(patient_age or "").strip().upper()
+    match = re.fullmatch(r"(\d{1,3})([YMWD])", raw_age)
+    if match:
+        return f"{int(match.group(1))}{match.group(2)}"
     try:
         birth = datetime.strptime(str(birth_date)[:8], "%Y%m%d").date()
         studied = datetime.strptime(str(study_date)[:8], "%Y%m%d").date()
@@ -177,7 +187,7 @@ def download_and_annotate(orthanc, instance_id, tags, tmp_dir, magick_path, inst
         f.write(png_bytes)
 
     patient_name = (tags.get("PatientName") or "").replace("^", " ")
-    age_sex = f"Age: {_dicom_age(tags.get('PatientBirthDate'), tags.get('StudyDate'))} | {tags.get('PatientSex', '')}"
+    age_sex = f"Age: {_dicom_age(tags.get('PatientAge'), tags.get('PatientBirthDate'), tags.get('StudyDate'))} | {tags.get('PatientSex', '')}"
     patient_id = tags.get("PatientID", "")
     accession = tags.get("AccessionNumber", "")
     study_date = tags.get("StudyDate", "")
@@ -236,7 +246,7 @@ def download_and_annotate_ct(orthanc, instance_id, tags, tmp_dir, magick_path, i
     accession = tags.get("AccessionNumber", "")
     sex = tags.get("PatientSex", "") or "—"
     timestamp = _dicom_timestamp(tags.get('StudyDate'), tags.get('StudyTime'))
-    age = _dicom_age(tags.get('PatientBirthDate'), tags.get('StudyDate'))
+    age = _dicom_age(tags.get('PatientAge'), tags.get('PatientBirthDate'), tags.get('StudyDate'))
     series_no = tags.get("SeriesNumber", "") or "—"
     instance_no = tags.get("InstanceNumber", "") or "—"
 
