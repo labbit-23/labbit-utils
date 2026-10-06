@@ -315,7 +315,8 @@ def sync_radiology_index(index, orthanc, orthanc_backup, date_str, force=False):
         with ThreadPoolExecutor(max_workers=LIST_CONCURRENCY) as pool:
             rows = [row for row in pool.map(lambda item: _fetch_study_row(client, item), candidates) if row is not None]
         records = [index.record_from_api_row(row, source=source) for row in rows]
-        index.upsert_rows(records)
+        if not index.upsert_rows(records):
+            raise RuntimeError(f"Radiology index upsert failed for {date_str}")
     index._mark_sync(date_str)
     return len(candidates)
 
@@ -423,13 +424,15 @@ def make_handler(cfg, orthanc, orthanc_backup, radiology_index=None):
                         # Fast path: table first. Refresh only when the worker
                         # has not recently completed its background sync or
                         # the requested date is not indexed yet.
+                        refresh_failed = False
                         if radiology_index.needs_refresh(date_str):
                             try:
                                 sync_radiology_index(radiology_index, orthanc, orthanc_backup, date_str, force=False)
                             except Exception as exc:
                                 log.warning("Radiology index refresh failed for %s: %s", date_str, exc)
+                                refresh_failed = True
                         indexed_rows = radiology_index.list_rows(date_str, requested_modality)
-                        if indexed_rows:
+                        if indexed_rows and not refresh_failed:
                             self._send_json(indexed_rows)
                             return
                         # Empty/missing index: one controlled Orthanc fill, then

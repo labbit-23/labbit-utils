@@ -8,7 +8,6 @@ import json
 import logging
 import threading
 import time
-from datetime import datetime
 from urllib.parse import quote
 
 import requests
