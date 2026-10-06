@@ -3,6 +3,14 @@
   "ct": {
     "enabled": true
   },
+  "radiology_index": {
+    "enabled": false,
+    "url": "https://supabase.sdrc.in",
+    "service_role_key": "${LABBIT_REPORT_SUPABASE_SERVICE_ROLE_KEY}",
+    "table": "radiology",
+    "timeout_seconds": 15,
+    "refresh_age_seconds": 120
+  },
   "institution": {
     "name": "SDRC Diagnostics"
   },

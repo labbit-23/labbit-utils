@@ -14,6 +14,7 @@ import core
 import cr
 import ct
 import print_scu
+from radiology_index import RadiologyIndex
 
 # Caps concurrent Orthanc calls from the LIST endpoint. Each per-study
 # lookup is ~500ms of mostly Orthanc-side work (confirmed live -- not our
@@ -210,6 +211,11 @@ def _fetch_study_row(orthanc, study_or_id):
         return None
     main_tags = study.get("MainDicomTags") or {}
     patient_tags = study.get("PatientMainDicomTags") or {}
+    requested_tags = study.get("RequestedTags") or {}
+    try:
+        instance_count = int(requested_tags.get("NumberOfStudyRelatedInstances") or 0)
+    except (TypeError, ValueError):
+        instance_count = 0
     # ModalitiesInStudy can list more than one modality (space-separated)
     # if a study genuinely mixes them; take the first -- every real study
     # seen in this system so far is single-modality.
@@ -226,6 +232,13 @@ def _fetch_study_row(orthanc, study_or_id):
         "accession": main_tags.get("AccessionNumber", ""),
         "studyDescription": _study_description_for_row(orthanc, study, main_tags),
         "patientName": (patient_tags.get("PatientName") or "").replace("^", " ").strip(),
+        "patientId": patient_tags.get("PatientID", ""),
+        "patientSex": patient_tags.get("PatientSex", ""),
+        "studyDate": main_tags.get("StudyDate", ""),
+        "studyTime": main_tags.get("StudyTime", ""),
+        "studyInstanceUid": main_tags.get("StudyInstanceUID", ""),
+        "instanceCount": instance_count,
+        "orthancMetadata": meta,
         "phone": meta.get("WhatsappPhone", ""),
         "status": meta.get("WhatsappStatus", ""),
         "attempts": meta.get("WhatsappAttempts", "0"),
@@ -260,6 +273,51 @@ def list_studies_for_date(orthanc, orthanc_backup, date_str):
     for row in rows:
         row["source"] = source
     return rows
+
+
+def sync_radiology_index(index, orthanc, orthanc_backup, date_str, force=False):
+    """Fill/update the fast index from Orthanc for one calendar date.
+
+    Normal cycles fetch only new/incomplete studies. A send in the cycle can
+    request force=True so delivery status and PDF URLs become current without
+    making every dashboard load re-read every study from Orthanc.
+    """
+    if not index or not index.enabled:
+        return 0
+    client, source, study_rows = _resolve_studies_for_date(orthanc, orthanc_backup, date_str)
+    if not study_rows:
+        index._mark_sync(date_str)
+        return 0
+    existing = index.existing_for_date(date_str)
+    candidates = []
+    for study in study_rows:
+        study_id = str(study.get("ID") or "")
+        if not study_id:
+            continue
+        previous = existing.get(study_id)
+        requested = study.get("RequestedTags") or {}
+        try:
+            instance_count = int(requested.get("NumberOfStudyRelatedInstances") or 0)
+        except (TypeError, ValueError):
+            instance_count = 0
+        if force or previous is None:
+            candidates.append(study)
+            continue
+        if int(previous.get("series_count") or 0) != len(study.get("Series") or []):
+            candidates.append(study)
+            continue
+        if instance_count and int(previous.get("instance_count") or 0) != instance_count:
+            candidates.append(study)
+            continue
+        if str(previous.get("delivery_status") or "").upper() in ("", "PROCESSING"):
+            candidates.append(study)
+    if candidates:
+        with ThreadPoolExecutor(max_workers=LIST_CONCURRENCY) as pool:
+            rows = [row for row in pool.map(lambda item: _fetch_study_row(client, item), candidates) if row is not None]
+        records = [index.record_from_api_row(row, source=source) for row in rows]
+        index.upsert_rows(records)
+    index._mark_sync(date_str)
+    return len(candidates)
 
 
 def get_study_instances_payload(orthanc, study_id):
@@ -325,7 +383,7 @@ def save_selection(orthanc, cfg, study_id, selected_instance_ids):
     return {"ok": True, "studyId": study_id, "selectedCount": len(selected_instance_ids)}
 
 
-def make_handler(cfg, orthanc, orthanc_backup):
+def make_handler(cfg, orthanc, orthanc_backup, radiology_index=None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             log.info("HTTP %s - %s", self.address_string(), fmt % args)
@@ -360,8 +418,31 @@ def make_handler(cfg, orthanc, orthanc_backup):
             try:
                 if data.get("action") == "LIST":
                     date_str = data.get("date") or datetime.now().strftime("%Y%m%d")
-                    rows = list_studies_for_date(orthanc, orthanc_backup, date_str)
                     requested_modality = str(data.get("modality") or "").strip().upper()
+                    if radiology_index and radiology_index.enabled:
+                        # Fast path: table first. Refresh only when the worker
+                        # has not recently completed its background sync or
+                        # the requested date is not indexed yet.
+                        if radiology_index.needs_refresh(date_str):
+                            try:
+                                sync_radiology_index(radiology_index, orthanc, orthanc_backup, date_str, force=False)
+                            except Exception as exc:
+                                log.warning("Radiology index refresh failed for %s: %s", date_str, exc)
+                        indexed_rows = radiology_index.list_rows(date_str, requested_modality)
+                        if indexed_rows:
+                            self._send_json(indexed_rows)
+                            return
+                        # Empty/missing index: one controlled Orthanc fill, then
+                        # read the table again so the next load is fast.
+                        try:
+                            sync_radiology_index(radiology_index, orthanc, orthanc_backup, date_str, force=True)
+                            indexed_rows = radiology_index.list_rows(date_str, requested_modality)
+                            if indexed_rows:
+                                self._send_json(indexed_rows)
+                                return
+                        except Exception as exc:
+                            log.warning("Radiology index fallback fill failed for %s: %s", date_str, exc)
+                    rows = list_studies_for_date(orthanc, orthanc_backup, date_str)
                     if requested_modality:
                         rows = [row for row in rows if str(row.get("modality") or "").upper() == requested_modality]
                     self._send_json(rows)
@@ -489,9 +570,9 @@ def make_handler(cfg, orthanc, orthanc_backup):
     return Handler
 
 
-def run_http_server(cfg, orthanc, orthanc_backup):
+def run_http_server(cfg, orthanc, orthanc_backup, radiology_index=None):
     port = cfg["http"]["port"]
-    server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(cfg, orthanc, orthanc_backup))
+    server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(cfg, orthanc, orthanc_backup, radiology_index))
     log.info(
         "HTTP API listening on 0.0.0.0:%d (LIST / manualsend, dry_run=%s, orthanc_backup=%s)",
         port, cfg["dry_run"], "configured" if orthanc_backup else "not configured",
@@ -499,7 +580,7 @@ def run_http_server(cfg, orthanc, orthanc_backup):
     server.serve_forever()
 
 
-def run_poll_loop(cfg, orthanc):
+def run_poll_loop(cfg, orthanc, orthanc_backup, radiology_index=None):
     poll_seconds = _poll_interval_seconds(cfg)
     # CT has its OWN activation flag (cfg["ct"]["enabled"], default False),
     # deliberately separate from cfg["dry_run"]. Found live on 2026-09-17:
@@ -520,6 +601,7 @@ def run_poll_loop(cfg, orthanc):
     while True:
         cycle_ok = True
         cycle_error = None
+        sent = 0
         try:
             sent = cr.process_once(cfg, orthanc)
             if sent:
@@ -551,17 +633,31 @@ def run_poll_loop(cfg, orthanc):
                 cycle_ok = False
                 cycle_error = (cycle_error + " | " if cycle_error else "") + f"CR yesterday: {exc}"
 
+        ct_sent = 0
         if ct_enabled:
             try:
-                sent = ct.process_once(cfg, orthanc)
-                if sent:
-                    log.info("Processed %d CT group(s) this cycle.", sent)
+                ct_sent = ct.process_once(cfg, orthanc)
+                if ct_sent:
+                    log.info("Processed %d CT group(s) this cycle.", ct_sent)
                     with _state_lock:
-                        _worker_state["ct_sent_total"] += sent
+                        _worker_state["ct_sent_total"] += ct_sent
             except Exception as exc:
                 log.exception("CT poll loop error: %s", exc)
                 cycle_ok = False
                 cycle_error = (cycle_error + " | " if cycle_error else "") + f"CT: {exc}"
+
+        if radiology_index and radiology_index.enabled:
+            try:
+                synced = sync_radiology_index(
+                    radiology_index, orthanc, orthanc_backup,
+                    today_key, force=bool(sent or ct_sent),
+                )
+                if synced:
+                    log.info("Radiology index synchronized %d study row(s) for %s.", synced, today_key)
+            except Exception as exc:
+                log.exception("Radiology index sync error: %s", exc)
+                cycle_ok = False
+                cycle_error = (cycle_error + " | " if cycle_error else "") + f"Radiology index: {exc}"
 
         with _state_lock:
             _worker_state["last_poll_at"] = datetime.now().isoformat()
@@ -584,8 +680,9 @@ if __name__ == "__main__":
 
     orthanc = build_orthanc(cfg)
     orthanc_backup = build_orthanc_backup(cfg)
+    radiology_index = RadiologyIndex(cfg)
 
-    http_thread = threading.Thread(target=run_http_server, args=(cfg, orthanc, orthanc_backup), daemon=True)
+    http_thread = threading.Thread(target=run_http_server, args=(cfg, orthanc, orthanc_backup, radiology_index), daemon=True)
     http_thread.start()
 
-    run_poll_loop(cfg, orthanc)
+    run_poll_loop(cfg, orthanc, orthanc_backup, radiology_index)
