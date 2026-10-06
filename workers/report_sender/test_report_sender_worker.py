@@ -2,7 +2,15 @@ import unittest
 from datetime import datetime, timedelta
 from unittest import mock
 
-from report_sender_worker import ReportSenderWorker, ready_reportable_testids, utc_now, utc_iso
+from report_sender_worker import (
+    ReportSenderWorker,
+    is_outsourced_only_reportable,
+    ready_reportable_testids,
+    ready_special_testids,
+    resolve_job_report_label,
+    utc_now,
+    utc_iso,
+)
 
 
 def base_cfg():
@@ -204,6 +212,42 @@ class WorkerTests(unittest.TestCase):
         }
         self.assertEqual(ready_reportable_testids(status), ["T1", "T3"])
 
+    def test_regular_and_special_testids_are_disjoint(self):
+        status = {
+            "tests": [
+                {"TEST_ID": "REG", "GROUPNM": "LAB", "DEPARTMENT": "BIOCHEMISTRY", "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1"},
+                {"TEST_ID": "SP", "GROUPNM": "LAB", "DEPARTMENT": "SPECIAL TESTS", "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1"},
+            ]
+        }
+        markers = {"DPT00033", "SPECIAL TESTS"}
+        self.assertEqual(ready_reportable_testids(status, markers), ["REG"])
+        self.assertEqual(ready_special_testids(status, markers), ["SP"])
+
+    def test_regular_label_uses_non_special_status_and_follow_note(self):
+        status = {
+            "overall_status": "PARTIAL_REPORT",
+            "overall_status_excluding_special": "FULL_REPORT",
+            "lab_total": 2,
+            "lab_ready": 1,
+            "radiology_total": 0,
+            "radiology_ready": 0,
+            "pending_special_tests": [{"TEST_ID": "SP", "TEST_NAME": "Special"}],
+            "tests": [
+                {"TEST_ID": "REG", "GROUPNM": "LAB", "DEPARTMENT": "BIOCHEMISTRY", "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1"},
+                {"TEST_ID": "SP", "GROUPNM": "LAB", "DEPARTMENT": "SPECIAL TESTS", "REPORT_STATUS": "PENDING", "APPROVEDFLG": "0"},
+            ],
+        }
+        label = resolve_job_report_label({"metadata": {}}, status, {"SPECIAL TESTS"})
+        self.assertEqual(label, "complete lab; special report to follow separately")
+
+    def test_special_only_detection_uses_department_not_old_status_literal(self):
+        status = {
+            "tests": [
+                {"TEST_ID": "SP", "GROUPNM": "LAB", "DEPARTMENT": "SPECIAL TESTS", "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1"},
+            ]
+        }
+        self.assertTrue(is_outsourced_only_reportable(status, {"SPECIAL TESTS"}))
+
     def test_mark_delivery_status_posts_testids(self):
         w = self.make_worker()
         calls = []
@@ -213,10 +257,44 @@ class WorkerTests(unittest.TestCase):
             {"id": 5, "reqno": "R5", "metadata": {}},
             {"reqno": "R5"},
             ["T1", "T3"],
+            sent_at="2026-10-06T15:42:10+05:30",
+            external_event_id="wamid.test",
         )
         self.assertEqual(result, {"ok": True})
         self.assertEqual(calls[0][0], "https://api.sdrc.in/py/delivery/status/update")
         self.assertIn('"testids": ["T1", "T3"]', calls[0][1]["data"])
+        self.assertIn('"channel_code": "whatsapp"', calls[0][1]["data"])
+        self.assertIn('"sent_at": "2026-10-06T15:42:10+05:30"', calls[0][1]["data"])
+        self.assertIn('"external_event_id": "wamid.test"', calls[0][1]["data"])
+
+    def test_special_delivery_status_uses_special_scope(self):
+        w = self.make_worker()
+        calls = []
+        w.http.post = lambda url, **kwargs: calls.append((url, kwargs)) or FakeResponse(text='{"ok":true}')
+        w._mark_delivery_status(
+            {"id": 5, "reqno": "R5", "metadata": {"report_source": "outsourced_report"}},
+            {"reqno": "R5"},
+            ["SP"],
+            sent_at="2026-10-06T15:42:10+05:30",
+            external_event_id="wamid.special",
+        )
+        self.assertIn('"scope": "special"', calls[0][1]["data"])
+
+    def test_outsourced_delivery_uses_enqueued_testids_not_later_ready_tests(self):
+        w = self.make_worker()
+        job = {
+            "metadata": {
+                "report_source": "outsourced_report",
+                "outsourced_testids": ["SP-SELECTED"],
+            }
+        }
+        status = {
+            "tests": [
+                {"TEST_ID": "SP-SELECTED", "DEPARTMENT": "SPECIAL TESTS", "APPROVEDFLG": "1"},
+                {"TEST_ID": "SP-LATER", "DEPARTMENT": "SPECIAL TESTS", "APPROVEDFLG": "1"},
+            ]
+        }
+        self.assertEqual(w._sent_testids_for_job(job, status), ["SP-SELECTED"])
 
     def test_session_document_route_sends_document_when_patient_window_active(self):
         w = self.make_worker()

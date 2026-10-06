@@ -247,16 +247,41 @@ def _status_has_special_test(status: Dict[str, Any], markers: set) -> bool:
     return False
 
 
+def _is_special_test(row: Dict[str, Any], markers: set) -> bool:
+    deptid = norm_text(row.get("DEPTID") or row.get("deptid")).upper()
+    department = norm_text(
+        row.get("DEPARTMENT") or row.get("department")
+        or row.get("GROUPNM") or row.get("groupnm")
+    ).upper()
+    return bool(markers) and (deptid in markers or department in markers)
+
+
+def regular_delivery_status(status: Dict[str, Any], markers: set) -> Dict[str, Any]:
+    """Status view for the ordinary bundle: special tests neither block it
+    nor get recorded as delivered by it."""
+    regular = dict(status)
+    tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+    regular["tests"] = [
+        row for row in tests
+        if not isinstance(row, dict) or not _is_special_test(row, markers)
+    ]
+    excluding = norm_text(status.get("overall_status_excluding_special")).upper()
+    if excluding:
+        regular["overall_status"] = excluding
+    return regular
+
+
 def resolve_job_report_label(job: Dict[str, Any], status: Dict[str, Any], special_markers: Optional[set] = None) -> str:
     meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
     report_source = norm_text(meta.get("report_source")).lower()
     if report_source == "outsourced_report":
         return "special report"
-    # Special-department tests are reported as "special" whether the result came
-    # in transcribed (typed into the LIS) or as an attachment -- same patient-facing wording.
-    if _status_has_special_test(status, special_markers if special_markers is not None else special_test_department_markers()):
-        return "special report"
-    return build_template_report_label(status)
+    markers = special_markers if special_markers is not None else special_test_department_markers()
+    label = build_template_report_label(regular_delivery_status(status, markers))
+    pending_special = status.get("pending_special_tests")
+    if isinstance(pending_special, list) and pending_special:
+        label = f"{label}; special report to follow separately"
+    return label[:120]
 
 
 def evaluate_same_day_readiness(status: Dict[str, Any]) -> bool:
@@ -298,15 +323,13 @@ def has_any_reportable_test(status: Dict[str, Any]) -> bool:
     return any(isinstance(t, dict) and is_lab_or_radiology_test(t) for t in tests)
 
 
-def is_outsourced_only_reportable(status: Dict[str, Any]) -> bool:
+def is_outsourced_only_reportable(status: Dict[str, Any], markers: Optional[set] = None) -> bool:
+    markers = markers if markers is not None else special_test_department_markers()
     tests = status.get("tests") if isinstance(status.get("tests"), list) else []
     reportable = [t for t in tests if isinstance(t, dict) and is_lab_or_radiology_test(t)]
     if not reportable:
         return False
-    return all(
-        norm_text(t.get("REPORT_STATUS") or t.get("report_status")).upper() == "OUTSOURCED"
-        for t in reportable
-    )
+    return all(_is_special_test(t, markers) for t in reportable)
 
 
 def is_no_reportable_case(status: Dict[str, Any]) -> bool:
@@ -376,14 +399,15 @@ def same_day_counts_and_pending(status: Dict[str, Any]) -> Tuple[int, int, List[
     return total, ready, pending
 
 
-def ready_reportable_testids(status: Dict[str, Any]) -> List[str]:
+def ready_reportable_testids(status: Dict[str, Any], markers: Optional[set] = None) -> List[str]:
+    markers = markers if markers is not None else special_test_department_markers()
     tests = status.get("tests") if isinstance(status.get("tests"), list) else []
     out: List[str] = []
     seen = set()
     for row in tests:
         if not isinstance(row, dict):
             continue
-        if not is_lab_or_radiology_test(row) or not is_ready_test(row):
+        if not is_lab_or_radiology_test(row) or not is_ready_test(row) or _is_special_test(row, markers):
             continue
         testid = norm_text(
             row.get("TEST_ID") or
@@ -391,6 +415,35 @@ def ready_reportable_testids(status: Dict[str, Any]) -> List[str]:
             row.get("test_id") or
             row.get("testid") or
             row.get("key")
+        )
+        if not testid or testid in seen:
+            continue
+        seen.add(testid)
+        out.append(testid)
+    return out
+
+
+def ready_special_testids(status: Dict[str, Any], markers: Optional[set] = None) -> List[str]:
+    """Sibling of ready_reportable_testids for the special/outsourced bundle
+    (2026-09-27 split-delivery work): ready, approved tests whose department
+    matches the same config-driven marker set _status_has_special_test uses.
+    Used both to decide whether a special-bundle reconciliation job is due,
+    and to record which special test ids a special send actually covered
+    (director: "mark test ids that are sent too so we have that granularity
+    clearly") -- the same purpose ready_reportable_testids already serves
+    for the regular send, just for the special one."""
+    markers = markers if markers is not None else special_test_department_markers()
+    tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+    out: List[str] = []
+    seen = set()
+    for row in tests:
+        if not isinstance(row, dict) or not is_ready_test(row):
+            continue
+        if not _is_special_test(row, markers):
+            continue
+        testid = norm_text(
+            row.get("TEST_ID") or row.get("TESTID")
+            or row.get("test_id") or row.get("testid") or row.get("key")
         )
         if not testid or testid in seen:
             continue
@@ -1078,16 +1131,19 @@ class ReportSenderWorker:
         reqno = norm_text(job.get("reqno") or status.get("reqno"))
         meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
         report_source = norm_text(meta.get("report_source")).lower()
-        outsourced_testid = norm_text(meta.get("outsourced_testid"))
         if not base or not reqid:
             raise ValueError("Missing base_url or reqid for report document URL")
         if report_source == "outsourced_report":
-            if not outsourced_testid:
-                raise ValueError("Missing outsourced_testid for outsourced report URL")
-            url = f"{base}/outsourced-report?reqid={reqid}&testid={outsourced_testid}"
+            # 2026-09-27: the special bundle (labit-core delivery_service.
+            # render_dispatch_pdf scope="special" -- special/outsourced
+            # content, attached or transcribed, + T&C + dispatch sheet,
+            # nothing else) replaces the old per-test raw-attachment fetch
+            # (/outsourced-report?reqid=&testid=), which never included the
+            # T&C/dispatch sheet at all and could only ever send one test's
+            # attachment per job.
             if reqno:
-                url += f"&reqno={reqno}"
-            return url
+                return f"{base}/special_report/{reqid}?reqno={reqno}"
+            return f"{base}/special_report/{reqid}"
         if reqno:
             return f"{base}/report/{reqid}?reqno={reqno}"
         return f"{base}/report/{reqid}"
@@ -1095,10 +1151,32 @@ class ReportSenderWorker:
     def _sent_testids_for_job(self, job: Dict[str, Any], status: Dict[str, Any]) -> List[str]:
         meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
         report_source = norm_text(meta.get("report_source") or "requisition_report").lower() or "requisition_report"
-        outsourced_testid = norm_text(meta.get("outsourced_testid"))
         if report_source == "outsourced_report":
-            return [outsourced_testid] if outsourced_testid else []
-        return ready_reportable_testids(status)
+            # An outsourced job may intentionally cover only one selected
+            # test (legacy outsourced_testid) or a fixed bundle selected by
+            # the enqueue worker (outsourced_testids). Prefer that immutable
+            # send scope over the live status snapshot: more special tests
+            # can become ready between enqueue and callback, and must not be
+            # marked delivered by a PDF that did not contain them.
+            selected = meta.get("outsourced_testids")
+            if not isinstance(selected, list):
+                selected = [meta.get("outsourced_testid")]
+            exact = []
+            seen = set()
+            for value in selected:
+                testid = norm_text(value)
+                if not testid or testid in seen:
+                    continue
+                seen.add(testid)
+                exact.append(testid)
+            if exact:
+                return exact
+            # 2026-09-27: the special bundle now covers every ready special
+            # test at send time (scope=special on labit-core), not one
+            # testid per job -- record all of them, same granularity
+            # ready_reportable_testids already gives the regular send.
+            return ready_special_testids(status, self.special_test_markers)
+        return ready_reportable_testids(status, self.special_test_markers)
 
     def _send_template(self, job: Dict[str, Any], status: Dict[str, Any], report_label: str) -> Dict[str, Any]:
         wa = self.cfg["whatsapp"]
@@ -1344,7 +1422,15 @@ class ReportSenderWorker:
                 })
         return self._send_template(job, status, report_label)
 
-    def _mark_delivery_status(self, job: Dict[str, Any], status: Dict[str, Any], sent_testids: List[str]) -> Dict[str, Any]:
+    def _mark_delivery_status(
+        self,
+        job: Dict[str, Any],
+        status: Dict[str, Any],
+        sent_testids: List[str],
+        *,
+        sent_at: str,
+        external_event_id: str,
+    ) -> Dict[str, Any]:
         reqno = norm_text(job.get("reqno") or status.get("reqno"))
         if not reqno:
             raise ValueError("Missing reqno for delivery status update")
@@ -1355,10 +1441,15 @@ class ReportSenderWorker:
         report_source = norm_text(meta.get("report_source") or "requisition_report").lower() or "requisition_report"
         payload = {
             "reqno": reqno,
+            "channel_code": "whatsapp",
+            "sent_at": sent_at,
+            "external_event_id": external_event_id,
+            # Retained while labit-py's compatibility bridge still accepts
+            # the legacy NeoSoft delivery-status vocabulary.
             "status": "S",
             "channel": "WHATSAPP",
             "message": f"OK {report_source.upper()}",
-            "scope": "all",
+            "scope": "special" if report_source == "outsourced_report" else "all",
             "testids": sent_testids,
         }
         timeout = int(self.cfg.get("worker", {}).get("request_timeout_seconds", 40))
@@ -1438,6 +1529,10 @@ class ReportSenderWorker:
 
         status = self._fetch_status(job)
         report_label = resolve_job_report_label(job, status, self.special_test_markers)
+        meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+        report_source = norm_text(meta.get("report_source") or "requisition_report").lower() or "requisition_report"
+        is_special_job = report_source == "outsourced_report"
+        readiness_status = status if is_special_job else regular_delivery_status(status, self.special_test_markers)
         self.log.info("status-check %s overall=%s label=%s", self._job_ctx(job, status), norm_text(status.get("overall_status") or "-"), report_label)
 
         # Check dispatch constraints before proceeding
@@ -1461,10 +1556,10 @@ class ReportSenderWorker:
             self.log.info("skip-dispatch-denied %s reason=%s", self._job_ctx(job, status), denial_reason)
             return
 
-        sameday_total, sameday_ready, not_ready_tests = same_day_counts_and_pending(status)
+        sameday_total, sameday_ready, not_ready_tests = same_day_counts_and_pending(readiness_status)
 
-        has_required = has_same_day_required_tests(status)
-        all_ready = evaluate_same_day_readiness(status)
+        has_required = has_same_day_required_tests(readiness_status)
+        all_ready = evaluate_same_day_readiness(readiness_status)
         if is_no_reportable_case(status):
             reason = "no_lab_or_radiology_tests"
             if has_any_reportable_test(status):
@@ -1493,9 +1588,11 @@ class ReportSenderWorker:
             self._event(job, "skipped_no_reportable_tests", "No reportable lab/radiology tests found", {"reason": reason})
             self.log.info("skip-no-reportable %s reason=%s", self._job_ctx(job, status), reason)
             return
-        if not has_required:
-            overall = norm_text(status.get("overall_status")).upper()
-            rad_ready = int(status.get("radiology_ready") or 0)
+        if is_special_job:
+            all_ready = bool(ready_special_testids(status, self.special_test_markers))
+        elif not has_required:
+            overall = norm_text(readiness_status.get("overall_status")).upper()
+            rad_ready = int(readiness_status.get("radiology_ready") or 0)
             all_ready = overall == "FULL_REPORT" or rad_ready > 0
         if not all_ready:
             cutoff_due, cutoff_at_utc = self._partial_cutoff_due(job)
@@ -1578,9 +1675,6 @@ class ReportSenderWorker:
             return
 
         attempts = int(job.get("attempt_count") or 0)
-        meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
-        report_source = norm_text(meta.get("report_source") or "requisition_report").lower() or "requisition_report"
-
         # Duplicate-send guard: do not resend when same-day ready count has not increased.
         # Exception: reconciliation follow-ups bypass this (they're created when partial→full happens).
         is_reconcile = bool(meta.get("reconcile", False))
@@ -1608,7 +1702,7 @@ class ReportSenderWorker:
 
         # Guard: regular job for an outsourced-only requisition — PDF will never be at the regular URL.
         # Fail immediately so retries are not wasted; enqueue reconcile will create the outsourced split job.
-        if report_source != "outsourced_report" and is_outsourced_only_reportable(status):
+        if report_source != "outsourced_report" and is_outsourced_only_reportable(status, self.special_test_markers):
             self._patch_job(job, {
                 "status": "failed",
                 "last_error": "outsourced_only_regular_job",
@@ -1642,10 +1736,18 @@ class ReportSenderWorker:
             )
             dispatch_route = norm_text(_resp.get("dispatch_route") or "template")
             sent_testids = self._sent_testids_for_job(job, status)
+            sent_at = utc_now().astimezone(IST).isoformat()
+            external_event_id = provider_id or f"report-sender:{job.get('id')}:{attempts + 1}"
             delivery_status_update = None
             delivery_status_error = None
             try:
-                delivery_status_update = self._mark_delivery_status(job, status, sent_testids)
+                delivery_status_update = self._mark_delivery_status(
+                    job,
+                    status,
+                    sent_testids,
+                    sent_at=sent_at,
+                    external_event_id=external_event_id,
+                )
                 self.log.info("delivery-status-marked %s testids=%s", self._job_ctx(job, status), ",".join(sent_testids) or "-")
             except Exception as mark_exc:
                 delivery_status_error = str(mark_exc)
@@ -1662,16 +1764,25 @@ class ReportSenderWorker:
                 # not only nested under "whatsapp". Applies to both the
                 # template and session-document routes.
                 "provider_message_id": provider_id or None,
+                "sent_at": sent_at,
+                "external_event_id": external_event_id,
                 "dispatch_route": dispatch_route,
                 "delivery_status_update": delivery_status_update,
                 "delivery_status_error": delivery_status_error,
                 "sent_testids": sent_testids,
             }
+            sent_meta = dict(meta or {})
+            if report_source == "outsourced_report":
+                # The bundle renders every ready special test at send time,
+                # which can be a superset of what was ready when enqueued.
+                # Persist the exact covered set for later reconciliation.
+                sent_meta["outsourced_testids"] = sent_testids
             self._patch_job(job, {
                 "status": "sent",
-                "sent_at": utc_iso(),
+                "sent_at": sent_at,
                 "last_error": None,
                 "provider_response": provider_payload,
+                "metadata": sent_meta,
             })
             self.log.info("sent %s label=%s route=%s provider_message_id=%s", self._job_ctx(job, status), report_label, dispatch_route, provider_id or "-")
             self._event(job, "sent", "Report sent successfully", {

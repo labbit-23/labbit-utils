@@ -299,21 +299,6 @@ class SupabaseRest:
 
 
 class EnqueueWorker:
-    # Director, 2026-09-27: "we dont do attachment qr logic anymore, Its
-    # either attached or transcribed." Confirmed live in labit-py's
-    # app/outsourced_report_fetcher.py: fetch_outsourced_report() (the
-    # function actually backing the /outsourced-report/meta endpoint this
-    # file calls) has an unconditional early return -- "Intentional policy:
-    # use existing attached PDF directly for dispatch. Keep QR decode/fetch
-    # code in-place for possible future reuse, but bypass it now." -- before
-    # any of its QR-decode code (which would produce "attached_qr") ever
-    # runs. That mode is dead/unreachable from this call path; only
-    # "attached_base", "transcribed", or "unavailable" can come back today.
-    # ("attached_pending_resolution" is a real mode too, but only from the
-    # OTHER, lightweight classify_outsourced_report() function -- a
-    # different endpoint this file doesn't call.)
-    ATTACHED_OUTSOURCED_MODES = {"attached_base"}
-
     def __init__(self, cfg: Dict[str, Any], dry_run: bool = False) -> None:
         self.cfg = cfg
         self.dry_run = dry_run
@@ -488,52 +473,82 @@ class EnqueueWorker:
                 return False
         return True
 
-    def _outsourced_tests_need_split_job(self, status: Dict[str, Any], reqid: str) -> bool:
-        """True if at least one outsourced-ready test on this requisition will
-        actually get its own attached-PDF split job from _reconcile_outsourced_jobs
-        (mode attached_base). False for transcribed-only results, which are
-        typed into the consolidated report and must go through the normal
-        follow-up job instead -- otherwise the split-job path silently never
-        creates anything for them and the regular path shouldn't skip either."""
-        for testid in self._extract_outsourced_ready_testids(status):
-            meta = self._fetch_outsourced_meta(reqid=reqid, testid=testid)
-            mode = norm(meta.get("outsourced_mode") or meta.get("mode")).lower()
-            if mode in self.ATTACHED_OUTSOURCED_MODES:
+    # 2026-09-27 split-delivery rework: the special bundle now covers every
+    # ready special test at send time (labit-core delivery_service.
+    # render_dispatch_pdf scope="special") instead of one job per test id --
+    # dedup is reqno-level (is a special job already in flight; has THIS
+    # specific set of ready tests already been delivered), not per-testid.
+
+    _SPECIAL_ACTIVE_STATUSES = {"queued", "cooling_off", "eligible", "retrying", "sending", "processing"}
+
+    def _has_active_special_job(self, jobs_table: str, reqno: str) -> bool:
+        rows = self.sb.list_jobs_by_reqno(jobs_table, reqno=reqno, limit=300)
+        for row in rows:
+            meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            if norm(meta.get("report_source")).lower() != "outsourced_report":
+                continue
+            if norm(row.get("status")).lower() in self._SPECIAL_ACTIVE_STATUSES:
                 return True
         return False
 
-    def _has_outsourced_job(self, jobs_table: str, reqno: str, testid: str, statuses: set[str]) -> bool:
+    def _already_sent_special_testids(self, jobs_table: str, reqno: str) -> set:
         rows = self.sb.list_jobs_by_reqno(jobs_table, reqno=reqno, limit=300)
-        wanted = norm(testid).upper()
+        covered: set = set()
         for row in rows:
-            st = norm(row.get("status")).lower()
-            if st not in statuses:
+            if norm(row.get("status")).lower() != "sent":
                 continue
             meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-            src = norm(meta.get("report_source")).lower()
-            tid = norm(meta.get("outsourced_testid")).upper()
-            if src == "outsourced_report" and tid == wanted:
-                return True
-        return False
+            if norm(meta.get("report_source")).lower() != "outsourced_report":
+                continue
+            for tid in (meta.get("outsourced_testids") or []):
+                covered.add(norm(tid).upper())
+        return covered
 
-    def _fetch_outsourced_meta(self, reqid: str, testid: str) -> Dict[str, Any]:
-        base = norm(self.cfg.get("labbit_py", {}).get("base_url")).rstrip("/")
-        reqid = self._status_reqid(reqid)
-        if not base or not reqid or not testid:
-            return {}
-        timeout = int(self.cfg.get("enqueue", {}).get("request_timeout_seconds", 20))
-        try:
-            r = self.http.get(
-                f"{base}/outsourced-report/meta",
-                params={"reqid": reqid, "testid": testid},
-                timeout=timeout,
-            )
-            r.raise_for_status()
-            data = r.json()
-            return data if isinstance(data, dict) else {}
-        except Exception as e:
-            self.log.warning("outsourced-meta fetch failed reqid=%s testid=%s err=%s", reqid, testid, e)
-            return {}
+    def _maybe_enqueue_special_job(
+        self, jobs_table: str, *, row: Dict[str, Any], reqno: str, reqid: str, phone: str,
+        mrno: str, name: str, ready_testids: List[str], lab_id: str, paused_default: bool,
+        cooloff: int, max_attempts: int, reason: str,
+    ) -> bool:
+        """One job for the whole special bundle, not one per test. Skips if
+        a special job is already in flight (it'll pick up whatever's ready
+        at send time regardless), or if every currently-ready special test
+        was already covered by a prior SENT special job -- only enqueues
+        when there's genuinely new special content to deliver."""
+        if not ready_testids:
+            return False
+        if self._has_active_special_job(jobs_table, reqno):
+            return False
+        wanted = {norm(t).upper() for t in ready_testids}
+        if wanted <= self._already_sent_special_testids(jobs_table, reqno):
+            return False
+        job = {
+            "lab_id": lab_id,
+            "reqno": reqno,
+            "reqid": reqid or None,
+            "mrno": mrno or None,
+            "phone": phone,
+            "patient_name": name or None,
+            "status": "queued",
+            "is_paused": paused_default,
+            "force_send_now": False,
+            "cooloff_minutes": cooloff,
+            "attempt_count": 0,
+            "max_attempts": max_attempts,
+            "next_attempt_at": utc_iso(),
+            "metadata": self._job_metadata(row, {
+                "report_source": "outsourced_report",
+                "outsourced_testids": sorted(wanted),
+                "reason": reason,
+            }),
+            "created_at": utc_iso(),
+            "updated_at": utc_iso(),
+        }
+        if self.dry_run:
+            self.log.info("[dry-run] special-bundle enqueue reqno=%s testids=%s reason=%s", reqno, sorted(wanted), reason)
+        else:
+            self.sb.insert_job(jobs_table, job)
+        self.log.info("special-bundle enqueued reqno=%s testids=%s reason=%s", reqno, sorted(wanted), reason)
+        return True
 
     def _same_day_full_ready(self, status: Dict[str, Any]) -> bool:
         tests = status.get("tests") if isinstance(status.get("tests"), list) else []
@@ -550,7 +565,10 @@ class EnqueueWorker:
         return total, ready
 
     def _is_overall_full_ready(self, status: Dict[str, Any]) -> bool:
-        overall = norm(status.get("overall_status")).upper()
+        overall = norm(
+            status.get("overall_status_excluding_special")
+            or status.get("overall_status")
+        ).upper()
         return overall == "FULL_REPORT"
 
     def _is_partial_label(self, label: Any) -> bool:
@@ -769,16 +787,17 @@ class EnqueueWorker:
             if not self._is_overall_full_ready(live):
                 continue
 
-            # If live status shows all reportable tests are outsourced, a regular job
-            # only fails when the result is an attached PDF (not at the regular report
-            # URL) -- mirror run_once and let _reconcile_outsourced_jobs create the
-            # split job instead. But a "transcribed" outsourced result is typed
-            # directly into the consolidated report, so the regular URL DOES have it;
-            # _reconcile_outsourced_jobs deliberately never makes a split job for
-            # transcribed mode ("remains on regular flow"). Skipping here too would
-            # leave the requisition in a gap where neither path ever sends it -- only
-            # skip when at least one outsourced-ready test actually needs a split job.
-            if self._is_outsourced_only_reportable(live) and self._outsourced_tests_need_split_job(live, reqid):
+            # If live status shows all reportable tests are special/outsourced,
+            # the regular URL has nothing to render at all now -- labit-core's
+            # scope="all"/"lab"/"radiology" excludes special-department content
+            # unconditionally (2026-09-27 split-delivery rework), attached OR
+            # transcribed alike (previously only attached-PDF results needed
+            # this skip; a transcribed one used to still be typed into the
+            # regular bundle, so that distinction mattered -- it no longer
+            # does, since transcribed special content moved to the special
+            # bundle too). Let _reconcile_outsourced_jobs's special-bundle
+            # job cover it instead.
+            if self._is_outsourced_only_reportable(live):
                 self.log.info("Reconcile skip reqno=%s reason=outsourced_only_all_tests", reqno)
                 continue
 
@@ -935,53 +954,11 @@ class EnqueueWorker:
             mrno = norm(row.get("mrno"))
             name = norm(row.get("patient_name"))
 
-            for testid in outsourced_testids:
-                if self._has_outsourced_job(
-                    jobs_table,
-                    reqno=reqno,
-                    testid=testid,
-                    statuses={"queued", "cooling_off", "eligible", "retrying", "sending", "processing", "sent"},
-                ):
-                    continue
-
-                # Confirm PDF is available — fail-closed: skip if unavailable or endpoint unreachable.
-                meta_resp = self._fetch_outsourced_meta(reqid=reqid, testid=testid)
-                mode = norm(meta_resp.get("outsourced_mode") or meta_resp.get("mode")).lower()
-                if not mode or mode not in self.ATTACHED_OUTSOURCED_MODES:
-                    self.log.info(
-                        "reconcile-outsourced skip reqno=%s testid=%s mode=%s reason=pdf_not_available",
-                        reqno, testid, mode or "unknown",
-                    )
-                    continue
-
-                job = {
-                    "lab_id": lab_id,
-                    "reqno": reqno,
-                    "reqid": reqid or None,
-                    "mrno": mrno or None,
-                    "phone": phone,
-                    "patient_name": name or None,
-                    "status": "queued",
-                    "is_paused": paused_default,
-                    "force_send_now": False,
-                    "cooloff_minutes": cooloff,
-                    "attempt_count": 0,
-                    "max_attempts": max_attempts,
-                    "next_attempt_at": utc_iso(),
-                    "metadata": self._job_metadata(row, {
-                        "report_source": "outsourced_report",
-                        "outsourced_testid": testid,
-                        "outsourced_mode": mode,
-                        "reason": "outsourced_reconcile",
-                    }),
-                    "created_at": utc_iso(),
-                    "updated_at": utc_iso(),
-                }
-                if self.dry_run:
-                    self.log.info("[dry-run] reconcile-outsourced enqueue reqno=%s testid=%s mode=%s", reqno, testid, mode)
-                else:
-                    self.sb.insert_job(jobs_table, job)
-                self.log.info("reconcile-outsourced enqueued reqno=%s testid=%s mode=%s", reqno, testid, mode)
+            if self._maybe_enqueue_special_job(
+                jobs_table, row=row, reqno=reqno, reqid=reqid, phone=phone, mrno=mrno, name=name,
+                ready_testids=outsourced_testids, lab_id=lab_id, paused_default=paused_default,
+                cooloff=cooloff, max_attempts=max_attempts, reason="outsourced_reconcile",
+            ):
                 added += 1
 
         # Also scan failed regular jobs — PDF may have arrived after they exhausted retries.
@@ -1017,64 +994,23 @@ class EnqueueWorker:
             mrno = norm(row.get("mrno"))
             name = norm(row.get("patient_name"))
 
-            for testid in outsourced_testids:
-                if self._has_outsourced_job(
-                    jobs_table,
-                    reqno=reqno,
-                    testid=testid,
-                    statuses={"queued", "cooling_off", "eligible", "retrying", "sending", "processing", "sent"},
-                ):
-                    continue
-
-                meta_resp = self._fetch_outsourced_meta(reqid=reqid, testid=testid)
-                mode = norm(meta_resp.get("outsourced_mode") or meta_resp.get("mode")).lower()
-                if not mode or mode not in self.ATTACHED_OUTSOURCED_MODES:
-                    self.log.info(
-                        "reconcile-outsourced-failed skip reqno=%s testid=%s mode=%s reason=pdf_not_available",
-                        reqno, testid, mode or "unknown",
-                    )
-                    continue
-
-                job = {
-                    "lab_id": lab_id,
-                    "reqno": reqno,
-                    "reqid": reqid or None,
-                    "mrno": mrno or None,
-                    "phone": phone,
-                    "patient_name": name or None,
-                    "status": "queued",
-                    "is_paused": paused_default,
-                    "force_send_now": False,
-                    "cooloff_minutes": cooloff,
-                    "attempt_count": 0,
-                    "max_attempts": max_attempts,
-                    "next_attempt_at": utc_iso(),
-                    "metadata": self._job_metadata(row, {
-                        "report_source": "outsourced_report",
-                        "outsourced_testid": testid,
-                        "outsourced_mode": mode,
-                        "reason": "outsourced_reconcile_from_failed",
-                    }),
-                    "created_at": utc_iso(),
-                    "updated_at": utc_iso(),
-                }
-                if self.dry_run:
-                    self.log.info("[dry-run] reconcile-outsourced-failed enqueue reqno=%s testid=%s mode=%s", reqno, testid, mode)
-                else:
-                    self.sb.insert_job(jobs_table, job)
-                    if source_job_id:
-                        try:
-                            defer_hours = int(self.cfg.get("enqueue", {}).get("outsourced_defer_hours", 6))
-                            src_meta = dict(row.get("metadata") or {})
-                            src_meta["deferred_reason"] = "outsourced_split_created"
-                            src_meta["deferred_at"] = utc_iso()
-                            self.sb.defer_job_by_id(jobs_table, source_job_id, hours=defer_hours, merged_meta=src_meta)
-                            self.log.info("reconcile-outsourced-failed deferred source job_id=%s reqno=%s hours=%s", source_job_id, reqno, defer_hours)
-                            source_job_id = None  # only defer once per reqno
-                        except Exception as e:
-                            self.log.warning("reconcile-outsourced-failed defer-failed job_id=%s err=%s", source_job_id, e)
-                self.log.info("reconcile-outsourced-failed enqueued reqno=%s testid=%s mode=%s", reqno, testid, mode)
+            created = self._maybe_enqueue_special_job(
+                jobs_table, row=row, reqno=reqno, reqid=reqid, phone=phone, mrno=mrno, name=name,
+                ready_testids=outsourced_testids, lab_id=lab_id, paused_default=paused_default,
+                cooloff=cooloff, max_attempts=max_attempts, reason="outsourced_reconcile_from_failed",
+            )
+            if created:
                 added += 1
+                if source_job_id and not self.dry_run:
+                    try:
+                        defer_hours = int(self.cfg.get("enqueue", {}).get("outsourced_defer_hours", 6))
+                        src_meta = dict(row.get("metadata") or {})
+                        src_meta["deferred_reason"] = "outsourced_split_created"
+                        src_meta["deferred_at"] = utc_iso()
+                        self.sb.defer_job_by_id(jobs_table, source_job_id, hours=defer_hours, merged_meta=src_meta)
+                        self.log.info("reconcile-outsourced-failed deferred source job_id=%s reqno=%s hours=%s", source_job_id, reqno, defer_hours)
+                    except Exception as e:
+                        self.log.warning("reconcile-outsourced-failed defer-failed job_id=%s err=%s", source_job_id, e)
 
         if added:
             self.log.info("Reconcile-outsourced complete. new_outsourced_jobs=%s", added)
@@ -1180,13 +1116,20 @@ class EnqueueWorker:
                 continue
 
             latest = self.sb.latest_job(jobs_table, reqno)
+            regular_job_blocked = False
             if latest:
                 latest_status = norm(latest.get("status")).lower()
+                latest_meta = latest.get("metadata") if isinstance(latest.get("metadata"), dict) else {}
+                latest_is_special = norm(latest_meta.get("report_source")).lower() == "outsourced_report"
                 if latest_status in {"queued", "cooling_off", "eligible", "retrying", "sending", "processing", "sent"}:
-                    continue
+                    # A regular job must not suppress special-bundle discovery,
+                    # and an active/sent special job must not suppress creation
+                    # of the requisition's ordinary job. Apply this gate only
+                    # immediately before ordinary enqueue below.
+                    regular_job_blocked = not latest_is_special
                 # If latest is skipped/failed, re-evaluate live status and allow re-activation
                 # when reportable tests are present (e.g., non-same-day culture/TMT pending).
-                if latest_status in {"skipped", "failed"}:
+                elif latest_status in {"skipped", "failed"} and not latest_is_special:
                     try:
                         live = self._fetch_status(reqno=reqno, reqid=reqid)
                     except Exception as e:
@@ -1213,81 +1156,31 @@ class EnqueueWorker:
                 self.log.warning("Skip enqueue reqno=%s reason=status-fetch-failed err=%s", reqno, e)
                 continue
 
-            # Split outsourced attached-PDF tests into separate jobs (works for mixed and outsourced-only requisitions).
+            # Split ready special/outsourced tests into their own bundle job
+            # (attached-PDF or transcribed -- labit-core's scope="special"
+            # decides that internally; this file only needs to know a
+            # special test is ready). Works for mixed and outsourced-only
+            # requisitions alike.
             outsourced_testids = self._extract_outsourced_ready_testids(live)
-            outsourced_enqueued = 0
-            for testid in outsourced_testids:
-                # Dedupe by reqno+testid for active/sent outsourced jobs.
-                if self._has_outsourced_job(
-                    jobs_table,
-                    reqno=reqno,
-                    testid=testid,
-                    statuses={"queued", "cooling_off", "eligible", "retrying", "sending", "processing", "sent"},
-                ):
-                    continue
-                meta = self._fetch_outsourced_meta(reqid=reqid, testid=testid)
-                mode = norm(meta.get("outsourced_mode") or meta.get("mode")).lower()
-                # Enqueue separate outsourced jobs for attached-PDF routes.
-                # If mode resolver is unavailable, fail-open to split-job enqueue so
-                # outsourced ready tests are not silently dropped.
-                # Transcribed rows remain on regular requisition flow.
-                if mode and mode not in self.ATTACHED_OUTSOURCED_MODES:
-                    continue
-                normalized_mode = mode or "unavailable"
-                job = {
-                    "lab_id": lab_id,
-                    "reqno": reqno,
-                    "reqid": reqid or None,
-                    "mrno": mrno or None,
-                    "phone": phone,
-                    "patient_name": name or None,
-                    "status": "queued",
-                    "is_paused": paused_default,
-                    "force_send_now": False,
-                    "cooloff_minutes": cooloff,
-                    "attempt_count": 0,
-                    "max_attempts": int(self.cfg.get("worker", {}).get("max_attempts", 5)),
-                    "next_attempt_at": utc_iso(),
-                    "metadata": self._job_metadata(row, {
-                        "report_source": "outsourced_report",
-                        "outsourced_testid": testid,
-                        "outsourced_mode": normalized_mode,
-                        "reason": "outsourced_separate_job",
-                    }),
-                    "created_at": utc_iso(),
-                    "updated_at": utc_iso(),
-                }
-                if self.dry_run:
-                    self.log.info("[dry-run] enqueue-outsourced reqno=%s testid=%s mode=%s", reqno, testid, mode)
-                else:
-                    self.sb.insert_job(jobs_table, job)
+            if self._maybe_enqueue_special_job(
+                jobs_table, row=row, reqno=reqno, reqid=reqid, phone=phone, mrno=mrno, name=name,
+                ready_testids=outsourced_testids, lab_id=lab_id, paused_default=paused_default,
+                cooloff=cooloff, max_attempts=int(self.cfg.get("worker", {}).get("max_attempts", 5)),
+                reason="outsourced_separate_job",
+            ):
                 enqueued += 1
-                outsourced_enqueued += 1
 
-            # For outsourced-only requisitions, convert existing regular job or create outsourced job
-            if self._is_outsourced_only_reportable(live) and outsourced_enqueued > 0:
-                # If a single outsourced test exists and there's an existing regular job, convert it
-                if len(outsourced_testids) == 1:
-                    existing_regular = self.sb.latest_job(jobs_table, reqno)
-                    if existing_regular and norm(existing_regular.get("status")).lower() in {"failed", "skipped", "queued", "cooling_off"}:
-                        # Convert existing regular job to outsourced
-                        meta = parse_metadata(existing_regular.get("metadata"))
-                        meta["report_source"] = "outsourced_report"
-                        meta["outsourced_testid"] = outsourced_testids[0]
-                        if self.dry_run:
-                            self.log.info("[dry-run] convert-to-outsourced reqno=%s", reqno)
-                        else:
-                            self.sb.patch_job(jobs_table, existing_regular.get("id"), {
-                                "metadata": meta,
-                                "status": "queued",
-                                "next_attempt_at": utc_iso(),
-                                "last_error": None,
-                                "updated_at": utc_iso(),
-                            })
-                        self.log.info("Convert regular job to outsourced reqno=%s testid=%s", reqno, outsourced_testids[0])
+            # An outsourced-only requisition has no regular content to send
+            # at all -- scope="all"/"lab"/"radiology" would find nothing to
+            # render (delivery_service.render_dispatch_pdf 422s on empty
+            # content). Skip the regular job entirely rather than let it
+            # fail every attempt; the special job above (or a later
+            # reconciliation pass, once more special content is ready) is
+            # the only thing this requisition should ever send.
+            if self._is_outsourced_only_reportable(live):
                 continue
 
-            if already_dispatched:
+            if already_dispatched or regular_job_blocked:
                 continue
 
             job = {

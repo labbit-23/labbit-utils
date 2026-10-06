@@ -65,6 +65,55 @@ class EnqueueWorkerTests(unittest.TestCase):
             {"source_backend": "shivam_archive", "report_origin": "shivam_archive"},
         )
 
+    def test_full_ready_for_regular_bundle_ignores_pending_special_only(self):
+        worker = self.make_worker()
+        self.assertTrue(worker._is_overall_full_ready({
+            "overall_status": "PARTIAL_REPORT",
+            "overall_status_excluding_special": "FULL_REPORT",
+        }))
+
+    def test_sent_regular_job_does_not_suppress_new_special_bundle(self):
+        worker = EnqueueWorker(base_cfg(), dry_run=False)
+
+        class FakeSB:
+            def __init__(self):
+                self.inserted = []
+
+            def latest_job(self, table, reqno):
+                return {"id": "regular", "status": "sent", "metadata": {}}
+
+            def dispatched_exists(self, reqno, phone):
+                return True
+
+            def list_jobs_by_reqno(self, table, reqno, limit=300):
+                return [{"id": "regular", "status": "sent", "metadata": {}}]
+
+            def insert_job(self, table, job):
+                self.inserted.append(job)
+
+        worker.sb = FakeSB()
+        worker._can_start = lambda: True
+        worker._today_ist = lambda: "2026-10-04"
+        worker._fetch_rows = lambda: [{
+            "REQNO": "R1", "REQID": "REQ1", "PHONENO": "9849025601",
+            "PATIENTNM": "Patient", "MRNO": "M1",
+        }]
+        worker._fetch_status = lambda **kwargs: {
+            "tests": [{
+                "TEST_ID": "SP", "GROUPNM": "LAB", "DEPARTMENT": "SPECIAL TESTS",
+                "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1",
+            }]
+        }
+        worker._should_skip_invalid_phone_reenqueue = lambda *args: False
+        worker._reconcile_recent = lambda *args: None
+        worker._reconcile_outsourced_jobs = lambda *args: 0
+        worker._expire_deferred_jobs = lambda *args: None
+
+        worker.run_once()
+
+        self.assertEqual(len(worker.sb.inserted), 1)
+        self.assertEqual(worker.sb.inserted[0]["metadata"]["report_source"], "outsourced_report")
+
 
 class PatientMessageJobsTests(unittest.TestCase):
     def make_worker(self, jobs, max_per_cycle=2, skip_first_n=0, skip_first_n_date=None):
