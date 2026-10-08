@@ -504,6 +504,24 @@ class EnqueueWorker:
                 covered.add(norm(tid).upper())
         return covered
 
+    def _skip_special_if_any_sent(self) -> bool:
+        """cfg enqueue.special_skip_if_any_sent (default False = the designed behaviour: a sent regular job never suppresses a later
+        special bundle). Turned ON in production until labit-core's scope="special" ships -- see _has_any_sent_job."""
+        return bool(self.cfg.get("enqueue", {}).get("special_skip_if_any_sent", False))
+
+    def _has_any_sent_job(self, jobs_table: str, reqno: str) -> bool:
+        """True when ANY job for this requisition was already sent (any label, any source).
+
+        2026-10-08 (live: 185 failed special jobs across 15 requisitions, 12 of them for patients who had already received their
+        report): the split-delivery rework creates a special job whenever no SENT job lists these test ids in outsourced_testids,
+        but every send before 2026-10-06 (the 'special report' jobs, and the regular partial/complete bundles -- production
+        labit-core's scope="all" still INCLUDES special-department tests) has no such record. Until labit-core's scope="special"
+        ships and per-test delivery receipts have accumulated, a requisition that has already had something sent is left to the
+        regular reconciliation (which sends the full bundle, special content included) -- a special job here would be a duplicate.
+        Only requisitions with nothing sent yet (e.g. a special-only PAP LBC) get an automatic special job."""
+        rows = self.sb.list_jobs_by_reqno(jobs_table, reqno=reqno, limit=300)
+        return any(norm(row.get("status")).lower() == "sent" for row in rows)
+
     def _maybe_enqueue_special_job(
         self, jobs_table: str, *, row: Dict[str, Any], reqno: str, reqid: str, phone: str,
         mrno: str, name: str, ready_testids: List[str], lab_id: str, paused_default: bool,
@@ -517,6 +535,9 @@ class EnqueueWorker:
         if not ready_testids:
             return False
         if self._has_active_special_job(jobs_table, reqno):
+            return False
+        if self._skip_special_if_any_sent() and self._has_any_sent_job(jobs_table, reqno):
+            self.log.info("special-bundle skipped reqno=%s: a job was already sent for this requisition (see _has_any_sent_job)", reqno)
             return False
         wanted = {norm(t).upper() for t in ready_testids}
         if wanted <= self._already_sent_special_testids(jobs_table, reqno):

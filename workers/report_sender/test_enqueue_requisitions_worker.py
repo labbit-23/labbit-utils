@@ -247,5 +247,32 @@ class FakeJsonResponse:
         return self._payload
 
 
+    def test_special_skip_if_any_sent_flag_suppresses_duplicate_special_job(self):
+        class FakeSB:
+            def __init__(self, rows):
+                self.rows, self.inserted = rows, []
+
+            def list_jobs_by_reqno(self, table, reqno, limit=300):
+                return self.rows
+
+            def insert_job(self, table, job):
+                self.inserted.append(job)
+
+        def run(flag, rows):
+            cfg = base_cfg()
+            cfg["enqueue"]["special_skip_if_any_sent"] = flag
+            worker = EnqueueWorker(cfg, dry_run=False)
+            worker.sb = FakeSB(rows)
+            ok = worker._maybe_enqueue_special_job(
+                "report_auto_dispatch_jobs", row={}, reqno="R1", reqid="REQ1", phone="9849025601", mrno="M1", name="P",
+                ready_testids=["SP"], lab_id="lab", paused_default=False, cooloff=30, max_attempts=5, reason="t")
+            return ok, worker.sb.inserted
+
+        sent_regular = [{"id": "a", "status": "sent", "report_label": "complete lab", "metadata": {}}]
+        self.assertEqual(run(True, sent_regular)[0], False)       # flag on + something already sent: no duplicate special job
+        self.assertEqual(run(False, sent_regular)[0], True)       # flag off (default): designed behaviour unchanged
+        self.assertEqual(run(True, [])[0], True)                  # flag on but nothing sent yet: the special job is created
+        self.assertEqual(run(True, [{"id": "f", "status": "failed", "metadata": {}}])[0], True)  # failed sends do not count
+
 if __name__ == "__main__":
     unittest.main()
