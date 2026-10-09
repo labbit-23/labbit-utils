@@ -33,7 +33,7 @@ import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import core
 import cr
@@ -391,12 +391,15 @@ def auto_select_all_if_stale(orthanc, study, study_id, dry_run):
 
     last_update_raw = study.get("LastUpdate", "")
     try:
-        last_update = datetime.strptime(last_update_raw, "%Y%m%dT%H%M%S")
+        # Orthanc serializes LastUpdate in UTC; keep both sides timezone-aware.
+        # Comparing it with naive local datetime.now() made a fresh study
+        # look 5.5 hours old and triggered fallback while series were arriving.
+        last_update = datetime.strptime(last_update_raw, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
     except ValueError:
         log.warning("[StudyId=%s] Unparseable LastUpdate=%r, cannot evaluate fallback.", study_id, last_update_raw)
         return False
 
-    age = datetime.now() - last_update
+    age = datetime.now(timezone.utc) - last_update
     if age < timedelta(hours=SELECTION_FALLBACK_HOURS):
         return False
 
