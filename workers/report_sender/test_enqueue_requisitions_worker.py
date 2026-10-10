@@ -274,5 +274,37 @@ class FakeJsonResponse:
         self.assertEqual(run(True, [])[0], True)                  # flag on but nothing sent yet: the special job is created
         self.assertEqual(run(True, [{"id": "f", "status": "failed", "metadata": {}}])[0], True)  # failed sends do not count
 
+    def test_special_legacy_cutoff_only_counts_sends_before_the_cutover(self):
+        class FakeSB:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def list_jobs_by_reqno(self, table, reqno, limit=300):
+                return self.rows
+
+            def insert_job(self, table, job):
+                pass
+
+        def run(cutoff, rows):
+            cfg = base_cfg()
+            cfg["enqueue"]["special_skip_if_any_sent"] = True
+            if cutoff:
+                cfg["enqueue"]["special_legacy_cutoff"] = cutoff
+            worker = EnqueueWorker(cfg, dry_run=False)
+            worker.sb = FakeSB(rows)
+            return worker._maybe_enqueue_special_job(
+                "report_auto_dispatch_jobs", row={}, reqno="R1", reqid="REQ1", phone="9849025601", mrno="M1", name="P",
+                ready_testids=["SP"], lab_id="lab", paused_default=False, cooloff=30, max_attempts=5, reason="t")
+
+        before = [{"id": "a", "status": "sent", "sent_at": "2026-10-10T08:00:00+00:00", "metadata": {}}]
+        after = [{"id": "b", "status": "sent", "sent_at": "2026-10-10T10:00:00+00:00", "metadata": {}}]
+        undated = [{"id": "c", "status": "sent", "metadata": {}}]
+        cutoff = "2026-10-10T09:00:00+00:00"
+        self.assertEqual(run(cutoff, before), False)   # sent before the cutover: that bundle carried the special tests -> no duplicate
+        self.assertEqual(run(cutoff, after), True)     # sent after: regular bundle excludes special tests -> the special job is still owed
+        self.assertEqual(run(cutoff, undated), False)  # no sent_at: cannot prove it is post-cutover -> treated as legacy
+        self.assertEqual(run(None, after), False)      # no cutoff configured: original behaviour, any sent job suppresses
+        self.assertEqual(run("not-a-date", after), False)  # unparseable cutoff is ignored (original behaviour), not a crash
+
 if __name__ == "__main__":
     unittest.main()

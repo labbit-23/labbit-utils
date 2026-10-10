@@ -509,18 +509,48 @@ class EnqueueWorker:
         special bundle). Turned ON in production until labit-core's scope="special" ships -- see _has_any_sent_job."""
         return bool(self.cfg.get("enqueue", {}).get("special_skip_if_any_sent", False))
 
+    def _special_legacy_cutoff(self):
+        """cfg enqueue.special_legacy_cutoff: ISO timestamp of the labit-core scope="special" cutover. When set, only jobs sent BEFORE
+        it are 'legacy' (their regular bundle still carried the special tests); a regular send after it excludes special tests, so it
+        must never suppress the special follow-up. Unset = every sent job counts (the original behaviour). Naive timestamps are UTC."""
+        raw = norm(self.cfg.get("enqueue", {}).get("special_legacy_cutoff"))
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            self.log.warning("enqueue.special_legacy_cutoff=%r is not an ISO timestamp; ignoring it", raw)
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    @staticmethod
+    def _sent_before(row: Dict[str, Any], cutoff) -> bool:
+        raw = norm(row.get("sent_at"))
+        if not raw:
+            return True  # sent but no timestamp: cannot prove it is post-cutover, so treat it as legacy (never risk a duplicate)
+        try:
+            sent_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=timezone.utc)
+        return sent_at < cutoff
+
     def _has_any_sent_job(self, jobs_table: str, reqno: str) -> bool:
-        """True when ANY job for this requisition was already sent (any label, any source).
+        """True when a LEGACY job for this requisition was already sent (any label, any source).
 
         2026-10-08 (live: 185 failed special jobs across 15 requisitions, 12 of them for patients who had already received their
         report): the split-delivery rework creates a special job whenever no SENT job lists these test ids in outsourced_testids,
-        but every send before 2026-10-06 (the 'special report' jobs, and the regular partial/complete bundles -- production
-        labit-core's scope="all" still INCLUDES special-department tests) has no such record. Until labit-core's scope="special"
-        ships and per-test delivery receipts have accumulated, a requisition that has already had something sent is left to the
-        regular reconciliation (which sends the full bundle, special content included) -- a special job here would be a duplicate.
-        Only requisitions with nothing sent yet (e.g. a special-only PAP LBC) get an automatic special job."""
+        but every send before the labit-core scope="special" cutover (the 'special report' jobs, and the regular partial/complete
+        bundles -- scope="all" then still INCLUDED special-department tests) has no such record. Such a requisition is left to the
+        regular reconciliation. With enqueue.special_legacy_cutoff set, only jobs sent before the cutover count: after it a regular
+        bundle excludes special tests, so a later special approval must still get its own special job."""
         rows = self.sb.list_jobs_by_reqno(jobs_table, reqno=reqno, limit=300)
-        return any(norm(row.get("status")).lower() == "sent" for row in rows)
+        cutoff = self._special_legacy_cutoff()
+        return any(
+            norm(row.get("status")).lower() == "sent" and (cutoff is None or self._sent_before(row, cutoff))
+            for row in rows
+        )
 
     def _maybe_enqueue_special_job(
         self, jobs_table: str, *, row: Dict[str, Any], reqno: str, reqid: str, phone: str,
