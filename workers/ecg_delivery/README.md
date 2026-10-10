@@ -22,6 +22,16 @@ Watermarks and seen ECG IDs are stored under that scope key. Existing center-onl
   DEXA ECG management page. It receives one ledger row over stdin and never
   opens a network listener.
 
+## Technical-quality gate
+
+Before patient WhatsApp delivery, the Python path derives a quality flag from
+Tricog's structured quality field or from the diagnosis/final-classification
+text. It blocks technical-acquisition warnings such as `Lead Reversal
+Suspected`, `Lead Placement Suspected`, and `Poor Quality ECG`. Core/FTP
+processing and ledger recording still occur; the patient WhatsApp stage is
+recorded as `blocked`, and the configured default/staff number receives a
+quality alert. A blocked ECG is considered handled so it does not retry forever.
+
 ## Shadow run
 
 Use the DICOM worker's existing delivery JSON while the configuration is being

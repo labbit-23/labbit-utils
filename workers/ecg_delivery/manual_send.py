@@ -12,6 +12,7 @@ import ftplib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -22,6 +23,47 @@ from urllib.parse import quote
 import requests
 
 log = logging.getLogger("dicom_export.ecg")
+
+
+# These are technical-acquisition warnings, not diagnostic conclusions. They
+# must not be sent to a patient as an ordinary ECG result. Keep these patterns
+# aligned with the legacy Mirth ECG channel until that path is retired.
+QUALITY_FLAG_PATTERNS = (
+    re.compile(r"lead\s+(placement|reversal)\s+suspected", re.IGNORECASE),
+    re.compile(r"poor\s+quality\s+ecg", re.IGNORECASE),
+)
+
+
+def detect_quality_flag(*values):
+    """Return the technical-quality warning text found in any ECG field."""
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            value = " ".join(str(item) for item in value)
+        text = str(value).strip()
+        if not text:
+            continue
+        for pattern in QUALITY_FLAG_PATTERNS:
+            if pattern.search(text):
+                return text
+    return None
+
+
+def quality_flag_for_row(row):
+    """Resolve an explicit Tricog flag or derive it from the interpretation."""
+    raw = row.get("raw_json") or {}
+    return (
+        row.get("quality_flag")
+        or raw.get("qualityFlag")
+        or raw.get("quality_flag")
+        or detect_quality_flag(
+            row.get("diagnosis"),
+            row.get("final_classification"),
+            raw.get("diagnosis"),
+            raw.get("finalclassification"),
+        )
+    )
 
 
 def _stage(state, name, status, detail=None):
@@ -147,6 +189,37 @@ def _normalize_phone(value):
         return digits
     raise ValueError("WhatsApp recipient must be a 10-digit Indian number")
 
+
+def _send_quality_alert(row, reason, cfg):
+    """Notify the configured SDRC number without sending the report to the patient."""
+    wa = cfg["whatsapp"]
+    recipient = _normalize_phone(wa["default_phone"])
+    body = (
+        "⚠️ ECG quality alert\n"
+        f"Accession: {row.get('accession_no') or ''}\n"
+        f"Patient: {row.get('patient_name') or ''}\n"
+        f"Tricog interpretation: \"{reason}\"\n\n"
+        "Delivery to the patient was blocked automatically. "
+        "Please have the patient retake the ECG and re-upload via the portal."
+    )
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient,
+        "type": "text",
+        "text": {"body": body},
+    }
+    response = requests.post(
+        wa["api_url"],
+        headers={"Content-Type": "application/json", "X-API-KEY": wa["api_key"]},
+        json=payload,
+        timeout=(10, 60),
+    )
+    response.raise_for_status()
+    messages = (response.json() or {}).get("messages") or []
+    return messages[0].get("id") if messages and messages[0].get("id") else "accepted"
+
+
 def _phone(row, cfg, override=None):
     if override:
         return _normalize_phone(override)
@@ -218,7 +291,16 @@ def manual_reattach(cfg, row, send_whatsapp=False, test_phone=None):
     if not row.get("diagnosis") or not str(row["diagnosis"]).strip():
         raise ValueError("ECG has no diagnosis; delivery remains gated")
 
-    raw = row.get("raw_json") or {}
+    quality_flag = quality_flag_for_row(row)
+    if quality_flag:
+        # Preserve the derived flag in the ledger even when Tricog only put it
+        # in the free-text diagnosis field.
+        row = dict(row)
+        raw = dict(row.get("raw_json") or {})
+        raw["qualityFlag"] = quality_flag
+        row["raw_json"] = raw
+    else:
+        raw = row.get("raw_json") or {}
     pdf_url = raw.get("pdfUrl") or raw.get("pdf_url")
     token = raw.get("tricogToken") or raw.get("tricog_token")
     if not pdf_url or not token:
@@ -238,12 +320,37 @@ def manual_reattach(cfg, row, send_whatsapp=False, test_phone=None):
 
         try:
             status = _core_attach(row["accession_no"], original, cfg)
-            _stage(stages, "core", "ok", f"HTTP {status}")
+            detail = f"HTTP {status}"
+            if status == 409:
+                detail += " — already attached for this accession"
+            _stage(stages, "core", "ok", detail)
         except Exception as exc:
             _stage(stages, "core", "error", exc)
 
         links = _ftp_upload([graph, original], str(row["accession_no"]), cfg)
         _stage(stages, "ftp", "ok", f"{len(links)} files")
+
+        if test_phone and not send_whatsapp:
+            raise ValueError("A custom WhatsApp recipient requires send_whatsapp=true")
+        if send_whatsapp:
+            if quality_flag:
+                _stage(stages, "whatsapp", "blocked", f"Quality flag: {quality_flag}")
+                try:
+                    alert_id = _send_quality_alert(row, quality_flag, cfg)
+                    _stage(stages, "quality_alert", "ok", alert_id)
+                except Exception as exc:
+                    # The patient remains protected even if the staff alert is
+                    # temporarily unavailable. Do not retry the ECG forever.
+                    log.warning("ECG quality alert failed for %s: %s", row["accession_no"], exc)
+                    _stage(stages, "quality_alert", "error", exc)
+            else:
+                message_id = _send_whatsapp(row, links[0], cfg)
+                _stage(stages, "whatsapp", "ok", message_id)
+                if test_phone:
+                    copy_message_id = _send_whatsapp(row, links[0], cfg, test_phone)
+                    _stage(stages, "whatsapp_copy", "ok", copy_message_id)
+        else:
+            _stage(stages, "whatsapp", "skipped", "operator did not request resend")
 
         if cfg.get("supabase_url") and cfg.get("supabase_service_key"):
             try:
@@ -254,20 +361,6 @@ def manual_reattach(cfg, row, send_whatsapp=False, test_phone=None):
         else:
             # The DEXA API owns the Supabase service client.
             _stage(stages, "ledger", "deferred", "DEXA API will update ledger")
-
-        if test_phone and not send_whatsapp:
-            raise ValueError("A custom WhatsApp recipient requires send_whatsapp=true")
-        if send_whatsapp:
-            quality_flag = row.get("quality_flag") or (row.get("raw_json") or {}).get("qualityFlag")
-            if quality_flag:
-                raise ValueError("WhatsApp is blocked for a Tricog quality-flagged ECG")
-            message_id = _send_whatsapp(row, links[0], cfg)
-            _stage(stages, "whatsapp", "ok", message_id)
-            if test_phone:
-                copy_message_id = _send_whatsapp(row, links[0], cfg, test_phone)
-                _stage(stages, "whatsapp_copy", "ok", copy_message_id)
-        else:
-            _stage(stages, "whatsapp", "skipped", "operator did not request resend")
 
         # Record final WhatsApp result if it was explicitly sent. A second
         # small ledger update avoids losing the message id in the prior patch.
@@ -283,7 +376,10 @@ def manual_reattach(cfg, row, send_whatsapp=False, test_phone=None):
             )
             response.raise_for_status()
 
-        return {"ok": all(value["status"] in ("ok", "skipped", "deferred") for value in stages.values()), "accession": row["accession_no"], "links": links, "stages": stages}
+        handled_stages = {
+            name: value for name, value in stages.items() if name != "quality_alert"
+        }
+        return {"ok": all(value["status"] in ("ok", "skipped", "deferred", "blocked") for value in handled_stages.values()), "accession": row["accession_no"], "links": links, "stages": stages}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

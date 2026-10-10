@@ -19,7 +19,7 @@ from pathlib import Path
 
 import requests
 
-from manual_send import manual_reattach
+from manual_send import detect_quality_flag, manual_reattach
 
 log = logging.getLogger("ecg_delivery")
 TRICOG_BASE = "https://customer.tricog.com"
@@ -168,6 +168,12 @@ def discover(username, password, state, initial_lookback_hours=24):
             accession = str(record.get("patientId") or record.get("patientid") or "").strip()
             if not accession:
                 continue
+            quality_flag = detect_quality_flag(
+                record.get("qualityFlag"),
+                record.get("quality_flag"),
+                diagnosis,
+                record.get("finalclassification"),
+            )
             found.append({
                 "accession_no": accession,
                 "tricog_ecg_id": str(ecg_id),
@@ -180,6 +186,7 @@ def discover(username, password, state, initial_lookback_hours=24):
                 "diagnosis": record.get("diagnosis"),
                 "final_classification": record.get("finalclassification"),
                 "status": record.get("status"),
+                "quality_flag": quality_flag,
                 "acquired_at": datetime.fromtimestamp(_timestamp(record), tz=timezone.utc).isoformat() if _timestamp(record) else None,
                 "raw_json": {
                     **record,
@@ -188,6 +195,7 @@ def discover(username, password, state, initial_lookback_hours=24):
                     "tricogCenterId": branch["centerId"],
                     "tricogCenterName": branch["centerName"],
                     "tricogEcgId": str(ecg_id),
+                    **({"qualityFlag": quality_flag} if quality_flag else {}),
                 },
             })
         # The watermark is advanced only after a row is successfully handled
