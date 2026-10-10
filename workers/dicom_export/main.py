@@ -304,6 +304,96 @@ def list_studies_for_date(orthanc, orthanc_backup, date_str):
     return rows
 
 
+def _merge_index_rows_with_live_rows(indexed_rows, live_rows):
+    """Complete the fast index with studies found in live Orthanc.
+
+    The index is authoritative for delivery state and generated-file links,
+    while Orthanc is authoritative for study discovery. A study can arrive
+    at Orthanc before the sender has created its index row, so this merge must
+    be keyed by Orthanc study ID rather than accession or patient ID.
+    """
+    merged = {}
+    for row in indexed_rows or []:
+        study_id = str(row.get("studyId") or "").strip()
+        if study_id:
+            merged[study_id] = row
+    for row in live_rows or []:
+        study_id = str(row.get("studyId") or "").strip()
+        if study_id and study_id not in merged:
+            merged[study_id] = row
+    rows = list(merged.values())
+    rows.sort(key=lambda row: str(row.get("accession") or ""), reverse=True)
+    return rows
+
+
+def _complete_index_rows_from_orthanc(index, orthanc, orthanc_backup, date_str,
+                                      indexed_rows, requested_modality=""):
+    """Return indexed rows plus same-day studies absent from the index.
+
+    This performs one cheap Orthanc study search even when the index already
+    has rows. Only IDs absent from the index receive the more expensive
+    per-study metadata fetch. That keeps the normal list load fast while
+    making unsent/processing CR and CT studies visible immediately.
+    """
+    if indexed_rows is None:
+        return None
+    try:
+        client, source, study_rows = _resolve_studies_for_date(
+            orthanc, orthanc_backup, date_str
+        )
+        if requested_modality:
+            requested_modality = str(requested_modality).upper()
+            study_rows = [
+                study for study in study_rows
+                if requested_modality in str(
+                    (study.get("RequestedTags") or {}).get("ModalitiesInStudy", "")
+                ).upper().split()
+            ]
+        indexed_ids = {
+            str(row.get("studyId") or "").strip()
+            for row in indexed_rows
+            if str(row.get("studyId") or "").strip()
+        }
+        missing_studies = [
+            study for study in study_rows
+            if str(study.get("ID") or "").strip() not in indexed_ids
+        ]
+        if not missing_studies:
+            return _merge_index_rows_with_live_rows(indexed_rows, [])
+
+        with ThreadPoolExecutor(max_workers=LIST_CONCURRENCY) as pool:
+            missing_rows = [
+                row for row in pool.map(
+                    lambda item: _fetch_study_row(client, item), missing_studies
+                ) if row is not None
+            ]
+        for row in missing_rows:
+            row["source"] = source
+
+        # Persist newly discovered rows opportunistically. A temporary
+        # Supabase failure must not hide a real Orthanc study from this load.
+        if index and missing_rows:
+            records = [
+                index.record_from_api_row(row, source=source)
+                for row in missing_rows
+            ]
+            if not index.upsert_rows(records):
+                log.warning(
+                    "Radiology index could not persist %d Orthanc-discovered row(s) for %s",
+                    len(records), date_str,
+                )
+        return _merge_index_rows_with_live_rows(indexed_rows, missing_rows)
+    except Exception as exc:
+        # The table remains a valid degraded-mode answer if Orthanc is
+        # temporarily unavailable. The ordinary full Orthanc fallback below
+        # still handles the case where there is no indexed data at all.
+        log.warning(
+            "Radiology index live-completion failed for %s; returning indexed rows: %s",
+            date_str, exc,
+        )
+        return _merge_index_rows_with_live_rows(indexed_rows, [])
+
+
 def sync_radiology_index(index, orthanc, orthanc_backup, date_str, force=False):
     """Fill/update the fast index from Orthanc for one calendar date.
 
@@ -464,16 +554,32 @@ def make_handler(cfg, orthanc, orthanc_backup, radiology_index=None):
                                 log.warning("Radiology index refresh failed for %s: %s", date_str, exc)
                                 refresh_failed = True
                         indexed_rows = radiology_index.list_rows(date_str, requested_modality)
-                        if indexed_rows and not refresh_failed:
-                            self._send_json(indexed_rows)
+                        if indexed_rows is not None and not refresh_failed:
+                            completed_rows = _complete_index_rows_from_orthanc(
+                                radiology_index,
+                                orthanc,
+                                orthanc_backup,
+                                date_str,
+                                indexed_rows,
+                                requested_modality,
+                            )
+                            self._send_json(completed_rows)
                             return
                         # Empty/missing index: one controlled Orthanc fill, then
                         # read the table again so the next load is fast.
                         try:
                             sync_radiology_index(radiology_index, orthanc, orthanc_backup, date_str, force=True)
                             indexed_rows = radiology_index.list_rows(date_str, requested_modality)
-                            if indexed_rows:
-                                self._send_json(indexed_rows)
+                            if indexed_rows is not None:
+                                completed_rows = _complete_index_rows_from_orthanc(
+                                    radiology_index,
+                                    orthanc,
+                                    orthanc_backup,
+                                    date_str,
+                                    indexed_rows,
+                                    requested_modality,
+                                )
+                                self._send_json(completed_rows)
                                 return
                         except Exception as exc:
                             log.warning("Radiology index fallback fill failed for %s: %s", date_str, exc)
