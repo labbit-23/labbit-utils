@@ -3,7 +3,7 @@ import argparse
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import time
 
@@ -201,6 +201,15 @@ class SupabaseRest:
         r.raise_for_status()
         rows = r.json()
         return rows if isinstance(rows, list) else []
+
+    def list_reqnos_with_any_job(self, table: str, since_iso: str, limit: int = 20000) -> set:
+        """Every reqno that has a job of ANY status created since `since_iso` (skipped/cancelled included)."""
+        u = f"{self.base}/{table}"
+        p = {"select": "reqno", "created_at": f"gte.{since_iso}", "limit": str(limit)}
+        r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
+        r.raise_for_status()
+        rows = r.json()
+        return {norm(x.get("reqno")) for x in rows if isinstance(x, dict) and norm(x.get("reqno"))} if isinstance(rows, list) else set()
 
     def list_recent_sent_regular_jobs(self, table: str, since_iso: str, limit: int = 500) -> List[Dict[str, Any]]:
         u = f"{self.base}/{table}"
@@ -1262,14 +1271,15 @@ class EnqueueWorker:
             return False
         return self._within_window()
 
-    def _fetch_rows(self) -> List[Dict[str, Any]]:
+    def _fetch_rows(self, date_str: Optional[str] = None) -> List[Dict[str, Any]]:
+        day = date_str or self._today_ist()
         endpoint = norm(self.cfg.get("shivam", {}).get("requisitions_url"))
         if not endpoint:
             raise ValueError("Missing shivam.requisitions_url")
 
         method = norm(self.cfg.get("shivam", {}).get("method") or "POST").upper()
         payload = {
-            "date": self._today_ist(),
+            "date": day,
             "limit": int(self.cfg.get("enqueue", {}).get("fetch_limit", 1000))
         }
         timeout = int(self.cfg.get("enqueue", {}).get("request_timeout_seconds", 20))
@@ -1277,9 +1287,9 @@ class EnqueueWorker:
         if method == "GET":
             dated_endpoint = endpoint
             if "{" in endpoint and "}" in endpoint:
-                dated_endpoint = endpoint.replace("{date}", self._today_ist())
-            elif not endpoint.rstrip("/").endswith(self._today_ist()):
-                dated_endpoint = endpoint.rstrip("/") + "/" + self._today_ist()
+                dated_endpoint = endpoint.replace("{date}", day)
+            elif not endpoint.rstrip("/").endswith(day):
+                dated_endpoint = endpoint.rstrip("/") + "/" + day
             r = self.http.get(dated_endpoint, timeout=timeout)
         else:
             r = self.http.post(endpoint, json=payload, timeout=timeout)
@@ -1291,6 +1301,37 @@ class EnqueueWorker:
             raise ValueError("Unexpected requisitions response")
         return rows
 
+    def _unjobbed_rows_from_previous_days(self, jobs_table: str) -> List[Dict[str, Any]]:
+        """Requisitions of the last N days (enqueue.unjobbed_lookback_days, default 0 = off) that have NO job at all.
+
+        The new-requisition pass only reads TODAY's list, and the reconcile passes only look at requisitions that
+        already have a job. A requisition that never got one -- a special-only requisition whose result is approved
+        a day later (no regular job exists to reconcile), or one skipped on its own day because the status fetch
+        failed (core restart) -- was never looked at again. R202610110051 (HSV, special-only) was exactly that.
+        Fed through the normal pass, so every existing guard (phone, dedupe, special split) applies unchanged."""
+        days = int(self.cfg.get("enqueue", {}).get("unjobbed_lookback_days", 0) or 0)
+        if days <= 0:
+            return []
+        today = now_ist().date()
+        since = (datetime.now(timezone.utc) - timedelta(days=days + 1)).isoformat()
+        try:
+            have = self.sb.list_reqnos_with_any_job(jobs_table, since)
+        except Exception as e:
+            self.log.warning("unjobbed lookback skipped: job list failed err=%s", e)
+            return []
+        out: List[Dict[str, Any]] = []
+        for back in range(1, days + 1):
+            day = (today - timedelta(days=back)).strftime("%Y-%m-%d")
+            try:
+                rows = self._fetch_rows(day)
+            except Exception as e:
+                self.log.warning("unjobbed lookback: fetch for %s failed err=%s", day, e)
+                continue
+            out.extend(r for r in rows if isinstance(r, dict) and norm(r.get("reqno")) and norm(r.get("reqno")) not in have)
+        if out:
+            self.log.info("unjobbed lookback: %s requisition(s) from the last %s day(s) have no job", len(out), days)
+        return out
+
     def run_once(self) -> None:
         if not self._can_start():
             self.log.info("Outside active window or before start date; skipping enqueue cycle")
@@ -1299,6 +1340,7 @@ class EnqueueWorker:
         jobs_table = self.cfg["tables"]["jobs"]
         rows = self._fetch_rows()
         self.log.info("Fetched %s requisition rows for %s", len(rows), self._today_ist())
+        rows = rows + self._unjobbed_rows_from_previous_days(jobs_table)
 
         paused_default = bool(self.cfg.get("enqueue", {}).get("enqueue_paused_default", True))
         lab_id = norm(self.cfg.get("whatsapp", {}).get("lab_id"))

@@ -560,5 +560,37 @@ class DirectSendModalityEnqueueTests(unittest.TestCase):
         lab = {"GROUPID": "GDEP0001", "GROUPNM": "LAB", "TEST_NAME": "CBC"}
         self.assertTrue(w._has_any_reportable_tests({"tests": [self.ECG, lab]}))
 
+
+class UnjobbedLookbackTests(unittest.TestCase):
+    """R202610110051: a special-only requisition got no job on its own day and was never looked at again."""
+
+    def make(self, days, have, rows_by_day):
+        cfg = base_cfg()
+        cfg["enqueue"]["unjobbed_lookback_days"] = days
+        w = EnqueueWorker(cfg, dry_run=True)
+        sb = MagicMock()
+        sb.list_reqnos_with_any_job.return_value = set(have)
+        w.sb = sb
+        w._fetch_rows = lambda day=None: rows_by_day.get(day, [])
+        return w
+
+    def test_off_by_default(self):
+        w = self.make(0, [], {})
+        self.assertEqual(w._unjobbed_rows_from_previous_days("jobs"), [])
+
+    def test_returns_only_requisitions_without_any_job(self):
+        from enqueue_requisitions_worker import now_ist
+        from datetime import timedelta
+        d1 = (now_ist().date() - timedelta(days=1)).strftime("%Y-%m-%d")
+        rows = {d1: [{"reqno": "R1"}, {"reqno": "R2"}, {"reqno": ""}]}
+        w = self.make(2, ["R1"], rows)
+        out = w._unjobbed_rows_from_previous_days("jobs")
+        self.assertEqual([r["reqno"] for r in out], ["R2"])
+
+    def test_job_list_failure_never_raises(self):
+        w = self.make(2, [], {})
+        w.sb.list_reqnos_with_any_job.side_effect = RuntimeError("boom")
+        self.assertEqual(w._unjobbed_rows_from_previous_days("jobs"), [])
+
 if __name__ == "__main__":
     unittest.main()
