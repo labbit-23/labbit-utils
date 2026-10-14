@@ -80,3 +80,17 @@ Admin recovery SQL:
 
 - `report_auto_dispatch_jobs`
 - `report_auto_dispatch_events`
+
+## Incremental follow-up sends (`enqueue.incremental_followups`)
+
+`off` (default) keeps the old rule: a follow-up job is created only when the requisition reaches FULL_REPORT.
+`preview` logs `[followup-preview] would enqueue ...` and creates nothing. `on` enables the rule below.
+
+After the first send a requisition stays open (up to `followup_max_age_days`, default 15, counted from its first
+job) until every non-cancelled test is ready. A follow-up job is created whenever tests are ready that the LAST
+SENT report did not contain; the send is cumulative (everything ready so far). The sender's same-day gate then
+coalesces same-day tests into one send (held until all same-day tests are ready or the evening partial cutoff),
+while non-same-day tests such as cultures create their own send when approved. Cancelled tests count as neither
+ready nor pending; special/outsourced tests keep their own split-job path. Jobs whose previous snapshot has no
+per-test data fall back to the old FULL-only rule. `followup_check_interval_minutes` (default 15) limits how
+often an open requisition's live status is fetched.

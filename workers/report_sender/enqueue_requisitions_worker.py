@@ -626,6 +626,95 @@ class EnqueueWorker:
         ready = sum(1 for row in required if self._is_ready_test(row))
         return total, ready
 
+    # ------------------------------------------------------------------
+    # Incremental follow-ups (enqueue.incremental_followups = off|preview|on)
+    #
+    # Rule (director, 2026-10-10): after the first send, a requisition stays
+    # open until every non-cancelled test is ready. A follow-up job is created
+    # whenever tests became ready that the LAST SENT report did not contain
+    # (cumulative bundle). The sender's existing same-day gate then coalesces
+    # same-day tests into ONE send (it holds the job until all same-day tests
+    # are ready, or the evening partial cutoff), while non-same-day tests
+    # (cultures etc.) create their own send as they are approved. Cancelled
+    # tests are neither ready nor pending. Special/outsourced tests keep their
+    # own split-job path and are ignored here.
+    # ------------------------------------------------------------------
+    def _incremental_mode(self) -> str:
+        mode = norm(self.cfg.get("enqueue", {}).get("incremental_followups") or "off").lower()
+        return mode if mode in {"off", "preview", "on"} else "off"
+
+    @staticmethod
+    def _test_key(row: Dict[str, Any]) -> str:
+        return norm(
+            row.get("TEST_ID") or row.get("TESTID") or row.get("test_id") or row.get("testid")
+        ).upper()
+
+    @staticmethod
+    def _is_cancelled_test(row: Dict[str, Any]) -> bool:
+        return norm(row.get("REPORT_STATUS") or row.get("report_status")).upper() == "CANCELLED"
+
+    def _followup_state(self, status: Dict[str, Any]) -> Dict[str, set]:
+        tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+        out: Dict[str, set] = {"ready": set(), "pending": set(), "same_ready": set(), "same_pending": set()}
+        for row in tests:
+            if not isinstance(row, dict) or not self._is_lab_or_radiology_test(row):
+                continue
+            if self._is_outsourced_row(row) or self._is_cancelled_test(row):
+                continue
+            key = self._test_key(row)
+            if not key:
+                continue
+            same = self._is_same_day_required(row)
+            if self._is_ready_test(row):
+                out["ready"].add(key)
+                if same:
+                    out["same_ready"].add(key)
+            else:
+                out["pending"].add(key)
+                if same:
+                    out["same_pending"].add(key)
+        return out
+
+    def _followup_decision(self, prev_status: Dict[str, Any], live: Dict[str, Any]) -> Dict[str, Any]:
+        """enqueue: True/False, or None when the previous snapshot has no per-test
+        data (old jobs) and the caller must fall back to the legacy FULL-only rule."""
+        prev_tests = prev_status.get("tests") if isinstance(prev_status, dict) else None
+        if not isinstance(prev_tests, list) or not prev_tests:
+            return {"enqueue": None, "reason": "no_prev_test_snapshot"}
+        prev = self._followup_state(prev_status)
+        cur = self._followup_state(live)
+        new_ready = sorted(cur["ready"] - prev["ready"])
+        if not new_ready:
+            return {"enqueue": False, "reason": "no_new_ready_tests"}
+        return {
+            "enqueue": True,
+            "reason": "new_ready_tests",
+            "new_ready": new_ready,
+            "new_same_day": sorted(set(new_ready) & cur["same_ready"]),
+            "new_non_same_day": sorted(set(new_ready) - cur["same_ready"]),
+            "pending_same_day": sorted(cur["same_pending"]),
+            "complete_after": not cur["pending"],
+        }
+
+    def _followup_age_days(self, jobs_table: str, reqno: str) -> float | None:
+        """Days since the requisition's FIRST job was created (proxy for registration)."""
+        try:
+            jobs = self.sb.list_jobs_by_reqno(jobs_table, reqno)
+        except Exception:
+            return None
+        stamps = []
+        for j in jobs or []:
+            raw = norm(j.get("created_at"))
+            if not raw:
+                continue
+            try:
+                stamps.append(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+            except ValueError:
+                continue
+        if not stamps:
+            return None
+        return (datetime.now(timezone.utc) - min(stamps)).total_seconds() / 86400.0
+
     def _is_overall_full_ready(self, status: Dict[str, Any]) -> bool:
         overall = norm(
             status.get("overall_status_excluding_special")
@@ -732,12 +821,23 @@ class EnqueueWorker:
 
     def _reconcile_recent(self, jobs_table: str) -> int:
         lookback_hours = int(self.cfg.get("enqueue", {}).get("lookback_hours", 0) or 0)
+        mode = self._incremental_mode()
+        max_age_days = int(self.cfg.get("enqueue", {}).get("followup_max_age_days", 15) or 15)
+        max_rows = int(self.cfg.get("enqueue", {}).get("lookback_max_rows", 500))
+        if mode != "off":
+            # Open requisitions stay eligible for follow-ups for followup_max_age_days
+            # (measured from the first job below), not just 150h from the last update.
+            lookback_hours = max(lookback_hours, max_age_days * 24)
+            max_rows = max(max_rows, 6000)
         if lookback_hours <= 0:
             return 0
+        recheck_seconds = int(self.cfg.get("enqueue", {}).get("followup_check_interval_minutes", 15) or 15) * 60
+        if not hasattr(self, "_followup_checked"):
+            self._followup_checked: Dict[str, float] = {}
 
         since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
         since_iso = since.isoformat()
-        recent = self.sb.list_recent_jobs(jobs_table, since_iso, limit=int(self.cfg.get("enqueue", {}).get("lookback_max_rows", 500)))
+        recent = self.sb.list_recent_jobs(jobs_table, since_iso, limit=max_rows)
         if not recent:
             return 0
 
@@ -787,6 +887,12 @@ class EnqueueWorker:
             if prev_overall == "FULL_REPORT":
                 self.log.debug("Reconcile skip reqno=%s reason=already_full_at_send", reqno)
                 continue
+
+            if mode != "off":
+                last_checked = self._followup_checked.get(reqno, 0.0)
+                if time.time() - last_checked < recheck_seconds:
+                    continue
+                self._followup_checked[reqno] = time.time()
 
             try:
                 live = self._fetch_status(reqno=reqno, reqid=reqid)
@@ -845,9 +951,34 @@ class EnqueueWorker:
                 self.log.info("Reconcile skip reqno=%s reason=outsourced_only_regular_job", reqno)
                 continue
 
-            # For non-skipped rows, follow-up only when fully ready.
-            if not self._is_overall_full_ready(live):
+            # Incremental mode: follow up whenever tests became ready that the last SENT
+            # report did not contain (see _followup_decision). Legacy rule (FULL only)
+            # applies when mode is off or the previous snapshot has no per-test data.
+            decision: Dict[str, Any] = {"enqueue": None}
+            if mode != "off":
+                prev_for_decision = self.sb.latest_sent_snapshot(jobs_table, reqno)
+                decision = self._followup_decision(
+                    (prev_for_decision or {}).get("last_status_snapshot") or {}, live
+                )
+            legacy_rule = decision["enqueue"] is None
+            if legacy_rule:
+                if not self._is_overall_full_ready(live):
+                    continue
+            elif not decision["enqueue"]:
                 continue
+            else:
+                age_days = self._followup_age_days(jobs_table, reqno)
+                if age_days is not None and age_days > max_age_days:
+                    self.log.info("Reconcile skip reqno=%s reason=followup_max_age age_days=%.1f", reqno, age_days)
+                    continue
+                if mode == "preview":
+                    self.log.info(
+                        "[followup-preview] would enqueue reqno=%s new_ready=%s new_same_day=%s "
+                        "new_non_same_day=%s pending_same_day=%s complete_after=%s",
+                        reqno, decision["new_ready"], decision["new_same_day"],
+                        decision["new_non_same_day"], decision["pending_same_day"], decision["complete_after"],
+                    )
+                    continue
 
             # If live status shows all reportable tests are special/outsourced,
             # the regular URL has nothing to render at all now -- labit-core's
@@ -865,7 +996,7 @@ class EnqueueWorker:
 
             # Duplicate guard: only enqueue follow-up if overall_status changed from PARTIAL to FULL.
             # Check against previous sent job's status snapshot (handles outsourced tests correctly).
-            latest_sent = self.sb.latest_sent_snapshot(jobs_table, reqno)
+            latest_sent = self.sb.latest_sent_snapshot(jobs_table, reqno) if legacy_rule else {}
             if latest_sent:
                 prev_snap = latest_sent.get("last_status_snapshot") if isinstance(latest_sent.get("last_status_snapshot"), dict) else {}
                 prev_overall = norm(prev_snap.get("overall_status")).upper()
@@ -934,7 +1065,11 @@ class EnqueueWorker:
                 "metadata": self._job_metadata(row, {
                     "reconcile": True,
                     "lookback_hours": lookback_hours,
-                    "reason": "partial_or_unsent_now_full_ready"
+                    "reason": "partial_or_unsent_now_full_ready" if legacy_rule else "incremental_new_ready_tests",
+                    **({} if legacy_rule else {
+                        "new_ready_testids": decision["new_ready"],
+                        "pending_same_day_testids": decision["pending_same_day"],
+                    }),
                 }),
                 "created_at": utc_iso(),
                 "updated_at": utc_iso(),
