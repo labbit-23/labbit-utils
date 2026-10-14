@@ -356,5 +356,39 @@ class SpecialFollowupAfterRegularSendTests(unittest.TestCase):
         self.assertEqual(w._reconcile_outsourced_jobs("jobs"), 0)
         self.assertEqual(calls, [])
 
+
+class LegacyCutoffUsesSentAtTests(unittest.TestCase):
+    def worker(self, rows):
+        cfg = base_cfg()
+        cfg["enqueue"].update({"special_skip_if_any_sent": True, "special_legacy_cutoff": "2026-10-10T06:29:26+00:00"})
+        w = EnqueueWorker(cfg, dry_run=True)
+        w.sb = MagicMock()
+        w.sb.list_jobs_by_reqno.return_value = rows
+        return w
+
+    def test_send_after_cutoff_does_not_suppress_special_followup(self):
+        w = self.worker([{"status": "sent", "sent_at": "2026-10-11T08:01:24+00:00"}])
+        self.assertFalse(w._has_any_sent_job("jobs", "R1"))
+
+    def test_send_before_cutoff_still_suppresses(self):
+        w = self.worker([{"status": "sent", "sent_at": "2026-10-09T08:01:24+00:00"}])
+        self.assertTrue(w._has_any_sent_job("jobs", "R1"))
+
+    def test_jobs_by_reqno_selects_sent_at(self):
+        import enqueue_requisitions_worker as m
+        sb = m.SupabaseRest.__new__(m.SupabaseRest)
+        sb.base, sb.headers, sb.timeout = "http://x", {}, 1
+        seen = {}
+        class R:
+            def raise_for_status(self): pass
+            def json(self): return []
+        class H:
+            def get(self, u, headers=None, params=None, timeout=None):
+                seen.update(params); return R()
+        sb.http = H()
+        sb.list_jobs_by_reqno("jobs", "R1")
+        self.assertIn("sent_at", seen["select"].split(","))
+
+
 if __name__ == "__main__":
     unittest.main()

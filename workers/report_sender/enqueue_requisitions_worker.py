@@ -104,7 +104,10 @@ class SupabaseRest:
             # (_should_skip_failed_reenqueue, _should_retry_pdf_not_found) --
             # they were silently absent before, which is why the
             # INVALID_PHONE re-enqueue guard never actually fired.
-            "select": "id,reqno,phone,status,last_error,metadata,updated_at,created_at",
+            # sent_at: _has_any_sent_job's special_legacy_cutoff compares it; when it was
+            # missing every sent job read as "sent, no timestamp" = legacy, so the cutoff
+            # never took effect (R202610110047, 2026-10-14).
+            "select": "id,reqno,phone,status,last_error,metadata,updated_at,created_at,sent_at",
             "reqno": f"eq.{reqno}",
             "order": "updated_at.desc,created_at.desc,id.desc",
             "limit": str(limit),
