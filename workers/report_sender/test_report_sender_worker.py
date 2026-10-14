@@ -458,5 +458,52 @@ class DirectSendModalityTests(unittest.TestCase):
         finally:
             del os.environ["DIRECT_SEND_TEST_MODALITIES"]
 
+
+class StuckWaitTerminalDaysTests(unittest.TestCase):
+    """A job waiting for results must not be failed for good just because it waited (cultures, biopsy)."""
+
+    def run_watchdog(self, terminal_days, age_days, stuck_count):
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import MagicMock
+        import report_sender_worker as m
+        now = datetime.now(timezone.utc)
+        worker = m.ReportSenderWorker.__new__(m.ReportSenderWorker)
+        worker.cfg = {"tables": {"jobs": "jobs", "events": "events"},
+                      "worker": {"stuck_wait_terminal_days": terminal_days, "stuck_max_auto_requeues": 3,
+                                 "stuck_queued_wait_hours": 6, "stuck_cooling_off_hours": 7}}
+        job = {"id": 1, "reqno": "R1", "status": "queued", "metadata": {"stuck_requeue_count": stuck_count},
+               "created_at": (now - timedelta(days=age_days)).isoformat()}
+        worker.sb = MagicMock()
+        worker.sb.list_watchdog_candidates.return_value = [job]
+        worker.sb.list_stale_inflight.return_value = []
+        worker.sb.get_latest_event.return_value = {
+            "event_type": "queued_wait", "created_at": (now - timedelta(hours=30)).isoformat()}
+        worker.metrics = {"stuck_detected": 0, "auto_requeued": 0, "failed_timeout": 0}
+        worker.log = MagicMock()
+        patches = []
+        worker._patch_job = lambda j, patch: patches.append(patch)
+        worker._event = lambda *a, **k: None
+        worker._watchdog_stuck_jobs()
+        return patches
+
+    def test_default_keeps_the_legacy_terminal_failure(self):
+        patches = self.run_watchdog(0, 3, 3)
+        self.assertEqual(patches[-1]["status"], "failed")
+        self.assertEqual(patches[-1]["last_error"], "failed_timeout_stuck")
+
+    def test_young_waiting_job_stays_queued_when_configured(self):
+        patches = self.run_watchdog(14, 3, 3)
+        self.assertEqual(patches[-1]["status"], "queued")
+        self.assertNotIn("failed", [p.get("status") for p in patches])
+
+    def test_job_older_than_the_limit_still_fails(self):
+        patches = self.run_watchdog(14, 20, 3)
+        self.assertEqual(patches[-1]["status"], "failed")
+
+    def test_requeue_below_the_cap_is_unchanged(self):
+        patches = self.run_watchdog(14, 3, 1)
+        self.assertEqual(patches[-1]["status"], "queued")
+        self.assertEqual(patches[-1]["metadata"]["stuck_requeue_count"], 2)
+
 if __name__ == "__main__":
     unittest.main()

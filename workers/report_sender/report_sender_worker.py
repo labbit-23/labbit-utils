@@ -987,6 +987,11 @@ class ReportSenderWorker:
         queued_wait_hours = int(os.getenv("REPORT_SENDER_STUCK_QUEUED_WAIT_HOURS", worker_cfg.get("stuck_queued_wait_hours", 6)))
         cooling_hours = int(os.getenv("REPORT_SENDER_STUCK_COOLING_OFF_HOURS", worker_cfg.get("stuck_cooling_off_hours", 2)))
         max_requeues = int(os.getenv("REPORT_SENDER_STUCK_MAX_AUTO_REQUEUES", worker_cfg.get("stuck_max_auto_requeues", 3)))
+        # worker.stuck_wait_terminal_days (default 0 = legacy: fail after max_requeues). A job still waiting on
+        # results (queued_wait / cooling_off) is not stuck: a culture or biopsy legitimately takes days, and a job
+        # failed here is never looked at again when the result lands (R202610070084, 122 such jobs in 45 days).
+        # With N > 0 it keeps being requeued, uncounted, until the job itself is N days old.
+        terminal_days = float(worker_cfg.get("stuck_wait_terminal_days", 0) or 0)
         scan_limit = int(os.getenv("REPORT_SENDER_STUCK_SCAN_LIMIT", worker_cfg.get("stuck_scan_limit", 500)))
         now = utc_now()
         inflight_minutes = int(os.getenv("REPORT_SENDER_STUCK_INFLIGHT_MINUTES", worker_cfg.get("stuck_inflight_minutes", 15)))
@@ -1071,6 +1076,18 @@ class ReportSenderWorker:
             self.metrics["stuck_detected"] += 1
             meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
             stuck_count = int((meta or {}).get("stuck_requeue_count") or 0)
+            job_created = parse_iso(job.get("created_at"))
+            still_waiting_for_results = bool(
+                terminal_days > 0 and job_created is not None
+                and (now - job_created).total_seconds() / 86400.0 < terminal_days
+            )
+            if still_waiting_for_results and stuck_count >= max_requeues:
+                self._patch_job(job, {"status": "queued", "next_attempt_at": utc_iso(now), "last_error": None})
+                self._event(job, "auto_requeue_waiting_for_results",
+                            "Watchdog kept a long-waiting job queued (results not ready yet)",
+                            {"previous_status": norm_text(job.get("status")), "event_type": e_type,
+                             "age_hours": round(age_hours, 2), "retry_count": stuck_count})
+                continue
             if stuck_count >= max_requeues:
                 self._patch_job(job, {"status": "failed", "last_error": "failed_timeout_stuck"})
                 self._event(job, "failed_timeout", "Watchdog marked terminal failure after stuck wait", {
