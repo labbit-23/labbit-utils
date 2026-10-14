@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import MagicMock
 
 from enqueue_requisitions_worker import EnqueueWorker
 
@@ -305,6 +306,55 @@ class FakeJsonResponse:
         self.assertEqual(run(cutoff, undated), False)  # no sent_at: cannot prove it is post-cutover -> treated as legacy
         self.assertEqual(run(None, after), False)      # no cutoff configured: original behaviour, any sent job suppresses
         self.assertEqual(run("not-a-date", after), False)  # unparseable cutoff is ignored (original behaviour), not a crash
+
+
+class SpecialFollowupAfterRegularSendTests(unittest.TestCase):
+    """R202610110047 (2026-10-14): the regular job went out as 'complete lab; special
+    report to follow separately' while the SPECIAL TESTS test was still pending; the
+    snapshot is frozen at send time, so a later approval was never followed up."""
+
+    @staticmethod
+    def _status(special_ready):
+        return {"tests": [
+            {"TEST_ID": "T1", "TEST_NAME": "CBC", "GROUPID": "GDEP0001", "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1",
+             "DEPARTMENT": "HAEMATOLOGY"},
+            {"TEST_ID": "T2", "TEST_NAME": "CA 15.3", "GROUPID": "GDEP0001", "DEPARTMENT": "SPECIAL TESTS",
+             "REPORT_STATUS": "LAB_READY" if special_ready else "Awaiting results",
+             "APPROVEDFLG": "1" if special_ready else "0"},
+        ]}
+
+    def make(self, live_special_ready=True, snapshot=None):
+        cfg = base_cfg()
+        cfg["enqueue"].update({"outsourced_lookback_hours": 200})
+        w = EnqueueWorker(cfg, dry_run=False)
+        sent = {"id": 7, "reqno": "R1", "reqid": "RQ1", "phone": "919999999999", "mrno": "M", "patient_name": "P",
+                "metadata": {}, "last_status_snapshot": snapshot if snapshot is not None else self._status(False)}
+        sb = MagicMock()
+        sb.list_recent_sent_regular_jobs.return_value = [sent]
+        sb.list_recent_failed_regular_jobs.return_value = []
+        sb.has_active_job.return_value = False
+        sb.list_jobs_by_reqno.return_value = []
+        w.sb = sb
+        w._fetch_status = lambda reqno, reqid: self._status(live_special_ready)
+        return w, sb
+
+    def test_special_approved_after_regular_send_is_followed_up(self):
+        w, sb = self.make(live_special_ready=True)
+        self.assertEqual(w._reconcile_outsourced_jobs("jobs"), 1)
+        self.assertEqual(sb.insert_job.call_count, 1)
+
+    def test_special_still_pending_does_not_enqueue(self):
+        w, sb = self.make(live_special_ready=False)
+        self.assertEqual(w._reconcile_outsourced_jobs("jobs"), 0)
+        sb.insert_job.assert_not_called()
+
+    def test_snapshot_without_any_special_test_is_not_refetched(self):
+        snap = {"tests": [self._status(False)["tests"][0]]}
+        w, sb = self.make(live_special_ready=True, snapshot=snap)
+        calls = []
+        w._fetch_status = lambda reqno, reqid: calls.append(reqno) or self._status(True)
+        self.assertEqual(w._reconcile_outsourced_jobs("jobs"), 0)
+        self.assertEqual(calls, [])
 
 if __name__ == "__main__":
     unittest.main()

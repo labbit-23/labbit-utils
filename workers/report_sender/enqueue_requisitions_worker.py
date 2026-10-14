@@ -434,6 +434,14 @@ class EnqueueWorker:
         approved = norm(row.get("APPROVEDFLG") or row.get("approvedflg")) == "1"
         return self._is_outsourced_row(row) and approved
 
+    def _snapshot_has_special_test(self, status: Dict[str, Any]) -> bool:
+        """True when the status holds any special/outsourced lab or radiology test, ready or not."""
+        tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+        return any(
+            isinstance(row, dict) and self._is_lab_or_radiology_test(row) and self._is_outsourced_row(row)
+            for row in tests
+        )
+
     def _extract_outsourced_ready_testids(self, status: Dict[str, Any]) -> List[str]:
         tests = status.get("tests") if isinstance(status.get("tests"), list) else []
         out: List[str] = []
@@ -989,7 +997,13 @@ class EnqueueWorker:
                     snap = {}
             if not isinstance(snap, dict) or not snap:
                 continue
-            if not self._extract_outsourced_ready_testids(snap):
+            # The snapshot is frozen at send time, so a special test that was still
+            # pending then (the regular send said "special report to follow") is NOT
+            # ready in it. Pass the row on whenever the snapshot holds ANY special
+            # test; the live fetch below decides whether one is ready now.
+            # 2026-10-14: R202610110047's CA 15.3 was approved a day after the
+            # regular send and was never followed up because of this filter.
+            if not (self._extract_outsourced_ready_testids(snap) or self._snapshot_has_special_test(snap)):
                 continue
 
             try:
