@@ -15,7 +15,7 @@ import requests
 # cfg["enqueue"]["special_test_department_markers"], default {"DPT00033",
 # "SPECIAL TESTS"}) instead of a second, independently-hardcoded department
 # id living in this file too.
-from report_sender_worker import special_test_department_markers
+from report_sender_worker import configure_direct_send, is_direct_send_test, special_test_department_markers
 
 
 def now_ist() -> datetime:
@@ -312,6 +312,8 @@ class EnqueueWorker:
         self.sb = SupabaseRest(cfg["supabase"]["url"], cfg["supabase"]["service_role_key"], timeout=timeout)
         self.http = requests.Session()
         self.outsourced_department_markers = special_test_department_markers(cfg)
+        # Tests a device worker delivers itself (enqueue.direct_send_modalities; empty by default).
+        configure_direct_send(cfg)
 
     def _fetch_status(self, reqno: str, reqid: str) -> Dict[str, Any]:
         base = norm(self.cfg.get("labbit_py", {}).get("base_url")).rstrip("/")
@@ -375,6 +377,8 @@ class EnqueueWorker:
         return norm(row.get("SAMEDAYREPORT") or row.get("samedayreport")) == "1"
 
     def _is_lab_or_radiology_test(self, row: Dict[str, Any]) -> bool:
+        if is_direct_send_test(row):
+            return False
         group = norm(row.get("GROUPNM") or row.get("groupnm")).upper()
         if group in {"LAB", "RADIOLOGY", "SCAN", "SCANS", "XRAY", "X-RAY", "CT", "MRI", "USG", "ULTRASOUND"}:
             return True

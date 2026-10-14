@@ -175,7 +175,7 @@ def is_cancelled_test(row: Dict[str, Any]) -> bool:
 
 def is_same_day_required(row: Dict[str, Any]) -> bool:
     # A cancelled test will never be ready, so it must not hold the same-day wait.
-    if is_cancelled_test(row):
+    if is_cancelled_test(row) or is_direct_send_test(row):
         return False
     return norm_text(row.get("SAMEDAYREPORT") or row.get("samedayreport")) == "1"
 
@@ -185,6 +185,13 @@ def build_template_report_label(status: Dict[str, Any]) -> str:
     overall = norm_text(status.get("overall_status")).upper()
     rad_total = int(status.get("radiology_total") or 0)
     rad_ready = int(status.get("radiology_ready") or 0)
+    if _DIRECT_SEND_MODALITIES:
+        # Core's radiology counts include tests a device worker sends itself (ECG); not ours to wait on.
+        for row in (status.get("tests") if isinstance(status.get("tests"), list) else []):
+            if is_direct_send_test(row) and norm_text(row.get("GROUPID") or row.get("groupid")) == "GDEP0002":
+                rad_total = max(0, rad_total - 1)
+                if is_ready_test(row):
+                    rad_ready = max(0, rad_ready - 1)
 
     if overall == "FULL_REPORT":
         lab_piece = "complete lab"
@@ -210,6 +217,39 @@ def build_template_report_label(status: Dict[str, Any]) -> str:
     if len(text) > 120:
         return text[:117].rstrip() + "..."
     return text
+
+
+# Tests a device worker delivers to the patient by itself (e.g. ECG): the report sender must neither
+# enqueue a requisition that holds only such tests nor wait on them. Which imaging modalities count is
+# lab configuration -- cfg["enqueue"]["direct_send_modalities"] (list) or the DIRECT_SEND_TEST_MODALITIES
+# env var (comma-separated) -- and the default is EMPTY, so no modality is special-cased in code.
+_DIRECT_SEND_MODALITIES: set = set()
+
+
+def direct_send_modalities(cfg: Optional[Dict[str, Any]] = None) -> set:
+    env_value = os.environ.get("DIRECT_SEND_TEST_MODALITIES")
+    if env_value:
+        return {norm_text(v).lower() for v in env_value.split(",") if norm_text(v)}
+    if isinstance(cfg, dict):
+        configured = (cfg.get("enqueue") or {}).get("direct_send_modalities")
+        if isinstance(configured, (list, tuple, set)):
+            return {norm_text(v).lower() for v in configured if norm_text(v)}
+    return set()
+
+
+def configure_direct_send(cfg: Optional[Dict[str, Any]]) -> set:
+    """Set the process-wide modality set the module-level test classifiers read."""
+    global _DIRECT_SEND_MODALITIES
+    _DIRECT_SEND_MODALITIES = direct_send_modalities(cfg)
+    return _DIRECT_SEND_MODALITIES
+
+
+def is_direct_send_test(row: Dict[str, Any], modalities: Optional[set] = None) -> bool:
+    modalities = _DIRECT_SEND_MODALITIES if modalities is None else modalities
+    if not modalities or not isinstance(row, dict):
+        return False
+    modality = norm_text(row.get("IMAGING_MODALITY") or row.get("imaging_modality")).lower()
+    return bool(modality) and modality in modalities
 
 
 DEFAULT_SPECIAL_TEST_DEPARTMENT_MARKERS = {"DPT00033", "SPECIAL TESTS"}
@@ -318,6 +358,8 @@ def has_same_day_required_tests(status: Dict[str, Any]) -> bool:
 
 
 def is_lab_or_radiology_test(row: Dict[str, Any]) -> bool:
+    if is_direct_send_test(row):
+        return False
     group = norm_text(row.get("GROUPNM") or row.get("groupnm")).upper()
     if group in {"LAB", "RADIOLOGY", "SCAN", "SCANS", "XRAY", "X-RAY", "CT", "MRI", "USG", "ULTRASOUND"}:
         return True
@@ -750,6 +792,7 @@ class ReportSenderWorker:
     def __init__(self, cfg: Dict[str, Any], dry_run: bool = False) -> None:
         self.cfg = cfg
         self.special_test_markers = special_test_department_markers(cfg)
+        configure_direct_send(cfg)
         worker_cfg = cfg.get("worker", {})
         self.dry_run = dry_run or bool(worker_cfg.get("dry_run", False))
         log_level = str(worker_cfg.get("log_level", "INFO")).upper()

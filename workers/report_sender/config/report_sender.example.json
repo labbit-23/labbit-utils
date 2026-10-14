@@ -81,7 +81,8 @@
     "fetch_limit": 1000,
     "request_timeout_seconds": 20,
     "log_level": "INFO",
-    "special_test_department_markers": ["DPT00033", "SPECIAL TESTS"]
+    "special_test_department_markers": ["DPT00033", "SPECIAL TESTS"],
+    "direct_send_modalities": []
   },
   "patient_message_jobs_send_url": "https://lab.sdrc.in/api/internal/whatsapp/campaign-send",
   "patient_message_jobs": [

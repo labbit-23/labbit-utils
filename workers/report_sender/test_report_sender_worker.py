@@ -407,5 +407,56 @@ class CancelledTestsDoNotHoldSameDayWaitTests(unittest.TestCase):
         total, ready_n, pending_names = m.same_day_counts_and_pending(status)
         self.assertEqual((total, ready_n, pending_names), (1, 1, []))
 
+
+class DirectSendModalityTests(unittest.TestCase):
+    """Tests a device worker delivers itself (enqueue.direct_send_modalities, default empty)."""
+
+    def setUp(self):
+        import report_sender_worker as m
+        self.m = m
+        m.configure_direct_send({"enqueue": {"direct_send_modalities": ["ECG"]}})
+
+    def tearDown(self):
+        self.m.configure_direct_send({})
+
+    @staticmethod
+    def ecg(**extra):
+        row = {"GROUPID": "GDEP0002", "GROUPNM": "RADIOLOGY", "TEST_NAME": "ECG", "IMAGING_MODALITY": "ecg",
+               "SAMEDAYREPORT": "1", "REPORT_STATUS": "Awaiting report", "APPROVEDFLG": "0"}
+        row.update(extra)
+        return row
+
+    def test_default_is_empty_so_nothing_is_special_cased(self):
+        self.assertEqual(self.m.direct_send_modalities({}), set())
+        self.m.configure_direct_send({})
+        self.assertTrue(self.m.is_lab_or_radiology_test(self.ecg()))
+
+    def test_configured_modality_is_not_a_reportable_test(self):
+        self.assertFalse(self.m.is_lab_or_radiology_test(self.ecg()))
+        xray = self.ecg(IMAGING_MODALITY="xray", TEST_NAME="X-Ray")
+        self.assertTrue(self.m.is_lab_or_radiology_test(xray))
+        self.assertTrue(self.m.is_lab_or_radiology_test({"GROUPID": "GDEP0001", "TEST_NAME": "CBC"}))
+
+    def test_ecg_only_requisition_has_nothing_to_report(self):
+        status = {"tests": [self.ecg()]}
+        self.assertFalse(self.m.has_any_reportable_test(status))
+
+    def test_pending_ecg_does_not_hold_the_same_day_wait(self):
+        lab = {"GROUPID": "GDEP0001", "TEST_NAME": "CBC", "SAMEDAYREPORT": "1", "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1"}
+        status = {"tests": [lab, self.ecg()]}
+        self.assertTrue(self.m.evaluate_same_day_readiness(status))
+
+    def test_label_ignores_the_direct_send_test_in_radiology_counts(self):
+        status = {"overall_status": "FULL_REPORT", "radiology_total": 1, "radiology_ready": 0, "tests": [self.ecg()]}
+        self.assertEqual(self.m.build_template_report_label(status), "complete lab")
+
+    def test_env_var_overrides_config(self):
+        import os
+        os.environ["DIRECT_SEND_TEST_MODALITIES"] = "bmd, ecg"
+        try:
+            self.assertEqual(self.m.direct_send_modalities({"enqueue": {"direct_send_modalities": ["x"]}}), {"bmd", "ecg"})
+        finally:
+            del os.environ["DIRECT_SEND_TEST_MODALITIES"]
+
 if __name__ == "__main__":
     unittest.main()

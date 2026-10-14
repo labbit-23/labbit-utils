@@ -539,7 +539,26 @@ class LegacyCutoffUsesSentAtTests(unittest.TestCase):
         self.assertIn("sent_at", seen["select"].split(","))
 
 
+class DirectSendModalityEnqueueTests(unittest.TestCase):
+    def make(self, modalities):
+        cfg = base_cfg()
+        cfg["enqueue"]["direct_send_modalities"] = modalities
+        return EnqueueWorker(cfg, dry_run=True)
 
+    ECG = {"GROUPID": "GDEP0002", "GROUPNM": "RADIOLOGY", "TEST_NAME": "ECG", "IMAGING_MODALITY": "ecg"}
+
+    def test_ecg_only_requisition_has_no_reportable_tests(self):
+        w = self.make(["ecg"])
+        self.assertFalse(w._has_any_reportable_tests({"tests": [self.ECG]}))
+
+    def test_without_config_the_ecg_is_an_ordinary_radiology_test(self):
+        w = self.make([])
+        self.assertTrue(w._has_any_reportable_tests({"tests": [self.ECG]}))
+
+    def test_other_tests_stay_reportable_next_to_an_ecg(self):
+        w = self.make(["ecg"])
+        lab = {"GROUPID": "GDEP0001", "GROUPNM": "LAB", "TEST_NAME": "CBC"}
+        self.assertTrue(w._has_any_reportable_tests({"tests": [self.ECG, lab]}))
 
 if __name__ == "__main__":
     unittest.main()
