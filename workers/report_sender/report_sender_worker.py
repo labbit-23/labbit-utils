@@ -169,7 +169,14 @@ def is_ready_test(row: Dict[str, Any]) -> bool:
     return approved or status in {"LAB_READY", "RADIOLOGY_READY"}
 
 
+def is_cancelled_test(row: Dict[str, Any]) -> bool:
+    return norm_text(row.get("REPORT_STATUS") or row.get("report_status")).upper() == "CANCELLED"
+
+
 def is_same_day_required(row: Dict[str, Any]) -> bool:
+    # A cancelled test will never be ready, so it must not hold the same-day wait.
+    if is_cancelled_test(row):
+        return False
     return norm_text(row.get("SAMEDAYREPORT") or row.get("samedayreport")) == "1"
 
 

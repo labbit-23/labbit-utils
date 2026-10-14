@@ -394,5 +394,18 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(any(e.get("event_type") == "session_document_failed_fallback_template" for e in w.sb.events))
 
 
+class CancelledTestsDoNotHoldSameDayWaitTests(unittest.TestCase):
+    def test_cancelled_same_day_test_is_not_required(self):
+        import report_sender_worker as m
+        cancelled = {"SAMEDAYREPORT": "1", "REPORT_STATUS": "cancelled", "APPROVEDFLG": "0"}
+        pending = {"SAMEDAYREPORT": "1", "REPORT_STATUS": "Awaiting results", "APPROVEDFLG": "0"}
+        self.assertFalse(m.is_same_day_required(cancelled))
+        self.assertTrue(m.is_same_day_required(pending))
+        ready = {"SAMEDAYREPORT": "1", "REPORT_STATUS": "Printed / dispatched", "APPROVEDFLG": "1"}
+        status = {"tests": [ready, cancelled]}
+        self.assertTrue(m.evaluate_same_day_readiness(status))
+        total, ready_n, pending_names = m.same_day_counts_and_pending(status)
+        self.assertEqual((total, ready_n, pending_names), (1, 1, []))
+
 if __name__ == "__main__":
     unittest.main()
