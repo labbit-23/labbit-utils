@@ -8,6 +8,7 @@ import random
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import requests
 
@@ -1220,9 +1221,17 @@ class ReportSenderWorker:
             if reqno:
                 return f"{base}/special_report/{reqid}?reqno={reqno}&v={content_version}"
             return f"{base}/special_report/{reqid}?v={content_version}"
+        # v = hash of the sent test set (a partial and a complete send never share a link);
+        # testids = exactly what this job reports ready/sent: labit-core refuses (409) a bundle
+        # that lacks any of them; job = per-send uniqueness (WhatsApp reuses media by URL).
+        extra = f"&v={content_version}"
+        if sent_testids:
+            extra += "&testids=" + quote(",".join(sent_testids), safe=",")
+        if job.get("id") is not None:
+            extra += f"&job={quote(str(job.get('id')), safe='')}"
         if reqno:
-            return f"{base}/report/{reqid}?reqno={reqno}&v={content_version}"
-        return f"{base}/report/{reqid}?v={content_version}"
+            return f"{base}/report/{reqid}?reqno={reqno}{extra}"
+        return f"{base}/report/{reqid}?{extra[1:]}"
 
     def _sent_testids_for_job(self, job: Dict[str, Any], status: Dict[str, Any]) -> List[str]:
         meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
@@ -1271,6 +1280,9 @@ class ReportSenderWorker:
             "report_source": report_source,
             "reqno": reqno or None,
             "reqid": reqid or None,
+            # Unique per send: the document link carries it so WhatsApp can never reuse an
+            # earlier message's media for this one (R202610120075: complete got the partial file).
+            "job_id": job.get("id"),
             "testid": outsourced_testid or None,
             "ready_lab_test_keys": sent_testids,
             "source_service": norm_text(wa.get("source_service") or "report_sender_worker"),
@@ -1376,13 +1388,25 @@ class ReportSenderWorker:
         except Exception as exc:
             return False, {"reason": "lookup_failed", "error": str(exc), "window_hours": window_hours}
 
-    def _build_report_filename(self, job: Dict[str, Any], status: Dict[str, Any]) -> str:
+    @staticmethod
+    def _report_filename_suffix(label: Any) -> str:
+        # Tells a partial and a complete file apart on the patient's phone. Keep in step with
+        # labit-main report-template-send's reportFilenameSuffix().
+        text = norm_text(label).lower()
+        if text.startswith("special report"):
+            return "_special"
+        for word in ("partial", "pending", "complete"):
+            if word in text:
+                return "_" + word
+        return ""
+
+    def _build_report_filename(self, job: Dict[str, Any], status: Dict[str, Any], report_label: Any = "") -> str:
         reqno = norm_text(job.get("reqno") or status.get("reqno"))
         reqid = norm_text(job.get("reqid") or status.get("reqid"))
         patient_name = norm_text(status.get("patient_name") or job.get("patient_name") or "Patient") or "Patient"
         first = patient_name.split()[0] if patient_name else "Patient"
         safe_first = "".join(ch for ch in first if ch.isalpha()).upper() or "PATIENT"
-        return f"SDRC_Report_{reqno or reqid or 'Report'}_{safe_first}.pdf"
+        return f"SDRC_Report_{reqno or reqid or 'Report'}_{safe_first}{self._report_filename_suffix(report_label)}.pdf"
 
     # Mirrors the approved `reports_pdf` WhatsApp template body so a
     # free-form document send reads identically to a template send.
@@ -1420,7 +1444,7 @@ class ReportSenderWorker:
             "phone": norm_text(job.get("phone") or status.get("patient_phone")),
             "message_type": "document",
             "document_url": report_url,
-            "filename": self._build_report_filename(job, status),
+            "filename": self._build_report_filename(job, status, report_label),
             "caption": self._document_caption(
                 status.get("patient_name") or job.get("patient_name"), report_label
             ),
