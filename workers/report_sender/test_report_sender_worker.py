@@ -574,3 +574,41 @@ class StuckWaitTerminalDaysTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DocumentLinkAndFilenameTests(unittest.TestCase):
+    """R202610120075: WhatsApp reused the partial message's file for the complete one."""
+
+    def _sender(self):
+        import report_sender_worker as m
+        sender = m.ReportSenderWorker.__new__(m.ReportSenderWorker)
+        sender.cfg = {"labbit_py": {"base_url": "https://api.sdrc.in/py"}}
+        sender.special_test_markers = set()
+        return sender
+
+    def test_link_carries_testids_and_job_and_is_unique_per_job(self):
+        def test(i):
+            return {"GROUPID": "GDEP0001", "GROUPNM": "LAB", "TEST_ID": i, "TEST_NAME": i,
+                    "DEPARTMENT": "HORMONES", "APPROVEDFLG": "1", "REPORT_STATUS": "LAB_READY",
+                    "SAMEDAYREPORT": "1"}
+
+        status = {"overall_status": "FULL_REPORT", "reqno": "R1", "reqid": "rid",
+                  "tests": [test("t-a"), test("t-b")]}
+        job = {"id": 30414, "reqno": "R1", "reqid": "rid", "metadata": {}}
+        sender = self._sender()
+        url = sender._build_report_document_url(job, status)
+        self.assertIn("testids=t-a,t-b", url)
+        self.assertIn("job=30414", url)
+        self.assertNotEqual(url, sender._build_report_document_url({**job, "id": 30500}, status))
+
+    def test_filename_tells_partial_from_complete(self):
+        sender = self._sender()
+        self.assertEqual(
+            sender._build_report_filename({"reqno": "R1"}, {"patient_name": "Rohit J"}, "complete lab"),
+            "SDRC_Report_R1_ROHIT_complete.pdf")
+        self.assertTrue(
+            sender._build_report_filename({"reqno": "R1"}, {"patient_name": "Rohit J"}, "partial lab")
+            .endswith("_partial.pdf"))
+        self.assertEqual(
+            sender._build_report_filename({"reqno": "R1"}, {"patient_name": "Rohit J"}, ""),
+            "SDRC_Report_R1_ROHIT.pdf")
