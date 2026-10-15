@@ -1198,6 +1198,15 @@ class ReportSenderWorker:
         reqno = norm_text(job.get("reqno") or status.get("reqno"))
         meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
         report_source = norm_text(meta.get("report_source")).lower()
+        # The public URL used to be identical for every partial/full send of
+        # a requisition.  Meta/WhatsApp is free to cache document URLs, which
+        # meant a later complete notification could attach an older partial
+        # PDF even though Core rendered the newly approved tests correctly.
+        # Fingerprint the exact ready-test set into the URL.  labit-py's route
+        # ignores this query parameter, but intermediaries now see a new URL
+        # whenever the report's covered test set changes.
+        sent_testids = sorted(self._sent_testids_for_job(job, status))
+        content_version = hashlib.sha256("|".join(sent_testids).encode("utf-8")).hexdigest()[:12]
         if not base or not reqid:
             raise ValueError("Missing base_url or reqid for report document URL")
         if report_source == "outsourced_report":
@@ -1209,11 +1218,11 @@ class ReportSenderWorker:
             # T&C/dispatch sheet at all and could only ever send one test's
             # attachment per job.
             if reqno:
-                return f"{base}/special_report/{reqid}?reqno={reqno}"
-            return f"{base}/special_report/{reqid}"
+                return f"{base}/special_report/{reqid}?reqno={reqno}&v={content_version}"
+            return f"{base}/special_report/{reqid}?v={content_version}"
         if reqno:
-            return f"{base}/report/{reqid}?reqno={reqno}"
-        return f"{base}/report/{reqid}"
+            return f"{base}/report/{reqid}?reqno={reqno}&v={content_version}"
+        return f"{base}/report/{reqid}?v={content_version}"
 
     def _sent_testids_for_job(self, job: Dict[str, Any], status: Dict[str, Any]) -> List[str]:
         meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
@@ -1743,14 +1752,36 @@ class ReportSenderWorker:
 
         attempts = int(job.get("attempt_count") or 0)
         # Duplicate-send guard: do not resend when same-day ready count has not increased.
-        # Exception: reconciliation follow-ups bypass this (they're created when partial→full happens).
-        is_reconcile = bool(meta.get("reconcile", False))
-        if report_source != "outsourced_report" and not is_reconcile:
+        # This must also cover reconciliation jobs. A stale/mistaken reconcile
+        # enqueue can observe the same 3-of-4 state as the previous partial;
+        # bypassing the guard used to send that identical partial again. The
+        # job remains queued, so it naturally proceeds once ready count grows.
+        if report_source != "outsourced_report":
             latest_sent = self.sb.get_latest_sent_job_for_reqno(self.cfg["tables"]["jobs"], norm_text(job.get("reqno")))
             if latest_sent:
                 prev_snap = latest_sent.get("last_status_snapshot") if isinstance(latest_sent.get("last_status_snapshot"), dict) else {}
                 prev_total, prev_ready, _ = same_day_counts_and_pending(prev_snap if isinstance(prev_snap, dict) else {})
-                if sameday_total > 0 and sameday_ready <= prev_ready and sameday_total == prev_total:
+                provider_response = latest_sent.get("provider_response") if isinstance(latest_sent.get("provider_response"), dict) else {}
+                previous_testids = {
+                    norm_text(value).upper()
+                    for value in (provider_response.get("sent_testids") or [])
+                    if norm_text(value)
+                }
+                current_testids = {
+                    norm_text(value).upper()
+                    for value in self._sent_testids_for_job(job, status)
+                    if norm_text(value)
+                }
+                unchanged_scope = bool(previous_testids) and not (current_testids - previous_testids)
+                # Older sent rows may predate provider_response.sent_testids;
+                # retain the count comparison as their compatibility fallback.
+                unchanged_legacy_count = (
+                    not previous_testids
+                    and sameday_total > 0
+                    and sameday_ready <= prev_ready
+                    and sameday_total == prev_total
+                )
+                if unchanged_scope or unchanged_legacy_count:
                     self._patch_job(job, {
                         "status": "queued",
                         "report_label": report_label,

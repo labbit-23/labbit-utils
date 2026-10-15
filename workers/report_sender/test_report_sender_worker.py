@@ -44,6 +44,7 @@ class FakeSB:
         self.active_chat_session = None
         self.recent_inbound_message = None
         self.half_day_dates = set()
+        self.latest_sent_job = None
 
     def half_day_exists(self, date_iso):
         return date_iso in self.half_day_dates
@@ -93,6 +94,9 @@ class FakeSB:
 
     def find_recent_inbound_message(self, table, *, lab_id, phone_variants, since_iso):
         return self.recent_inbound_message
+
+    def get_latest_sent_job_for_reqno(self, table, reqno):
+        return self.latest_sent_job
 
 
 class FakeResponse:
@@ -211,6 +215,69 @@ class WorkerTests(unittest.TestCase):
             ]
         }
         self.assertEqual(ready_reportable_testids(status), ["T1", "T3"])
+
+    def test_report_document_url_changes_when_ready_test_set_changes(self):
+        w = self.make_worker()
+        job = {"id": 7, "reqid": "req-id", "reqno": "R7", "metadata": {}}
+        partial = {
+            "tests": [
+                {"TEST_ID": "T1", "GROUPNM": "LAB", "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1"},
+                {"TEST_ID": "T2", "GROUPNM": "LAB", "REPORT_STATUS": "PENDING", "APPROVEDFLG": "0"},
+            ]
+        }
+        complete = {
+            "tests": [
+                {"TEST_ID": "T1", "GROUPNM": "LAB", "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1"},
+                {"TEST_ID": "T2", "GROUPNM": "LAB", "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1"},
+            ]
+        }
+        partial_url = w._build_report_document_url(job, partial)
+        complete_url = w._build_report_document_url(job, complete)
+        self.assertIn("reqno=R7&v=", partial_url)
+        self.assertNotEqual(partial_url, complete_url)
+
+    def test_reconcile_job_does_not_resend_unchanged_partial(self):
+        w = self.make_worker()
+        partial = {
+            "reqno": "R8",
+            "reqid": "req-id",
+            "patient_name": "Patient",
+            "overall_status": "PARTIAL_REPORT",
+            "lab_total": 4,
+            "lab_ready": 3,
+            "radiology_total": 0,
+            "radiology_ready": 0,
+            "tests": [
+                {"TEST_ID": "T1", "GROUPNM": "LAB", "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1", "SAMEDAYREPORT": "1"},
+                {"TEST_ID": "T2", "GROUPNM": "LAB", "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1", "SAMEDAYREPORT": "1"},
+                {"TEST_ID": "T3", "GROUPNM": "LAB", "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1", "SAMEDAYREPORT": "1"},
+                {"TEST_ID": "T4", "GROUPNM": "LAB", "REPORT_STATUS": "Awaiting approval", "APPROVEDFLG": "0", "SAMEDAYREPORT": "1"},
+            ],
+        }
+        w.sb.latest_sent_job = {
+            "last_status_snapshot": partial,
+            "provider_response": {"sent_testids": ["T1", "T2", "T3"]},
+        }
+        w._fetch_status = lambda _job: partial
+        w._partial_cutoff_due = lambda _job: (True, utc_now())
+        sent = []
+        w._send_report_message = lambda *args: sent.append(args)
+        w.process_job({
+            "id": 8,
+            "reqno": "R8",
+            "reqid": "req-id",
+            "phone": "9989843434",
+            "status": "queued",
+            "force_send_now": True,
+            "attempt_count": 0,
+            "metadata": {"reconcile": True},
+        })
+        self.assertEqual(sent, [])
+        self.assertTrue(any(
+            event.get("event_type") == "queued_wait"
+            and "Skipped duplicate send" in event.get("message", "")
+            for event in w.sb.events
+        ))
 
     def test_regular_and_special_testids_are_disjoint(self):
         status = {
