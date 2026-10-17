@@ -194,21 +194,36 @@ class SupabaseRest:
             "select": "id,lab_id,reqno,reqid,mrno,phone,patient_name,status,report_label,last_error,is_paused,metadata,created_at,updated_at",
             "status": "in.(queued,cooling_off,eligible,retrying,failed,sending,sent)",
             "updated_at": f"gte.{since_iso}",
-            "order": "updated_at.asc",
-            "limit": str(limit)
+            "order": "updated_at.asc,id.asc",
         }
-        r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
-        r.raise_for_status()
-        rows = r.json()
-        return rows if isinstance(rows, list) else []
+        return self._get_paged(u, p, limit)
+
+    def _get_paged(self, url: str, params: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
+        """GET up to `limit` rows, paging with offset. PostgREST silently truncates a single
+        response at its server-side max-rows (1000 on our Supabase), so one big `limit`
+        quietly drops the tail -- with oldest-first ordering that was the newest rows.
+        `params` must carry a deterministic `order`."""
+        out: List[Dict[str, Any]] = []
+        page = 1000
+        while len(out) < limit:
+            q = dict(params)
+            q["limit"] = str(min(page, limit - len(out)))
+            q["offset"] = str(len(out))
+            r = self.http.get(url, headers=self.headers, params=q, timeout=self.timeout)
+            r.raise_for_status()
+            rows = r.json()
+            if not isinstance(rows, list) or not rows:
+                break
+            out.extend(rows)
+            if len(rows) < int(q["limit"]):
+                break
+        return out
 
     def list_reqnos_with_any_job(self, table: str, since_iso: str, limit: int = 20000) -> set:
         """Every reqno that has a job of ANY status created since `since_iso` (skipped/cancelled included)."""
         u = f"{self.base}/{table}"
-        p = {"select": "reqno", "created_at": f"gte.{since_iso}", "limit": str(limit)}
-        r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
-        r.raise_for_status()
-        rows = r.json()
+        p = {"select": "reqno", "created_at": f"gte.{since_iso}", "order": "id.asc"}
+        rows = self._get_paged(u, p, limit)
         return {norm(x.get("reqno")) for x in rows if isinstance(x, dict) and norm(x.get("reqno"))} if isinstance(rows, list) else set()
 
     def list_recent_sent_regular_jobs(self, table: str, since_iso: str, limit: int = 500) -> List[Dict[str, Any]]:
