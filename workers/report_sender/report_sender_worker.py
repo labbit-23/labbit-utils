@@ -540,6 +540,42 @@ def derive_group_ready_timestamps(status: Dict[str, Any]) -> Tuple[Optional[date
     return lab_latest, rad_latest
 
 
+def derive_followup_ready_timestamps(status: Dict[str, Any], testids: Any) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """Latest approval per group among the given (follow-up) tests.
+
+    derive_group_ready_timestamps only looks at same-day-required tests, so a
+    follow-up whose new tests are non-same-day (a culture) got no cooloff at all:
+    its schedule fell back to the first approval, hours or days old."""
+    wanted = {norm_text(t).upper() for t in (testids or []) if norm_text(t)} if isinstance(testids, list) else set()
+    if not wanted:
+        return None, None
+    tests = status.get("tests") if isinstance(status.get("tests"), list) else []
+    lab_latest = None
+    rad_latest = None
+    for row in tests:
+        if not isinstance(row, dict) or not is_ready_test(row):
+            continue
+        key = norm_text(row.get("TEST_ID") or row.get("TESTID") or row.get("test_id") or row.get("testid")).upper()
+        if key not in wanted:
+            continue
+        approved = parse_status_dt_ist_to_utc(row.get("approved_at") or row.get("APPROVED_AT"))
+        if approved is None:
+            approved = parse_status_dt_ist_to_utc(status.get("latest_approved_at"))
+        if approved is None:
+            continue
+        group = norm_text(row.get("GROUPNM") or row.get("groupnm")).upper()
+        if group in {"SCAN", "SCANS", "XRAY", "X-RAY", "CT", "MRI", "USG", "ULTRASOUND"}:
+            group = "RADIOLOGY"
+        if not group:
+            group = "RADIOLOGY" if norm_text(row.get("GROUPID") or row.get("groupid")) == "GDEP0002" else "LAB"
+        if group == "RADIOLOGY":
+            if rad_latest is None or approved > rad_latest:
+                rad_latest = approved
+        elif lab_latest is None or approved > lab_latest:
+            lab_latest = approved
+    return lab_latest, rad_latest
+
+
 class SupabaseRest:
     def __init__(self, url: str, service_role_key: str, timeout_seconds: int = 40) -> None:
         self.base = url.rstrip("/") + "/rest/v1"
@@ -1597,6 +1633,13 @@ class ReportSenderWorker:
             return created_at + timedelta(minutes=cooloff_default)
 
         lab_ready_at, rad_ready_at = derive_group_ready_timestamps(status)
+        # Incremental follow-up: cool off from the approval of the NEW tests, like any other send.
+        if norm_text(meta.get("reason")) == "incremental_new_ready_tests":
+            f_lab, f_rad = derive_followup_ready_timestamps(status, meta.get("new_ready_testids"))
+            if f_lab is not None and (lab_ready_at is None or f_lab > lab_ready_at):
+                lab_ready_at = f_lab
+            if f_rad is not None and (rad_ready_at is None or f_rad > rad_ready_at):
+                rad_ready_at = f_rad
         candidates = []
         if lab_ready_at is not None:
             candidates.append(lab_ready_at + timedelta(minutes=cooloff_lab))

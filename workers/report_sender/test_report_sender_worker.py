@@ -612,3 +612,18 @@ class DocumentLinkAndFilenameTests(unittest.TestCase):
         self.assertEqual(
             sender._build_report_filename({"reqno": "R1"}, {"patient_name": "Rohit J"}, ""),
             "SDRC_Report_R1_ROHIT.pdf")
+
+
+class FollowupCooloffTests(unittest.TestCase):
+    def test_followup_ready_uses_new_tests_approval_not_first_approval(self):
+        from report_sender_worker import derive_followup_ready_timestamps
+        status = {"tests": [
+            {"GROUPNM": "LAB", "TEST_ID": "a4", "APPROVEDFLG": "1",
+             "approved_at": "2026-10-16T14:06:27+00:00", "SAMEDAYREPORT": "1"},
+            {"GROUPNM": "LAB", "TEST_ID": "02", "APPROVEDFLG": "1",
+             "approved_at": "2026-10-17T06:52:57+00:00", "SAMEDAYREPORT": "0"},
+        ]}
+        lab, rad = derive_followup_ready_timestamps(status, ["02"])
+        self.assertEqual(lab.isoformat(), "2026-10-17T06:52:57+00:00")
+        self.assertIsNone(rad)
+        self.assertEqual(derive_followup_ready_timestamps(status, []), (None, None))
