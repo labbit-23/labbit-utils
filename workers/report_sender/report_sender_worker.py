@@ -719,7 +719,7 @@ class SupabaseRest:
     def get_latest_sent_job_for_reqno(self, table: str, reqno: str) -> Optional[Dict[str, Any]]:
         url = f"{self.base}/{table}"
         params = {
-            "select": "id,status,report_label,last_status_snapshot,sent_at,updated_at",
+            "select": "id,status,report_label,last_status_snapshot,provider_response,sent_at,updated_at",
             "reqno": f"eq.{reqno}",
             "status": "eq.sent",
             "order": "sent_at.desc.nullslast,updated_at.desc",
