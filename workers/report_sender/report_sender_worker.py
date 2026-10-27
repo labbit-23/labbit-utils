@@ -399,7 +399,9 @@ def is_no_reportable_case(status: Dict[str, Any]) -> bool:
     overall = norm_text(status.get("overall_status")).upper()
     if overall not in {"NO_REPORT", "NO_LAB_TESTS", "LAB_PENDING"}:
         return False
-    return not any(is_ready_test(t) for t in tests if isinstance(t, dict))
+    # A direct-send test (e.g. ECG) is delivered by its own device worker, so its being approved
+    # is not a reason for this sender to send anything.
+    return not any(is_ready_test(t) for t in tests if isinstance(t, dict) and not is_direct_send_test(t))
 
 
 def requisition_after_cutoff(status: Dict[str, Any], cutoff_hhmm: int) -> bool:

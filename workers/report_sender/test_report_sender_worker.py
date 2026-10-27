@@ -508,6 +508,13 @@ class DirectSendModalityTests(unittest.TestCase):
         status = {"tests": [self.ecg()]}
         self.assertFalse(self.m.has_any_reportable_test(status))
 
+    def test_approved_ecg_only_requisition_is_a_no_reportable_case(self):
+        # core counts the ECG as a radiology test (radiology_total 1) and it is approved, which used to
+        # defeat the skip and fail the send with "Report/tests label is required".
+        status = {"overall_status": "NO_LAB_TESTS", "lab_total": 0, "radiology_total": 1,
+                  "tests": [self.ecg(REPORT_STATUS="RADIOLOGY_READY", APPROVEDFLG="1")]}
+        self.assertTrue(self.m.is_no_reportable_case(status))
+
     def test_pending_ecg_does_not_hold_the_same_day_wait(self):
         lab = {"GROUPID": "GDEP0001", "TEST_NAME": "CBC", "SAMEDAYREPORT": "1", "REPORT_STATUS": "LAB_READY", "APPROVEDFLG": "1"}
         status = {"tests": [lab, self.ecg()]}
