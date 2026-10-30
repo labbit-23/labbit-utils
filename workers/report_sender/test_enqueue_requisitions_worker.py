@@ -592,5 +592,19 @@ class UnjobbedLookbackTests(unittest.TestCase):
         w.sb.list_reqnos_with_any_job.side_effect = RuntimeError("boom")
         self.assertEqual(w._unjobbed_rows_from_previous_days("jobs"), [])
 
+
+class HasActiveJobStatusTests(unittest.TestCase):
+    def test_processing_counts_as_active(self):
+        from enqueue_requisitions_worker import SupabaseRest
+        sb = SupabaseRest.__new__(SupabaseRest)
+        sb.base, sb.headers, sb.timeout = "https://x/rest/v1", {}, 5
+        sb.http = MagicMock()
+        sb.http.get.return_value.json.return_value = [{"id": 1, "status": "processing"}]
+        self.assertTrue(sb.has_active_job("jobs", "R1"))
+        status = sb.http.get.call_args.kwargs["params"]["status"]
+        for s in ("queued", "cooling_off", "eligible", "retrying", "sending", "processing"):
+            self.assertIn(s, status)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -118,11 +118,13 @@ class SupabaseRest:
         return rows if isinstance(rows, list) else []
 
     def has_active_job(self, table: str, reqno: str) -> bool:
+        # 'processing' counts: the sender holds a job in it while sending. Leaving it out let a second
+        # follow-up be created mid-send (R202610300079: jobs 32495 and 32500).
         u = f"{self.base}/{table}"
         p = {
             "select": "id,status",
             "reqno": f"eq.{reqno}",
-            "status": "in.(queued,cooling_off,eligible,retrying,sending)",
+            "status": "in.(queued,cooling_off,eligible,retrying,sending,processing)",
             "limit": "1"
         }
         r = self.http.get(u, headers=self.headers, params=p, timeout=self.timeout)
